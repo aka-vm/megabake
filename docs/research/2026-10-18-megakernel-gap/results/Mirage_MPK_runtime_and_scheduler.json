@@ -1,0 +1,238 @@
+{
+  "name": "Mirage MPK runtime and scheduler",
+  "scope": "Static reading of the Mirage Persistent Kernel runtime checked out at agent_space/mirage (commit f9eb70c, 2026-10-05). Files read: include/mirage/persistent_kernel/runtime_header.h, persistent_kernel.cuh (worker loop, scheduler loop, init and prepare kernels, prepare_next_batch, launch); src/kernel/runtime.cc (register_mugraph task and event emission, prelaunch conversion); src/kernel/annotated_graph.cc and its header (per-edge GCD event_dim, fork/join LCM); src/kernel/task_register.cc (Hopper swapAB linear codegen); python/mirage/mpk/persistent_kernel.py, mpk.py, models/qwen3/builder.py, models/utils.py, python/mirage/utils.py (worker/scheduler sizing). Also read the MPK paper (arXiv 2512.22219v2, OSDI'26). On the MegaBake side: src/megabake/runtime.py, schedule.py, codegen.py (table driver loop), compiler.py (table-launch and scheduler selection), plan.py, bodies/gemm.py, buckets.py, ROADMAP.md, PERFORMANCE_REPORT.md, and artifacts/full_model_2026-10-18/*/report.json. Question answered: how MPK synchronizes and dispatches tasks without grid barriers, how it handles serving state on the GPU, which parts MegaBake already has, which it lacks, and what closing the runtime gap would gain on the 60-SM H200 MIG slice. No GPU jobs were run.",
+  "key_sources": [
+    "agent_space/mirage/include/mirage/persistent_kernel/runtime_header.h:29-30 (SCHEDULERS_PER_BLOCK=4), :71-80 (64-bit TaskId = iteration<<32|index; EventId = nvshmem_tag|gpu|index), :82-85 (MAX_INPUTS 8, MAX_OUTPUTS 3, MAX_NUM_WORKERS 160), :87-226 (TaskType enum, including per-model Inkling/GLM/GPT-OSS task types), :228-236 (EventType: EMPTY, LAUNCH_TASKS, LAUNCH_MASSIVE_TASKS, LAUNCH_DEPENDENT_TASKS, END_OF_TASK_GRAPH), :249-336 (EventDesc, FullTaskDesc, 16B-aligned TaskDesc with trigger_event/dependent_event and TMA descriptor pointers), :338-459 (RuntimeConfig: worker/sched queues, event counters, paged-KV buffers, pinned host rings, split worker/scheduler streams)",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:155-201 (init_kernel: page queue and request slots), :203-233 (prepare_kernel: zero counters, seed END_OF_TASK_GRAPH event), :279-560 (prepare_next_batch offline/online: continuous batching, chunked prefill, paged KV alloc/free on GPU), :563-840 (MODE_ONLINE_PINNED host rings with ld.acquire.sys/st.release.sys), :857-870 (get_rand_sched_id: static worker->scheduler mapping), :957-1252 (execute_worker: batch-load up to 16 task descs into smem via cp.async, spin on dependent_event, execute, atom_add_release on trigger_event, enqueue activated event), :1254-1523 (execute_scheduler: one lane per warp, 4 scheduler warps per CTA, END_OF_TASK_GRAPH -> prepare_next_batch -> next iteration, LAUNCH_DEPENDENT_TASKS round-robin dispatch), :1525-1563 (persistent_kernel / worker_kernel / scheduler_kernel entry points), :1955-2040 (launch: optional split worker and scheduler kernels on two streams)",
+    "agent_space/mirage/src/kernel/runtime.cc:30-39 (event id encoding), :223-260 (register_mugraph, begin-graph task), :601-640 (producer trigger assignment per event sub-range), :736-870 (fork/join event emission, MASSIVE if >=8 consumer tasks), :924-947 (leaf layers feed END_OF_TASK_GRAPH), :949-967 ('Prelaunch all tasks at the beginning of an iteration': every LAUNCH_TASKS event becomes EVENT_EMPTY and its consumer tasks get dependent_event)",
+    "agent_space/mirage/src/kernel/annotated_graph.cc:748-787 (per-edge event_dim = gcd(producer partition, consumer partition); view edges degrade to one barrier-like event), :788-950 (fork and join LCM unification); include/mirage/kernel/annotated_graph.h:26-80 (TaskView/EdgeInfo design notes)",
+    "agent_space/mirage/src/kernel/task_register.cc:1588-1650 (register_linear_swapAB_hopper_task: assert(batch_size <= 16), 5 K stages, TMA tiles 64)",
+    "agent_space/mirage/python/mirage/utils.py:25-53 (get_scheduler = 4*(sm_cnt-worker); get_configurations_from_gpu SM-count table: >=40 SMs -> 30 workers)",
+    "agent_space/mirage/python/mirage/mpk/models/utils.py:3-15 (grid_for_rmsnorm_linear_layer: 96 or 64 tasks, comment says chosen to cover Qwen3), :17-30 (split-K grid)",
+    "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:2390-2447 (linear_layer: grid_dim supplied by the hand-written builder; Hopper always picks linear_swapAB_hopper)",
+    "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:291-293 (split-K only on target_cc==100), :354-551 (per-layer task sequence: rmsnorm, qkv linear, paged attention, o_proj linear_with_residual, rmsnorm, gate_up linear, silu_mul, down linear_with_residual, optional allreduce)",
+    "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/allreduce.cuh:30-60 (NVSHMEM tile_sum_reduce_block, NVLS one-shot pull); python/mirage/mpk/multigpu.py:1-60 (capability query for peer access, VMM, multicast)",
+    "MPK paper: https://arxiv.org/abs/2512.22219 (HTML v2: https://arxiv.org/html/2512.22219v2); OSDI'26: https://www.usenix.org/conference/osdi26/presentation/cheng",
+    "Mirage blog post: https://zhihaojia.medium.com/compiling-llms-into-a-megakernel-a-path-to-low-latency-inference-cf7840913c17",
+    "src/megabake/runtime.py:68-108 (grid_barrier), :111-134 (counting_grid_barrier, ~0.7 us), :137-160 (cooperative_worker_loop / cooperative_event_worker_loop), :209-247 (publish_event / wait_for_event with (epoch+1)*trigger_count target, polled with atomic_cas), :250-283 (admit_runtime: cooperative launch and SM-count check)",
+    "src/megabake/schedule.py:294-399 (make_phase_schedule: dependency-level barriers), :487-587 (make_event_schedule: per-tile tasks, worker_id = order % workers at :514, events grouped by producer set), :590-692 (make_region_event_schedule: whole-region events), :816 and :985 (_tile_prerequisites/_tile_dependency), :1364-1386 (_worker_count; fold constants), :1389-1499 (_fold_small_intervals), :1510-1526 (_worker_assignments: contiguous block split)",
+    "src/megabake/codegen.py:194-199 (event schedules only reach the non-table module; table launch always uses barriers), :542-583 (per-region wait_for_event/publish_event emission), :1168-1180 (CTA rotation across phases in one interval), :1395-1431 (table driver loop: phase_table rows, rotation, counting_grid_barrier per interval)",
+    "src/megabake/compiler.py:205-224 (_TABLE_LAUNCH_OPS=1000, 24,000-byte parameter estimate), :240-241 (plan L2 tolerances 1% and 2%), :399 and :707 (scheduler='phase' by default), :734-760 (region-events only when requested)",
+    "src/megabake/bodies/gemm.py:1890-1893 (SWAP_AB_MAX_ROWS=64, justified by the 60-SM measurement), :1903-1915 (SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2); src/megabake/buckets.py:38 (DEFAULT_BUCKETS 16..512); src/megabake/plan.py:501-530 (worker-count search over W, W/2, W/4)",
+    "ROADMAP.md §2.1 (Full models cannot use events), §4.2 (runtime plan), §5 steps 8-11, §6 (measured state 2026-10-17); PERFORMANCE_REPORT.md lines 41-89 and 240-249 (barrier cost history, per-phase attribution)",
+    "artifacts/full_model_2026-10-18/HuggingFaceTB--SmolLM-1.7B/report.json (decode kernel: MegaBake 2,974 us vs Inductor 2,425 us; complete call 3,311 vs 10,323 us), HuggingFaceTB--SmolLM-135M/report.json (1,502 vs 1,382 us), Qwen--Qwen2-0.5B/report.json (1,584 vs 1,636 us), Qwen--Qwen3.5-0.8B/report.json (MegaBake prefill has no result)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "Worker/scheduler SM split",
+      "how_it_works": "The grid is num_workers + num_schedulers/4 CTAs (persistent_checker asserts this). CTAs with blockIdx < num_workers run execute_worker, each owning one task queue, and each holds one SM because of __launch_bounds__(WORKER_NUM_THREADS,1) and large dynamic shared memory. The remaining CTAs run execute_scheduler: lane 0 of each of the first 4 warps is one scheduler with its own event queue. A shared global queue (index num_schedulers) carries broadcast events. Workers and schedulers can also run as two kernels on two streams (split_worker_scheduler). The paper's sizing is 128 workers + 16 scheduler warps (4 SMs) on H100. The repository's get_configurations_from_gpu instead maps >=40 SMs to 30 workers and 4*(sm-30) schedulers, so a 60-SM slice would give 30 SMs to schedulers.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:939-955, 1254-1300, 1525-1563, 1955-2040; agent_space/mirage/include/mirage/persistent_kernel/runtime_header.h:30; agent_space/mirage/python/mirage/utils.py:25-53"
+    },
+    {
+      "idea": "SM-level task graph with tile-granular events (trigger_event / dependent_event counters)",
+      "how_it_works": "Each operator (a KN customized op with a bgraph grid_dim) expands into one task per block id. An edge's events are not per operator. event_dim is gcd(producer partition, consumer partition) along each tensor dim, so a consumer task waits only for the producer tasks that write the slice it reads. Fork and join points unify partitions with an LCM pass, and view-induced edges degrade to one event. Every task stores one trigger_event, which it increments after finishing, and one dependent_event, which it waits on before starting. An EventDesc holds num_triggers and a contiguous [first_task_id,last_task_id) consumer range, produced by linearizing task emission order. The paper reports that this event fusion cuts events 37-118x, to 1,142-2,366 events encoding 69k-162k task-pair dependencies.",
+      "where_in_source": "agent_space/mirage/src/kernel/annotated_graph.cc:748-950; agent_space/mirage/src/kernel/runtime.cc:223-260, 601-640, 736-870; agent_space/mirage/include/mirage/persistent_kernel/runtime_header.h:249-336"
+    },
+    {
+      "idea": "Monotonic, never-reset event counters keyed by iteration number",
+      "how_it_works": "A TaskId packs iteration<<32 | index. On completion, a worker issues atom.add.release.gpu on all_event_counters[e]. The event is ready when count == num_triggers * iteration, so counters are never reset between decode iterations and need no extra fence or reset phase. Waiters poll with ld.acquire (sys scope) plus __nanosleep(10). NVSHMEM events use nvshmem_signal_wait_until on the same counter.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:142-153, 1090-1112, 1166-1240"
+    },
+    {
+      "idea": "Static AOT prelaunch: the whole iteration's tasks are dispatched round-robin up front, and workers wait locally",
+      "how_it_works": "After building the graph, register_mugraph rewrites every LAUNCH_TASKS/LAUNCH_MASSIVE_TASKS event into EVENT_EMPTY and sets dependent_event on its consumer tasks. Event 1, the begin-graph event (LAUNCH_DEPENDENT_TASKS), then covers tasks [2, N). When it fires, the local schedulers split the range and write task ids round-robin into worker queues, so task k goes roughly to worker k mod W. Each worker runs its queue in order. It batch-loads up to 16 TaskDescs into shared memory with cp.async, spins on each task's dependent_event, runs it, and bumps trigger_event. Completed events no longer go through a scheduler. Schedulers only handle END_OF_TASK_GRAPH and the next iteration. Correctness relies on the emission order being topological by depth. The paper describes a hybrid JIT/AOT mode in which workers prefer scheduler-assigned JIT tasks, plus paged 32 KB shared-memory pages for cross-task prefetch. Neither appears in this checkout: no JIT queue code and no smem-page code was found.",
+      "where_in_source": "agent_space/mirage/src/kernel/runtime.cc:949-967; agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:1000-1070 (task fetch), 1424-1475 (round-robin dispatch)"
+    },
+    {
+      "idea": "No grid barriers at all",
+      "how_it_works": "Synchronization is only point-to-point event counters. Iteration boundaries use the END_OF_TASK_GRAPH event, which every leaf task triggers. Scheduler 0 then runs prepare_next_batch and enqueues the begin-graph task with iteration+1. Because counters are monotonic, early tasks of iteration i+1 can start as soon as their own inputs are ready.",
+      "where_in_source": "agent_space/mirage/src/kernel/runtime.cc:924-947; agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:1376-1423"
+    },
+    {
+      "idea": "On-GPU serving loop: continuous batching, chunked prefill, paged KV allocator, runtime token counts",
+      "how_it_works": "prepare_next_batch runs single-threaded on a scheduler warp between iterations. It commits output tokens, detects EOS or max length, frees KV pages back into a ring page_queue, compacts request slots, and admits new requests. It caps prefill chunks by MPK_TOKEN_ROOM(MPK_MAX_NUM_BATCHED_TOKENS) and rebuilds qo_indptr, paged_kv_indptr/indices/last_page_len per KV group (sliding windows supported). The task graph is compiled for the maximum batch tokens. Tasks read qo_indptr and step at runtime, so the token count is a device value, not a recompile or padding bucket. The paper also mentions power-of-two batch-size ttGraphs selected at runtime. This checkout hardcodes num_graphs=1.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:57-75, 279-560, 1794; agent_space/mirage/include/mirage/persistent_kernel/runtime_header.h:353-407"
+    },
+    {
+      "idea": "Host-device interaction through pinned lock-free rings (one launch for a whole generation)",
+      "how_it_works": "In offline mode one kernel launch runs every decode iteration until all requests finish. In MODE_ONLINE_PINNED the CPU writes requests into a pinned ring (ready flag with release semantics) and the GPU consumes them with ld.acquire.sys. The GPU publishes per-row progress (pinned_step) and completions with st.release.sys for CPU streaming, and a pinned shutdown flag ends the kernel. The host never launches per step.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:563-840; agent_space/mirage/include/mirage/persistent_kernel/runtime_header.h:408-450; agent_space/mirage/python/mirage/mpk/online_pinned_runtime.py"
+    },
+    {
+      "idea": "Multi-GPU inside the megakernel via NVSHMEM",
+      "how_it_works": "Event ids carry an NVSHMEM tag and a target GPU. Workers have a second remote queue fed by remote schedulers. AllReduce is a task (TASK_NVSHMEM_TILE_ALLREDUCE) using nvshmemx tile_sum_reduce_block with NVLS one-shot pull. In the paper, AllReduce is decomposed into signal-wait transfer tasks plus local reduce tasks that overlap with compute. Buffers come from nvshmem_malloc when USE_NVSHMEM is defined.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/allreduce.cuh:30-60; agent_space/mirage/src/kernel/runtime.cc:30-39; agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:983-990, 1546-1563; agent_space/mirage/python/mirage/mpk/multigpu.py"
+    },
+    {
+      "idea": "Operator fusion into few task types per layer, with linears split into a multiple of the worker count",
+      "how_it_works": "A Qwen3 decode layer on Hopper has about 8 task layers: rmsnorm, fused qkv linear, paged attention (with RoPE and qk-norm), o_proj linear_with_residual, rmsnorm, fused gate_up linear, silu_mul, down linear_with_residual. Linears use 64 or 96 tasks (grid_for_rmsnorm_linear_layer), so every operator has many independent tiles and events can overlap neighbouring operators. The Hopper linear is swapAB with batch <= 16.",
+      "where_in_source": "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:354-551; agent_space/mirage/python/mirage/mpk/models/utils.py:3-15; agent_space/mirage/src/kernel/task_register.cc:1588-1650"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "Worker/scheduler SM split",
+      "status": "not_applicable",
+      "evidence": "src/megabake/runtime.py:250-283 (cooperative launch, every CTA is a worker); src/megabake/codegen.py:1395-1431",
+      "notes": "MegaBake's schedule is fully static: every CTA computes its tiles from phase_table and blockIdx with no scheduler CTAs, which is right for 60 SMs. MPK's own runtime is effectively static too (AOT prelaunch), so dedicated scheduler SMs would only pay off for JIT/dynamic load balancing or on-GPU batching. Do not copy the split. If on-GPU batching is added, give it to one warp of one worker."
+    },
+    {
+      "idea": "SM-level task graph with tile-granular events (trigger_event / dependent_event counters)",
+      "status": "partial",
+      "evidence": "src/megabake/schedule.py:487-587 (make_event_schedule builds per-tile tasks and events from _tile_prerequisites), :590-692 (region events); src/megabake/codegen.py:194-199 and :542-583; ROADMAP.md §5 step 10 'not started'; ROADMAP.md §2.1",
+      "notes": "The planner already derives tile-level prerequisites (finer than MPK's GCD partition: exact tile overlap). Only whole-region events are code-generated, and only in the per-tensor-parameter module. Every full model uses the table launch, which has only grid barriers (counting_grid_barrier at each interval end). Events are not grouped with MPK's GCD/LCM fusion or contiguous-range linearization, so a naive per-tile encoding would be large."
+    },
+    {
+      "idea": "Monotonic, never-reset event counters keyed by iteration number",
+      "status": "implemented",
+      "evidence": "src/megabake/runtime.py:111-134 (counting_grid_barrier uses (ordinal+1)*workers), :227-247 (wait_for_event uses (epoch+1)*trigger_count); call counter in ready buffer (runtime.py:42-48)",
+      "notes": "The same idea is used for barriers and region events. Differences: wait_for_event polls with atomic_cas, a read-modify-write, where MPK uses ld.acquire plus nanosleep. MegaBake keeps int32 counters and resets before wrap, where MPK uses u64. Switching wait_for_event to an acquire load reduces L2 atomic contention when many CTAs poll one counter."
+    },
+    {
+      "idea": "Static AOT prelaunch: the whole iteration's tasks are dispatched round-robin up front, and workers wait locally",
+      "status": "partial",
+      "evidence": "src/megabake/schedule.py:514 (worker_id = order % workers, same as MPK); src/megabake/schedule.py:1510-1526 and codegen.py:1168-1180 (contiguous split plus CTA rotation per interval)",
+      "notes": "The event schedule data structure matches MPK's AOT model (static per-worker task list, waits on counters). The emitted table kernel instead runs phase by phase: a CTA finishes all its tiles of phase p before p+1 and waits at each interval's barrier. MegaBake has no per-task descriptor table (phase_table rows are per phase, not per tile) and no shared-memory prefetch of upcoming descriptors."
+    },
+    {
+      "idea": "No grid barriers at all",
+      "status": "missing",
+      "evidence": "ROADMAP.md §1 (~6 barrier intervals per layer after folding; 135M 333 -> 183 barriers per decode); runtime.py:111 counting_grid_barrier ~0.7 us each; codegen.py:1429-1431",
+      "notes": "MegaBake pays roughly 180 barriers per 135M decode call and about 150 [uncertain] per 1.7B call, about 0.1-0.13 ms of pure barrier latency. A larger cost is the drain/start-up bubble at each interval: the slowest CTA gates all 60, and small-N phases such as K/V projections fill 3 of 60 CTAs (PERFORMANCE_REPORT.md:79)."
+    },
+    {
+      "idea": "On-GPU serving loop: continuous batching, chunked prefill, paged KV allocator, runtime token counts",
+      "status": "missing",
+      "evidence": "src/megabake/buckets.py:38 (static buckets 16..512 with padding); ROADMAP.md §6 'Gaps' (a runtime token count would remove padding); KV caches are fixed-capacity tensors with a device-published valid length (lowering.py:164-177; codegen deferred length publish)",
+      "notes": "MegaBake has a runtime KV length (decode attention reads a device valid length), but token count is static per bucket, batch is static, and there is no paging, request admission or EOS handling on the device. These are serving features. For the stated goal (a generic compiler for HF/PyTorch models), a runtime token count (qo_indptr-style) matters most because it removes bucket padding (a 65-token prompt pays for 128)."
+    },
+    {
+      "idea": "Host-device interaction through pinned lock-free rings (one launch for a whole generation)",
+      "status": "partial",
+      "evidence": "src/megabake/runtime.py:37-48 (64-entry host-mapped address ring, device call counter, constant kernel arguments); ROADMAP.md §6 (host work 634 -> 360 us; Dynamo guards ~290 us)",
+      "notes": "MegaBake still launches once per forward call through Dynamo. Host cost (~360 us + ~290 us guards) is about 20% of a 1.7B call and over 30% of a 135M call (complete 2,138 us vs kernel 1,502 us). A multi-step persistent decode loop (sampling on device, pinned flag for stop) would need argmax/sampling inside the graph and a generic stop condition."
+    },
+    {
+      "idea": "Multi-GPU inside the megakernel via NVSHMEM",
+      "status": "missing",
+      "evidence": "No NVSHMEM or collective code in src/megabake; target is a single MIG slice",
+      "notes": "Not relevant on the current hardware (a MIG slice cannot use NVLink peers). Keep the event-id format extensible (a GPU id field) so remote events can be added later."
+    },
+    {
+      "idea": "Operator fusion into few task types per layer, with linears split into a multiple of the worker count",
+      "status": "partial",
+      "evidence": "ROADMAP.md §5 step 8 (fold small intervals into consumers as recompute phases; 135M 11 -> ~6 intervals per layer), step 7 (bias epilogue); ROADMAP.md §4.2 item 3 (RMSNorm prologue and residual/SiLU epilogues not done); bodies/gemm.py:1903-1915 split-K built, off",
+      "notes": "MegaBake fuses through generic recompute folding instead of hand-written fused tasks, which is more general. It still has separate GEMM phases for q/k/v and gate/up where MPK fuses weights. Fused-weight QKV/gate-up is a graph rewrite (concat weights of GEMMs sharing an input) that could be done generically."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Tile-granular cross-operator dependencies (consumer tile starts when only its producer tiles are done)",
+      "why_multikernel_cannot": "Between kernels the dependency is kernel-complete. PDL (cudaGridDependencySynchronize / griddepcontrol) only lets the next kernel's prologue run early. Its main body still waits for the whole previous grid to trigger or exit, and it cannot express 'tile j of B depends on tiles 2j,2j+1 of A'. Stream-level concurrency needs independent kernels.",
+      "nearest_substitute": "CUDA Graphs plus PDL hide launch latency (~0.8 us per kernel in the MPK paper) and overlap prologues (smem setup, descriptor prefetch). The kernel-wide tail of each operator remains. That tail is what MegaBake's grid barriers also pay today, so MegaBake gains nothing exclusive until step 10 lands."
+    },
+    {
+      "opportunity": "Weight prefetch for the next operator while waiting on events (cross-task software pipelining)",
+      "why_multikernel_cannot": "A later kernel's CTAs do not exist until the earlier kernel's CTAs retire (or, with PDL, its prologue can start but competes for SM residency). A resident CTA that knows its next task can issue cp.async.bulk.prefetch.L2 or TMA loads for its next weight tiles before the dependency is satisfied, because weights do not depend on activations. The MPK paper attributes a 1.2-1.3x speedup on the final linear (Qwen3-8B, B200) to this.",
+      "nearest_substitute": "PDL with weight prefetch in the prologue before griddepcontrol.wait gets part of this, but only one kernel ahead and only if the next kernel is co-resident."
+    },
+    {
+      "opportunity": "Overlap of under-filled operators (K/V projections, norms, attention over few heads) with other independent work",
+      "why_multikernel_cannot": "Concurrent kernels on multiple streams can overlap, but the graph partitioner must prove independence. Each kernel still carries launch, drain and tail costs, and small kernels block SM slots unpredictably. In a megakernel, idle CTAs pull the next ready task from their static queue.",
+      "nearest_substitute": "Multi-stream CUDA graphs with fork/join (Inductor does not do this by default). Horizontal fusion of independent GEMMs (q/k/v concatenation) is the practical substitute and also works in MegaBake."
+    },
+    {
+      "opportunity": "Device-resident serving loop (batching, KV paging, sampling, stop detection) with zero host round trips per token",
+      "why_multikernel_cannot": "A CUDA graph is fixed. Changing batch composition, sequence length or page tables per step needs a host decision or device-side graph launch. A persistent kernel can rebuild its own metadata between iterations and loop without returning.",
+      "nearest_substitute": "CUDA graphs captured per batch size plus host-side scheduling (vLLM/SGLang), costing tens of microseconds of host work per step, overlapped through async scheduling. Device graph launch (cudaGraphLaunch from device) is a partial alternative with limits."
+    },
+    {
+      "opportunity": "Compute-communication overlap at tile granularity (NVSHMEM signal per tile)",
+      "why_multikernel_cannot": "NCCL collectives are separate kernels with whole-tensor granularity. Overlapping them needs streams and SM partitioning. Inside a megakernel a reduce task starts as soon as its tile's remote signal arrives. The MPK paper reports 1.1x per-iteration gain on Qwen3-1.7B with 4x H100.",
+      "nearest_substitute": "Fused GEMM+AllReduce kernels (e.g. cuBLASMp, Flux, TransformerEngine userbuffers). Not relevant on a single MIG slice."
+    }
+  ],
+  "measured_or_reported_gains": "MPK paper (arXiv 2512.22219v2): 1.0-1.7x lower end-to-end latency than vLLM/SGLang (with CUDA graphs) on A100/H100/B200, batch 1-16, 64-token prompts, 1,024 output tokens, bf16. Gains are largest for small models and newer GPUs. Qwen3-8B on A100 at batch 1: 14.5 -> 12.5 ms per token, against a ~10 ms weight-load floor. Multi-GPU Qwen3-1.7B TP on 8x H100: 1.1-1.4x over SGLang/vLLM. Ablations: in-kernel scheduler is 0.28% of runtime; cross-task pipelining speeds the final linear 1.2-1.3x (Qwen3-8B, B200); compute-communication overlap 1.1x (Qwen3-1.7B, 4x H100); event fusion 37-118x fewer events; launch overhead estimate for Qwen3-8B is 293 launches x 3.8 us = 1.1 ms eager, ~0.2 ms with CUDA graphs. The README states 1.2-6.7x over unspecified baselines [uncertain: baseline mix not stated]. MegaBake measured (artifacts/full_model_2026-10-18, H200 MIG 3g.71gb): decode kernel GPU time SmolLM-135M 1,502 us vs Inductor 1,382 us; SmolLM-1.7B 2,974 vs 2,425 us; Qwen2-0.5B 1,584 vs 1,636 us. Complete calls: 2,138 / 3,311 / 2,380 us vs Inductor 11,925 / 10,323 / 10,739 us. Qwen3.5-0.8B prefill: no MegaBake result. No MPK number exists for a 60-SM slice. MPK's own heuristic would run there with 30 workers.",
+  "expected_impact_on_megabake": "Ranked by expected decode gain on the 60-SM slice. Baselines: 1.7B kernel 2.97 ms (GEMMs ~1.92 ms at ~1.8 TB/s; weight floor ~1.5 ms), 135M kernel 1.50 ms (weight floor ~0.12 ms, so latency-bound).\n(1) Events in the table launch, at phase level first (step 10). Removes about 150-180 counting barriers at 0.7 us, a direct 0.10-0.13 ms. More importantly, it removes the interval drain: phases with few tiles (K/V GEMMs on 3 of 60 CTAs, norms, attention) let other CTAs start the next independent or partially ready work. Estimate: 135M 1.50 -> 1.1-1.25 ms (-15-25%), 1.7B 2.97 -> 2.6-2.75 ms (-8-12%) [uncertain: depends on how much of the ~1.05 ms non-GEMM time on 1.7B is serial latency versus barrier wait; measure with tools/phase_profile.py stamps].\n(2) Cross-phase L2 weight prefetch while waiting on events (step 9), which needs (1) to be useful. It lets GEMM phases start with warm L2, lifting effective GEMM bandwidth from ~1.8 toward ~2.0 TB/s: 1.7B GEMM time 1.92 -> ~1.7 ms, about -0.2 ms (-7%). Small effect on 135M (weights are only ~0.27 GB at bf16).\n(3) Tile-granular events with GCD/LCM-style grouping. Beyond phase-level events this lets attention start per KV head as soon as that head's q/k/v tiles land, and lets o_proj start per head group. Estimate a further 3-8% on 135M, 2-4% on 1.7B [uncertain].\n(4) Persistent multi-step decode loop with device sampling and stop flag. This is not kernel time but complete-call time: it removes ~0.36 ms MegaBake host work + ~0.29 ms Dynamo guards per token (about 0.6 ms of the 2.14 ms 135M call, ~28%; ~0.5 ms of the 3.31 ms 1.7B call, ~15%). Pipelined calls already hide part of this (1,498 us vs 2,135 us on 135M), so the real gain is the non-overlapped remainder.\n(5) Runtime token count instead of buckets (qo_indptr-style). Prefill padding waste is up to 2x per bucket boundary (65 tokens paying for 128). That does not fix the 3-21x prefill gap, which comes from the prefill attention body and the >64-row GEMM path.\n(6) Worker/scheduler split, paging, NVSHMEM: no gain on this hardware.\nCombined realistic target after (1)-(3): 1.7B decode kernel ~2.3-2.5 ms, around Inductor's 2.42 ms. That is still short of ROADMAP's 2.0 ms goal without fused QKV/gate-up and epilogue fusions. 135M ~1.0-1.2 ms, beating Inductor's 1.38 ms kernels [uncertain].",
+  "generality_and_overfitting_risk": "MPK is not model-generic. Models are hand-written builders (python/mirage/mpk/models/qwen3/builder.py and others), and runtime_header.h:87-226 hardcodes per-model task types (Inkling, GLM, GPT-OSS, DeepSeek MLA TP2/4/8 variants). Grid sizes come from grid_for_rmsnorm_linear_layer (models/utils.py:3-15), whose comment says 96 and 64 were chosen to cover Qwen3. Split-K is only enabled on target_cc==100 (qwen3/builder.py:293). The Hopper linear asserts batch<=16 (task_register.cc:1634). The worker count comes from an SM-count lookup table (python/mirage/utils.py:33-53) that maps a 60-SM device to 30 workers and 120 schedulers, which is clearly not tuned for MIG slices. The runtime mechanism is generic: monotonic counters, GCD/LCM event derivation and AOT round-robin queues depend on no model or GPU. MegaBake should copy that and not the builders.\nMegaBake items that look tuned to the tested models or the 60-SM slice: (a) bodies/gemm.py:1890-1893 SWAP_AB_MAX_ROWS=64, justified by a 60-SM measurement. (b) compiler.py:205-224 _TABLE_LAUNCH_OPS=1000 and 24,000-byte parameter estimate; this is a hard switch that decides whether events are available at all, so small graphs get events and full models do not. (c) schedule.py:1384-1386 _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6, tuned on SmolLM decode (135M 333 -> 183 barriers). (d) bodies/gemm.py:1903-1905 SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2, plus split-K being off because it gave 'no gain on the 60-SM slice'; that conclusion may flip on 132-SM H100 where tiles < workers more often. (e) compiler.py:240-241 plan tolerances (1% / 2%), explained with the 30-layer SmolLM. (f) buckets.py:38 DEFAULT_BUCKETS (16..512). (g) The schedule.py:514 round-robin plus codegen.py:1168-1180 CTA rotation assume one CTA per SM (PERFORMANCE_REPORT notes 214 KB GEMM smem fixes occupancy at 1). Positives: plan.py:501-530 searches worker counts {W, W/2, W/4} from target.multiprocessor_count, and admit_runtime checks SM count. That is better than MPK's lookup table.\nHow to avoid overfitting: derive thresholds from TargetFacts (SM count, smem, bandwidth) through a small cost model, e.g. swapAB when rows <= the WGMMA N limit and weight-tile share per stage beats activation share. Measure candidates at compile time (plan.py already does this) instead of constants. Express fold limits in estimated microseconds versus measured barrier cost, not in rounds. Keep the events/barrier choice independent of the launch encoding, so the table launch carries events for every graph size.",
+  "hardware_portability": "Portable to SM80/SM90/SM100 unchanged: monotonic event counters (atom.add.release / ld.acquire.gpu, scope gpu), static per-worker task queues, GCD/LCM event derivation, device-side batch metadata, pinned rings (ld.acquire.sys/st.release.sys need SM70+). They depend only on a co-resident grid, which cooperative launch or occupancy-sized grids provide. The scheduler warps need nothing special. SM90-specific pieces around the runtime are TMA descriptors stored per task (MPK keeps up to 3 TMA desc pointers per tensor in TaskDesc; MegaBake writes descriptors from the address table in the prologue), WGMMA swapAB bodies, setmaxnreg (MPK fixes registers at the max over all task types; MegaBake decreases registers in GEMM warps, which PERFORMANCE_REPORT item 11 flags as unverified when generic bodies follow), and cp.async.bulk.prefetch.L2 for cross-phase prefetch (SM90+; SM80 can use ordinary prefetch.global.L2 or cp.async). On SM100, CLC (cluster launch control) could replace static queues for dynamic tile stealing, and TMEM/tcgen05 change only bodies. MPK's SM100 paths add split-K and 2-CTA MMA. Keeping it target-generic: put the event table, counters and queue layout in plan/runtime with no architecture assumptions. Restrict per-target code to bodies (bodies/blackwell.py already exists). Use target-queried constants (SM count, smem, max active blocks), and pick the barrier-versus-event and prefetch strategy per target through a cost model, not fixed flags.",
+  "recommended_actions": [
+    {
+      "action": "Add event counters to the table launch at phase granularity: per-phase counter slots in the ready buffer, phase_table columns for (wait_event, wait_target_per_epoch, publish_event). The wait uses ld.acquire polling with nanosleep, not atomic_cas. Generate barriers only where storage reuse demands them (workspace lifetime ends). Make make_region_event_schedule the default for table launches.",
+      "expected_gain": "135M decode kernel -15-25%, 1.7B -8-12% [uncertain]; removes ~150-180 barriers per call",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/codegen.py (table driver loop 1395-1431, phase_rows), src/megabake/runtime.py (wait_for_event polling, ready buffer layout), src/megabake/schedule.py (region events per interval), src/megabake/memory.py (workspace lifetimes keyed to events instead of barriers), src/megabake/compiler.py (default scheduler)",
+      "prerequisite": "Workspace lifetime analysis must express 'freed after event e completes for epoch k' instead of 'freed at barrier'"
+    },
+    {
+      "action": "Lower tile-level prerequisites (make_event_schedule) to compact events with MPK-style grouping: GCD of producer/consumer partitions per edge, LCM at fork/join, and contiguous consumer ranges after linearizing task order. Store a per-CTA task list (static, round-robin like MPK) as a device table of (phase, tile, wait_event, publish_event).",
+      "expected_gain": "Additional 3-8% on 135M, 2-4% on 1.7B decode; enables partial attention start per KV head [uncertain]",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/schedule.py (_tile_prerequisites, make_event_schedule), src/megabake/codegen.py (per-task table emission), src/megabake/plan.py",
+      "prerequisite": "Phase-level events in the table launch (previous action)"
+    },
+    {
+      "action": "While a CTA waits on an event, issue cp.async.bulk.prefetch.L2 for the weight tiles of its next GEMM task (ROADMAP step 9). Bound the prefetch to an L2 budget derived from TargetFacts.",
+      "expected_gain": "1.7B GEMM phase time 1.92 -> ~1.7 ms (~-7% kernel)",
+      "effort": "M",
+      "generality": "hw-specific",
+      "files_to_touch": "src/megabake/bodies/gemm.py, src/megabake/codegen.py, src/megabake/runtime.py",
+      "prerequisite": "Events in table launch; target fact for L2 size"
+    },
+    {
+      "action": "Make thresholds target-derived: replace SWAP_AB_MAX_ROWS, split-K limits, fold limits and _TABLE_LAUNCH_OPS gating with cost-model or measured decisions using TargetFacts. Re-test split-K and swapAB on a full-SM H100/H200 or another MIG profile before claiming defaults.",
+      "expected_gain": "Avoids regressions on other GPUs; no direct speedup on the current slice",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py:1890-1915, src/megabake/schedule.py:1384-1386, src/megabake/compiler.py:205-241, src/megabake/plan.py",
+      "prerequisite": "Access to a second hardware configuration"
+    },
+    {
+      "action": "Generic horizontal fusion: concatenate weights of GEMMs that share an input and have no dependency between them (q/k/v, gate/up), mirroring MPK's fused qkv and gate_up weights but derived from the graph, not a builder.",
+      "expected_gain": "Fewer under-filled GEMM phases; about 2 fewer phases per layer; estimated -3-6% decode kernel [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/regions.py, src/megabake/lowering.py, src/megabake/memory.py",
+      "prerequisite": "Weight concatenation at compile time with aliasing checks"
+    },
+    {
+      "action": "Runtime token count: compile a bucket for max tokens and pass the actual token count (and qo_indptr for batched requests) as a device value read by bodies. Tiles beyond the count exit early, as MPK tasks do.",
+      "expected_gain": "Removes up to 2x padding waste at bucket edges; reduces number of compiled buckets",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/buckets.py, src/megabake/bodies/*.py, src/megabake/codegen.py, src/megabake/lowering.py",
+      "prerequisite": "Bodies that tolerate a runtime row count (GEMM TMA bounds, attention masks)"
+    },
+    {
+      "action": "Optional multi-step persistent decode: keep the kernel resident across N decode steps with on-device argmax/sampling, a pinned stop flag and device-side KV length advance (MPK offline mode pattern).",
+      "expected_gain": "Removes ~0.5-0.65 ms host plus Dynamo cost per token on small models (15-30% of complete call)",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/runtime.py, src/megabake/codegen.py, src/megabake/main.py, decode wrapper (DecodeStep)",
+      "prerequisite": "Sampling and stop condition expressible in the captured graph; events (so iteration boundaries need no host)"
+    },
+    {
+      "action": "Batch-prefetch upcoming phase_table rows and TMA descriptors into shared memory (MPK loads up to 16 TaskDescs per cp.async batch) once per-task tables exist.",
+      "expected_gain": "Small (<1-2%), hides table reads behind compute",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/codegen.py",
+      "prerequisite": "Per-task table"
+    }
+  ],
+  "open_questions": [
+    "How much of the ~1.05 ms non-GEMM time on 1.7B decode is barrier wait or drain versus inherently serial latency? Settle by extending tools/phase_profile.py to stamp each CTA's arrival and release time per barrier, then summing per-CTA idle time.",
+    "Would MPK itself run well on a 60-SM MIG slice? Its heuristic would choose 30 workers. Settle by building MPK qwen3 (Qwen3-0.6B/1.7B) with num_workers=56-58 and 1 scheduler SM and comparing per-token latency with MegaBake on the same slice, once the GPU is free.",
+    "Does the paper's JIT/AOT hybrid and paged shared memory exist in a different branch? Neither is in this checkout (persistent_kernel.cuh shows only AOT prelaunch; num_graphs=1). Settle by searching upstream branches or PRs on github.com/mirage-project/mirage.",
+    "Is in-order execution per worker with round-robin assignment (head-of-line blocking) a problem for MegaBake's uneven phases? Settle by simulating with simulate_event_schedule using measured per-tile durations from phase_profile.",
+    "Can workspace reuse stay as aggressive with events as with barriers? Settle by computing peak workspace for 1.7B decode under event-based lifetimes versus barrier lifetimes in memory.py.",
+    "Is setmaxnreg decrease in GEMM warps followed by generic bodies safe once phases interleave out of barrier order? Settle with compute-sanitizer racecheck and a teacher-forced verification run under the event schedule.",
+    "What are the actual post-folding barrier counts per call for 1.7B and Qwen2-0.5B decode? Settle by reading the generated phase_table (dumps in artifacts/full_model_2026-10-18/*/dumps) or rerunning phase_profile."
+  ],
+  "uncertain": [
+    "expected_impact_on_megabake",
+    "measured_or_reported_gains"
+  ]
+}

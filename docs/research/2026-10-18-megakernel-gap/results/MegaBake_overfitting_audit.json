@@ -1,0 +1,338 @@
+{
+  "name": "MegaBake overfitting audit",
+  "scope": "Static audit (no GPU runs) of /workspace/megabake/src/megabake (compiler.py, plan.py, planner.py, schedule.py, regions.py, lowering.py, runtime.py, buckets.py, bodies/gemm.py, bodies/attention.py, bodies/generic.py, bodies/blackwell.py, fx_handler/hf_attention.py), benchmarks/stateful_models.py and benchmarks/full_model.py, tests/{unit,gpu,integration}, ROADMAP.md/PERFORMANCE_REPORT.md, git history (155 commits; tuned constants mostly introduced in a538d68 2026-10-16, e96e83f and bd40bf3 2026-10-17), the benchmark reports in artifacts/full_model*/ and the Mirage reference (agent_space/mirage/python/mirage/mpk/models/utils.py). Question answered: which compiler parameters, thresholds, tile sizes, worker counts, swapAB cutoffs, buckets, region matchers, stride heuristics, per-model wrappers, SM90/60-SM/BF16 assumptions and search budgets are generic, hardware-specific, or fitted to the tested models (SmolLM-135M/1.7B = Llama, Qwen2-0.5B, Gemma-3-270M, Qwen3.5-0.8B) and the H200 MIG 3g.71gb slice; what generic replacement each should get; and how well tests cover model families. Headline: the compiler core contains no model names (only comments), and worker count/SM count/shared memory come from device properties, but (1) for every real model (table launch) plan search is disabled (max_plans=1, max_compilations=1), so all performance choices are static constants; (2) the table-launch GEMM has exactly one tile config per launch (64x64x64, 8 stages, fixed 1 KiB+128 KiB+16 KiB smem, swapAB token tile 16/32/64 picked by max rows); (3) the interval-folding thresholds (2 rounds/phase, 6 rounds, 6 phases, 256 threads x 4 elements) cap folding at 2048-element maps and <=2-row reductions, which is exactly SmolLM-1.7B hidden size, so 4096-hidden models get no folding; (4) every tuned body is BF16-only and SM90a-only; (5) attention scratch caps KV length at 8192 keys and sliding windows are avoided rather than implemented; (6) GPU tests are almost exclusively the Llama/SmolLM fixture.",
+  "key_sources": [
+    "src/megabake/compiler.py:205 (_TABLE_LAUNCH_OPS=1000), :210 (_TABLE_LAUNCH_PARAMETER_BYTES=24000), :213-224 (_uses_table_launch)",
+    "src/megabake/compiler.py:236-248 (_PLAN_RELATIVE_L2_LIMIT 0.01, _TABLE_PLAN_RELATIVE_L2_LIMIT 0.02 justified by 30-layer SmolLM, _REGION_RELATIVE_L2_LIMIT 0.01 justified by SmolLM-1.7B)",
+    "src/megabake/compiler.py:414-431 (default SelectionPolicy: swapAB when table launch and all GEMM rows <=64; split-K only via MEGABAKE_SPLIT_K env; table launches forced to SearchBudget(max_plans=1, max_compilations=1))",
+    "src/megabake/compiler.py:1497-1515 (_target_facts: arch allow-list sm90/sm100/103/120/121, max_registers_per_thread=255 constant, supports_tma=True constant, supports_wgmma only for sm90; SM count and smem from torch.cuda.get_device_properties)",
+    "src/megabake/bodies/gemm.py:1708-1711 (TABLE_GEMM_SHARED_BYTES = 1024 + 8*2*64*64*2 + 4*64*32*2, one smem layout for all table GEMMs)",
+    "src/megabake/bodies/gemm.py:1847-1884 (G0 provider: sm90a only; table launch emits exactly one config (token_tile x 64, 8 stages) or (64,64); non-table path offers (64,64,13 stages,230400 B) and (64,128,8 stages,214016 B))",
+    "src/megabake/bodies/gemm.py:1887-1918 (SWAP_AB_MAX_ROWS=64, SWAP_AB_ROW_TILES=(16,32,64), SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2, split_k_count); comment 'On 60 SMs this doubles decode GEMM bandwidth'",
+    "src/megabake/bodies/gemm.py:1814-1820, :1938 (BF16-only operands, output and bias)",
+    "src/megabake/bodies/gemm.py:216-217 (setmaxnreg 40/232), :220 (smem capacity default get_smem_capacity_in_bytes('sm_90')), :2160 (participating_threads=256), :2232-2238 (evidence: max_admitted_workers 60, measured us)",
+    "src/megabake/bodies/attention.py:107-140 (numerical_policy must be BF16 scores/probabilities, FP32 stats; BF16 Q/K/V/output only), :220-221 (sm90a+WGMMA required although the body is CUDA-core warp-per-row code), :260-267 (ATTENTION_SCRATCH_ROWS=16, ATTENTION_SCRATCH_BYTES=32 KiB, _VALUE_BLOCK=8, _VALUE_UNROLL=8), :270 (attention_scratch_rows -> rejects kv_length > 8192)",
+    "src/megabake/bodies/attention.py:422-423 (DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64), :486 (split-context only when head_dim % 32 == 0), :738-751 (decode_chunks cost passes/chunks*(1+0.15*(passes-1)))",
+    "src/megabake/bodies/generic.py:34-35,53-54,83-84 (128 threads, 128-element tiles), :441 (MAP_ELEMENTS_PER_THREAD=4), :454-475 (single_cta_rounds), :478 (_UNROLL_ITERATIONS=16)",
+    "src/megabake/schedule.py:1380-1386 (_FOLD_FAMILIES, _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6), :1409-1431 (threads = max participating threads, typically 256 from GEMM; rounds = rows for reductions)",
+    "src/megabake/schedule.py:1365-1378 and src/megabake/plan.py:490-509 (worker count = min(max work items, SM count x active blocks); search also tries /2 and /4)",
+    "src/megabake/plan.py:286-291 (SearchBudget max_plans=8, max_compilations=8, timing_samples=8), :534 (worker_search_selections = max_compilations//3), :698 (_TIE_TOLERANCE=0.05)",
+    "src/megabake/planner.py:271-280, :347-349 (combination_limit = max_plans*16; beyond it only the greedy seed 'largest region first' is used), :475 (_TILE_MAP_CACHE_LIMIT=8192)",
+    "src/megabake/regions.py:147-190 (fusion candidate order), :501-683 (_rms_norm_candidates: anchored on aten.mean.dim), :686-819 (_rms_norm_chain: pow.Tensor_Scalar -> mean -> add scalar eps -> rsqrt -> mul -> optional cast/weight-mul/residual; weight must be a graph input), :836-1007 (_rotate_half_rope_candidate, HF rotate_half), :1010-1243 (_rope_candidate), :1250-1290 (_attention_head_axes stride heuristic, size-1 axis special case), :2159-2288 (_gated_mlp_candidate: SiLU only, always rejected at :2240 'paired GEMM provider is not implemented')",
+    "src/megabake/lowering.py:1855-1870 (kv_attention lowering: contiguous BF16 caches, one-token decode only)",
+    "src/megabake/buckets.py:38 (DEFAULT_BUCKETS=(16,32,64,128,256,512)), :42 (_RELATIVE_L2_LIMIT=0.05)",
+    "src/megabake/runtime.py:28 (PHASE_TIMER_SLOTS), :39 (DYNAMIC_ADDRESS_RING=64), :68-90 (grid barrier, comment on 13 us at 60 workers)",
+    "src/megabake/fx_handler/hf_attention.py:43-56 (softcap/sinks fall back to eager), :125-133 (sliding window: raises if cache capacity > window, i.e., window semantics avoided not implemented), :134-137 (non-default scaling folded into q), :147 (_ATTENTION_LAYERS full/sliding only), :174 (state default BF16, batch 1)",
+    "src/megabake/bodies/blackwell.py:19-60 (BLACKWELL_ARCHITECTURES, plain unbiased GEMM only)",
+    "benchmarks/stateful_models.py:40-166 (StatefulCausalLM: hard-coded Qwen3.5 output-gate detection by q_proj width at :78-83, Gemma sandwich-norm detection via hasattr at :153-157, gated-delta-rule eps 1e-6 at :37, BF16 caches, batch 1, sliding window guard at :64-66)",
+    "benchmarks/full_model.py:171-191 (decode_module: model_type=='llama' -> hand-written StatefulSmolLM 'the tests and published numbers use'; other attention models -> DecodeStep; hybrids -> StatefulCausalLM)",
+    "tests/fixtures.py:321-346 (StatefulSmolLM / tiny LlamaConfig fixture), tests/gpu/test_task31_full_model.py, tests/gpu/test_table_gemm.py (SmolLMArchitecture only), tests/unit/test_hf_attention.py:11-102 (Llama, Gemma3, Qwen3 configs, CPU-level), tests/gpu/test_pointwise_view_coverage.py:16,60 (Qwen3.5/Gemma pointwise ops), tests/gpu/test_gemm_range_body.py:47 (asserts compute capability (9,0))",
+    "ROADMAP.md:5,27,34,83-92,116-149,182-224 (tuning history, which model each step was validated on; split-K 'no gain on the 60-SM slice')",
+    "PERFORMANCE_REPORT.md:10,41,273-287 (135M-only measurement basis; generic elementwise 40x slower than native; setmaxregister safety unconfirmed)",
+    "git: a538d68 (2026-10-16, decode chunks / grid coverage), e96e83f (2026-10-17, table-launch thresholds and L2 tolerances), bd40bf3 (2026-10-17, SWAP_AB_MAX_ROWS 16->64, SWAP_AB_ROW_TILES, fold limits, buckets)",
+    "artifacts/full_model_2026-10-18/*/report.json and artifacts/full_model/*/report.json (models actually benchmarked: SmolLM-135M, SmolLM-1.7B, Qwen2-0.5B, Qwen3.5-0.8B (prefill fails on aten.cumsum), older: Gemma-3-270M, gemma-2b, DeepSeek-V3-DRAFT-0.6B, Beam-1.0 DFlash2 draft)",
+    "agent_space/mirage/python/mirage/mpk/models/utils.py:3-34 (Mirage grid_for_rmsnorm_linear_layer hard-codes 96/64 'enough to cover all Qwen3 model'; split-K grid derived from divisibility)",
+    "https://docs.nvidia.com/cutlass/media/docs/cpp/heuristics.html (CUTLASS GEMM heuristics via nvMatmulHeuristics: rank kernel configs by estimated performance for problem size + SKU, then profile a short list)",
+    "https://docs.nvidia.com/cuda/nvidia-matmul-heuristics/ (analytic GEMM config model incl. split-K, L2 hit rate, Ampere..Blackwell)",
+    "https://developer.nvidia.com/blog/improving-gemm-kernel-auto-tuning-efficiency-on-nvidia-gpus-with-heuristics-and-cutlass-4-2 (heuristic shortlist + profile workflow)",
+    "https://triton-lang.org/main/python-api/generated/triton.autotune.html (prune_configs_by: perf_model, top_k, early_config_prune)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "Table-launch plan search is disabled for every real model",
+      "how_it_works": "compile() switches to the table-driven launch when the graph has >1000 ops or >24 KB estimated kernel parameters; whenever that happens and the caller gave no budget it sets SearchBudget(max_plans=1, max_compilations=1). enumerate_body_selections then returns only the greedy seed (largest fused region first), worker count is min(work items, SMs x active blocks), and nothing is measured. All tested full models are table launches, so their plans are pure heuristics; the measured-search machinery (worker /2,/4 variants, 5% tie tolerance) only runs on small test graphs.",
+      "where_in_source": "src/megabake/compiler.py:205-224, :427-431; src/megabake/planner.py:271-349; src/megabake/plan.py:490-540"
+    },
+    {
+      "idea": "Single fixed GEMM tile per table launch (64x64x64 BF16, 8 stages) with swapAB token tile 16/32/64",
+      "how_it_works": "All table-launched GEMMs share one shared-memory layout TABLE_GEMM_SHARED_BYTES = 1 KiB barriers + 8 stages x (64x64 A + 64x64 B) BF16 + 4 x 64x32 epilogue. If every GEMM in the graph has <=64 rows, the launch uses swapAB (weight on WGMMA M=64, tokens on N) and the N tile is the smallest of (16,32,64) holding the largest row count; otherwise every GEMM uses a 64x64 tile. One orientation/tile serves every projection regardless of N, K or weight size, so e.g. lm_head (N=49152) and k_proj (N=64..512) get the same tile and stage count.",
+      "where_in_source": "src/megabake/bodies/gemm.py:1708-1711, :1854-1884, :1887-1896, :1985-1993; src/megabake/compiler.py:414-422"
+    },
+    {
+      "idea": "SWAP_AB_MAX_ROWS=64 and token tiles (16,32,64)",
+      "how_it_works": "Originally 16 (Mirage linear_swapAB_hopper), raised to 64 in bd40bf3 so prompts/batches up to 64 rows stay on the small-M path. The crossover between swapAB and normal orientation was not measured per shape; 64 is the largest WGMMA N that fits the fixed smem budget, not a measured break-even. Above 64 rows the whole launch flips to 64x64 non-swapped tiles - this coincides with the documented prefill cliff above ~64 tokens.",
+      "where_in_source": "src/megabake/bodies/gemm.py:1887-1896, :1985-1993; ROADMAP.md:148; git bd40bf3"
+    },
+    {
+      "idea": "Split-K policy (SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2) gated by env var",
+      "how_it_works": "split_k_count picks the largest split dividing K/64 that keeps tiles*splits <= SM count and >=2 K tiles per split. Off by default (MEGABAKE_SPLIT_K=1) because it gave 'no gain on the 60-SM slice'. The on/off decision is therefore a hardware-specific measurement baked in as a default; on a 132-SM H100/H200 or 148-SM B200 with the same small-N projections idle SMs double, so the conclusion likely flips.",
+      "where_in_source": "src/megabake/bodies/gemm.py:1899-1918; src/megabake/compiler.py:422; ROADMAP.md:149"
+    },
+    {
+      "idea": "Interval folding thresholds (2 rounds per phase, 6 rounds, 6 phases)",
+      "how_it_works": "A generic map/reduction body folds into its consumer's interval (recomputed per CTA, no barrier) only if single_cta_rounds <= 2, where a round = threads x MAP_ELEMENTS_PER_THREAD elements for maps (threads = max participating threads, 256 when a GEMM body exists -> 1024 elements) and = number of reduced rows for reductions; a run folds only if total <= 6 rounds and <= 6 phases. So maps of <=2048 elements and reductions of <=2 rows fold. 2048 is exactly SmolLM-1.7B hidden size; Qwen2-0.5B (896) and 135M (576) fit; Llama-3-8B (4096), Qwen2.5-7B (3584) or any batch>=3 decode get no RMSNorm folding. Limits were set while measuring 135M decode (11 -> ~6 intervals/layer) in bd40bf3.",
+      "where_in_source": "src/megabake/schedule.py:1380-1431; src/megabake/bodies/generic.py:441, :454-475; ROADMAP.md:123,146"
+    },
+    {
+      "idea": "Worker count derived from device properties (generic)",
+      "how_it_works": "Workers = min(max tile-map work items, multiprocessor_count x min maximum_active_blocks), from torch.cuda.get_device_properties. Measured search adds /2 and /4 variants (only when searching). This is the most generic piece; only the GEMM evidence metadata records 'max_admitted_workers: 60'.",
+      "where_in_source": "src/megabake/schedule.py:1365-1378; src/megabake/plan.py:490-509; src/megabake/compiler.py:1497-1515; src/megabake/bodies/gemm.py:2232"
+    },
+    {
+      "idea": "Split-context decode attention chunking (DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64, 0.15 pass penalty)",
+      "how_it_works": "decode_chunks(rows, workers) minimises passes/chunks*(1+0.15*(passes-1)) over chunks<=min(16, workers); the kernel activates ceil(keys/64) chunks at runtime. The function form is generic (uses workers), but 0.15, 16 and 64 are hand-picked constants from 135M/1.7B long-context runs (a538d68); only engaged when head_dim % 32 == 0.",
+      "where_in_source": "src/megabake/bodies/attention.py:422-423, :486, :738-751, :910-926"
+    },
+    {
+      "idea": "Attention scratch limits (16 rows, 32 KiB) cap KV length at 8192",
+      "how_it_works": "Each warp keeps one query row's FP32 scores in shared scratch; attention_scratch_rows = min(16, 32768 // (kv_length*4)) and the provider rejects when it is <1, i.e. kv_length > 8192 keys. 32 KiB is chosen to leave room next to the 145 KiB GEMM smem layout on SM90 (227 KiB). Long-context models fall back or fail.",
+      "where_in_source": "src/megabake/bodies/attention.py:222-226, :258-271"
+    },
+    {
+      "idea": "BF16-only tuned bodies",
+      "how_it_works": "G0 GEMM, bias epilogue, attention (score/prob dtype policy must be exactly BF16/FP32/BF16/FP32), kv_attention lowering and decode state shapes all require torch.bfloat16. FP16 or FP32 models silently fall to generic_contraction (one-thread-per-output scalar loop) and decomposed attention, which PERFORMANCE_REPORT measured 3-10 ms per GEMM at batch 256. FP8/INT4 weight-only models are not representable.",
+      "where_in_source": "src/megabake/bodies/gemm.py:1814-1820, :1938; src/megabake/bodies/attention.py:107-140; src/megabake/lowering.py:1855-1870; src/megabake/fx_handler/hf_attention.py:174; benchmarks/stateful_models.py:52-66"
+    },
+    {
+      "idea": "SM90a-only tuned bodies and SM90-specific register/smem constants",
+      "how_it_works": "G0 GEMM and attention providers reject anything but sm90a (attention is CUDA-core code but still gated on WGMMA). setmaxnreg 40/232 and 256 threads are the CUTLASS Hopper ping-pong layout; smem default get_smem_capacity_in_bytes('sm_90'); TargetFacts hard-codes max_registers_per_thread=255 and supports_tma=True; _target_facts rejects SM80/SM89 outright. Blackwell has a separate plain-GEMM provider only.",
+      "where_in_source": "src/megabake/bodies/gemm.py:216-220, :1847-1850, :2160; src/megabake/bodies/attention.py:220-221; src/megabake/compiler.py:1497-1515; src/megabake/bodies/blackwell.py:19-60"
+    },
+    {
+      "idea": "Generic body constants (128 threads, 4 elements/thread, unroll 16)",
+      "how_it_works": "Generated map/reduction bodies use 128-thread CTAs, 4 scalar (non-vectorized) elements per thread, full unroll when <=16 strided iterations. Chosen to make RMSNorm 5.0 -> 2.8 us on 1.7B. Not vectorized (no 128-bit loads), so efficiency depends on dtype width and hidden size multiples.",
+      "where_in_source": "src/megabake/bodies/generic.py:34-35, :53-54, :83-84, :441, :478; ROADMAP.md:145"
+    },
+    {
+      "idea": "Region matchers for RMSNorm / RoPE / attention / gated MLP",
+      "how_it_works": "RMSNorm matcher is anchored on aten.mean.dim and requires pow.Tensor_Scalar -> mean -> add(scalar eps) -> rsqrt -> mul, optional cast, a weight multiply whose weight is a graph input, and optional residual add; the body is rebuilt from the captured scalar programs, so exponent/eps semantics are preserved (generic in semantics, Llama-shaped in structure). Gemma's x*(1+w) has a non-input weight operand, so the affine part stays a separate generic op [uncertain whether Dynamo keeps 1+w as runtime op]. LayerNorm (mean-subtracting, var_mean), Gemma-2/3 sqrt(dim) scaling, and L2-norm (gated delta) have no matcher and fall to generic reductions. RoPE matcher covers HF rotate_half and a cat-based layout (GPT-NeoX half-rotation); interleaved (GPT-J/Llama-original even/odd), partial rotary with pass-through only in one matcher, and M-RoPE are not recognised. Attention is primarily declared via HF AttentionInterface (generic); the ATen pattern fallback relies on a stride heuristic (_attention_head_axes) that previously misread size-1 MQA axes (fixed by the shape==1 special case). Gated MLP matcher recognises SiLU only and is always rejected (no paired-GEMM provider), so it is dead code today.",
+      "where_in_source": "src/megabake/regions.py:501-819, :836-1243, :1250-1290, :2159-2288; ROADMAP.md:34"
+    },
+    {
+      "idea": "Per-model decode wrappers",
+      "how_it_works": "benchmarks/full_model.py routes model_type=='llama' to the hand-written StatefulSmolLM ('the tests and published numbers use'), attention-only HF models to the generic DecodeStep (AttentionInterface + pass-through cache), and hybrids to StatefulCausalLM which hard-codes Qwen3.5's interleaved output gate (detected by q_proj width == 2*heads*head_dim), Gemma sandwich norms (hasattr pre_feedforward_layernorm), the gated-delta-rule step in eager PyTorch with eps 1e-6, BF16 caches, batch 1, and refuses capacity > sliding_window. So published SmolLM numbers come from a per-model wrapper, not the generic path.",
+      "where_in_source": "benchmarks/full_model.py:171-191; benchmarks/stateful_models.py:36-166; tests/fixtures.py:321-346; src/megabake/fx_handler/hf_attention.py:120-187"
+    },
+    {
+      "idea": "Numerical acceptance tolerances tuned on SmolLM",
+      "how_it_works": "Plan acceptance uses 1% relative L2 for small graphs, 2% for table launches (justified by the 30-layer SmolLM 1.6% drift) and teacher-forced 1% per region (justified by SmolLM-1.7B 4.2% end-to-end drift); bucketed prefill accepts 5%. Deeper or wider models drift more, so a fixed 2% will reject exact plans on 60+ layer models or accept small bugs on shallow ones.",
+      "where_in_source": "src/megabake/compiler.py:236-248, :368, :388-389; src/megabake/buckets.py:42; ROADMAP.md:40"
+    },
+    {
+      "idea": "Size buckets (16,32,64,128,256,512)",
+      "how_it_works": "Power-of-two buckets padded per call; each bucket is a separate static-shape compile. Max prompt 512 by default; compile time grows to 41 min for SmolLM-1.7B 512 bucket. Generic in form but the 512 cap and 64-row swapAB boundary are coupled to the tested short-prompt workloads.",
+      "where_in_source": "src/megabake/buckets.py:38-42; ROADMAP.md:210-224"
+    },
+    {
+      "idea": "Table launch thresholds (1000 ops, 24 KB params)",
+      "how_it_works": "Derived from CUDA's 32 KiB kernel-parameter limit (hardware/driver fact) with an estimate of 8+16*rank bytes per value; 1000-op cutoff is a heuristic proxy. Generic enough, but because it also gates search (above) and GEMM tile choice, crossing it changes plan quality qualitatively.",
+      "where_in_source": "src/megabake/compiler.py:200-224; git e96e83f, d370e09"
+    },
+    {
+      "idea": "Test coverage across model families",
+      "how_it_works": "About 200 test functions. GPU end-to-end tests (test_task31_full_model, test_table_gemm) use only the SmolLM/Llama fixture (SmolLMArchitecture, StatefulSmolLM). Gemma3/Qwen3 appear only in CPU-level HF attention tests (tests/unit/test_hf_attention.py) and Qwen3.5/Gemma pointwise ops in test_pointwise_view_coverage. No GPU test for Qwen2 bias epilogue end to end, Gemma decode, MQA, head_dim 256 (Gemma), FP16, batch>1 decode, sliding windows, LayerNorm models (GPT-2/OPT/Phi), MoE, or non-H200 hardware; test_gemm_range_body asserts compute capability (9,0).",
+      "where_in_source": "tests/gpu/test_task31_full_model.py; tests/gpu/test_table_gemm.py:16-88; tests/unit/test_hf_attention.py:11-102; tests/gpu/test_gemm_range_body.py:47; tests/fixtures.py:321-346"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "Table-launch plan search disabled",
+      "status": "implemented",
+      "evidence": "src/megabake/compiler.py:427-431",
+      "notes": "Classification: overfit-by-omission (no tuning at all for real models). Generic replacement: keep search but make it cheap - analytic cost model (bytes moved / achievable BW + barrier count x measured barrier cost + per-phase dispatch) to rank candidates, then measure top-k with the existing PlanEvaluator; cache results keyed by (graph hash, device name, SM count, clocks)."
+    },
+    {
+      "idea": "Single fixed GEMM tile per table launch",
+      "status": "implemented",
+      "evidence": "src/megabake/bodies/gemm.py:1708-1711, :1854-1884",
+      "notes": "Classification: hardware-specific (sized for SM90 227 KiB smem minus attention scratch) and shape-agnostic. Generic replacement: per-GEMM tile candidates (N tile 16..256, K tile 64/128, stages from smem budget) with a smem layout = max over chosen configs, chosen by nvMatmulHeuristics-style analytic model or a micro-autotune at compile time; allow per-phase orientation since descriptors are already written per phase."
+    },
+    {
+      "idea": "SWAP_AB_MAX_ROWS=64 / tiles (16,32,64)",
+      "status": "implemented",
+      "evidence": "src/megabake/bodies/gemm.py:1893-1896; git bd40bf3",
+      "notes": "Classification: hardware-specific (WGMMA N granularity, smem budget) with a model/workload-fitted cutoff. Generic replacement: decide orientation per GEMM from a roofline: swapAB when rows < WGMMA M (64) and weight bytes dominate; token tile = smallest legal WGMMA N (multiples of 8/16) >= rows; above 64 rows use normal tiles per GEMM rather than flipping the whole launch."
+    },
+    {
+      "idea": "Split-K policy off by default",
+      "status": "partial",
+      "evidence": "src/megabake/bodies/gemm.py:1899-1918; compiler.py:422; ROADMAP.md:149",
+      "notes": "Classification: hardware-specific decision measured on 60 SMs. Generic replacement: enable by cost model - split when output tiles < SM count x occupancy and K/64 >= 2*splits; include reduction cost; validate on 132/148-SM parts."
+    },
+    {
+      "idea": "Interval folding thresholds",
+      "status": "implemented",
+      "evidence": "src/megabake/schedule.py:1383-1386",
+      "notes": "Classification: model-overfit (cap = 2048 elements = SmolLM-1.7B hidden; reductions <=2 rows). Generic replacement: fold when estimated recompute time (elements x bytes / per-SM bandwidth + latency rounds) < barrier cost (measure grid barrier once per device at compile time) - i.e., compare two costs instead of counting rounds; scale with batch and hidden size."
+    },
+    {
+      "idea": "Worker count from device properties",
+      "status": "implemented",
+      "evidence": "src/megabake/schedule.py:1365-1378; plan.py:490-509",
+      "notes": "Classification: generic. Keep; only the evidence metadata 'max_admitted_workers: 60' is stale documentation."
+    },
+    {
+      "idea": "Split-context decode chunking constants",
+      "status": "implemented",
+      "evidence": "src/megabake/bodies/attention.py:422-423, :738-751",
+      "notes": "Classification: partly generic (uses workers), constants (16, 64, 0.15) fitted. Generic replacement: derive 0.15 from measured barrier/exchange latency vs per-key time (keys x head_dim x 2 x 2 bytes / per-SM BW); allow head_dim not multiple of 32 via masked lanes."
+    },
+    {
+      "idea": "Attention scratch caps KV at 8192",
+      "status": "implemented",
+      "evidence": "src/megabake/bodies/attention.py:258-271",
+      "notes": "Classification: hardware-specific + workload-fitted (short contexts). Generic replacement: online softmax over KV tiles (flash-decoding) so scratch is O(tile), independent of kv_length; size scratch from target.max_shared_memory_per_cta minus GEMM layout."
+    },
+    {
+      "idea": "BF16-only tuned bodies",
+      "status": "implemented",
+      "evidence": "src/megabake/bodies/gemm.py:1814-1820; attention.py:107-140; lowering.py:1864-1866",
+      "notes": "Classification: model-overfit (all tested checkpoints run in bf16). Generic replacement: parametrise element type (FP16/BF16 trivially in CUTLASS; FP8 E4M3 with scales on SM90; FP32 accum unchanged), and make the attention numerical policy a parameter rather than a literal dict."
+    },
+    {
+      "idea": "SM90a-only bodies and constants",
+      "status": "implemented",
+      "evidence": "src/megabake/compiler.py:1497-1515; gemm.py:216-220, :1847; attention.py:220",
+      "notes": "Classification: hardware-specific. Generic replacement: TargetFacts should carry smem per SM, register file, TMA/WGMMA/tcgen05 flags, cluster support from device query or a per-arch table; attention/generic bodies should not require WGMMA; add an SM80 mma.sync GEMM path."
+    },
+    {
+      "idea": "Generic body constants",
+      "status": "implemented",
+      "evidence": "src/megabake/bodies/generic.py:441, :478",
+      "notes": "Classification: hardware-generic-ish, not model-tuned, but untuned. Generic replacement: vector width = 16 bytes / dtype size, elements/thread chosen so tiles divide the innermost dim; autotune threads per CTA in {128,256} with the cost model."
+    },
+    {
+      "idea": "Region matchers",
+      "status": "partial",
+      "evidence": "src/megabake/regions.py:501-819, :836-1243, :2159-2288",
+      "notes": "Classification: model-overfit in structure (HF Llama/Qwen RMSNorm and rotate_half RoPE). Generic replacement: replace pattern-specific matchers by a generic 'row-reduction + broadcast epilogue' fusion (any reduction over the last axis followed by elementwise consumers of the same row), which covers RMSNorm, LayerNorm, Gemma (1+w), L2-norm, softmax; express RoPE as generic gather/select elementwise; extend declared ops (megabake::rms_norm, rope) via HF/vLLM-style custom ops for the remainder."
+    },
+    {
+      "idea": "Per-model decode wrappers",
+      "status": "partial",
+      "evidence": "benchmarks/full_model.py:171-191; benchmarks/stateful_models.py",
+      "notes": "Classification: model-specific. Generic replacement: retire StatefulSmolLM for Llama (DecodeStep already handles it) so published numbers use the generic path; declare gated delta rule and other stateful mixers as ops (ROADMAP step 6) instead of StatefulCausalLM detection heuristics; implement sliding windows in kv_attention (ring buffer or mask by valid_length-window)."
+    },
+    {
+      "idea": "Numerical tolerances",
+      "status": "implemented",
+      "evidence": "src/megabake/compiler.py:236-248",
+      "notes": "Classification: model-overfit (constants justified by SmolLM depth). Generic replacement: keep teacher-forced per-region verification as the primary check with tolerance derived from dtype epsilon x sqrt(reduction length); end-to-end check scaled with depth or replaced by per-region checks only."
+    },
+    {
+      "idea": "Size buckets",
+      "status": "implemented",
+      "evidence": "src/megabake/buckets.py:38",
+      "notes": "Classification: generic form, workload-fitted range. Generic replacement: buckets derived from GEMM tile breakpoints (swapAB N tiles, 64/128 M tiles) and user max length; ultimately dynamic sequence length via runtime tile counts."
+    },
+    {
+      "idea": "Table launch thresholds",
+      "status": "implemented",
+      "evidence": "src/megabake/compiler.py:205-224",
+      "notes": "Classification: generic (driver param limit), 1000-op proxy heuristic. Replacement: decide purely on computed parameter bytes; decouple search budget from this switch."
+    },
+    {
+      "idea": "Test coverage across model families",
+      "status": "partial",
+      "evidence": "tests/gpu/test_task31_full_model.py; tests/gpu/test_table_gemm.py; tests/unit/test_hf_attention.py",
+      "notes": "Classification: overfit coverage. Replacement: parametrised tiny-config GPU tests for Llama, Qwen2 (bias), Qwen3 (q/k norm), Gemma3 (MQA, head_dim 256, sandwich norm, sliding), Phi/GPT-NeoX (LayerNorm, partial rotary), Mistral (sliding window), MoE (OLMoE/Qwen3-MoE tiny), FP16 variant, batch 2-8 decode; per-region bit-exact checks run on random weights."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    "Compile-time autotuning of whole-kernel schedule: because the entire model is one kernel with a static phase table, MegaBake can measure the real end-to-end kernel (barriers, L2 reuse across phases, tile interference) for each candidate plan, which a multi-kernel graph tuner (Inductor max-autotune, Triton autotune) cannot: they tune each kernel in isolation and miss cross-kernel effects such as L2 residency and launch gaps. Nearest multi-kernel substitute: per-kernel autotuning plus CUDA Graph capture, which ignores inter-kernel interactions. Currently unused because table launches force max_plans=1.",
+    "Device-calibrated barrier-vs-recompute folding: only a persistent kernel has grid barriers whose cost can be traded against redundant per-CTA recompute; making the fold decision a cost comparison (barrier_us vs recompute_us) generalises across models and SM counts. Multi-kernel graphs pay a kernel boundary (~2-4 us with graphs, ~1 us with PDL) and can only fuse via Inductor's vertical fusion, not recompute-instead-of-sync.",
+    "Per-phase GEMM orientation/tile in one launch: TMA descriptors are already written per phase in the prologue, so different tile shapes per projection are possible if the smem layout is the max over configs; separate kernels get this for free, but in a megakernel it must be designed into the smem budget - the current single-layout simplification is the main source of shape overfitting.",
+    "Runtime-adaptive split decisions: the persistent kernel knows valid_length at runtime (decode_chunks already uses in_use chunks), so split-K/split-context factors can be chosen per call without relaunching - a CUDA graph freezes grid sizes at capture."
+  ],
+  "measured_or_reported_gains": "From MegaBake docs (H200 MIG 3g.71gb, 60 SMs, bf16, batch 1): swapAB raised 1.7B decode GEMMs from 0.84-1.04 to 1.78-2.07 TB/s (3.66 -> 1.92 ms GEMM time; ROADMAP.md:118); interval folding cut 135M decode barriers 333 -> 183 (-5-7% on 135M but only -1-2% on 1.7B, consistent with the 2048-element fold cap; ROADMAP.md:146); split-K 'no gain on the 60-SM slice'; split-context decode 135M at 2000 cached tokens 22.7 -> 2.3 ms. Fresh decode kernel times (artifacts/full_model_2026-10-18): 135M 1.50 ms, 1.7B 2.97 ms, Qwen2-0.5B 1.58 ms; Qwen3.5-0.8B prefill fails (aten.cumsum); older artifacts: Gemma-3-270M decode 2.08 ms, gemma-2b 3.59 ms. External: NVIDIA reports nvMatmulHeuristics shortlists let CUTLASS reach near-exhaustive-autotune performance while profiling only a few candidates [uncertain - exact numbers not verified in this audit]. Mirage MPK itself is also per-model tuned (grid 96/64 hard-coded in mpk/models/utils.py).",
+  "expected_impact_on_megabake": "Ranked by impact on generality and performance (estimates, no GPU runs):\n1. Re-enable cost-model-guided search for table launches: the plan for every real model is currently the greedy seed. A cost model + top-3 measured candidates per model would mostly protect against regressions on unseen shapes; on tested models expected gain 0-5% decode [uncertain], but on new shapes (e.g., N not multiple of 64, large vocab) it avoids worst-case tile choices. Compile time +3 builds (~20 s each for 1.7B).\n2. Cost-based interval folding: for a 4096-hidden model at batch 1 the current cap folds nothing of the hidden-size maps/norms; each layer would pay ~11 barrier intervals (~0.7 us each) instead of ~6, i.e. +3.5 us/layer = +112 us on a 32-layer 8B model (~2-3% of a ~4.5 ms weight-bound step on 60 SMs). On 1.7B, raising the MLP-activation map cap (8192 elements) could save 1 interval/layer = 24 x 0.7 = ~17 us (~0.6%).\n3. Per-GEMM tile/orientation and prefill >64 rows: the prefill cliff (3-21x slower than Inductor+CUDA graphs at 128-300 tokens) is partly caused by the whole launch flipping to 64x64 tiles with 1 CTA per SM and no per-GEMM tile choice; per-GEMM 128x128/128x256 tiles for M>=128 could recover a large fraction (2-5x prefill at 128-512 tokens) [uncertain].\n4. FP16/FP8 dtype parametrisation: zero gain on tested bf16 models, but without it any fp16 checkpoint falls to generic_contraction (measured 3-10 ms per GEMM at batch 256 vs ~0.01 ms tuned) - a 100x cliff.\n5. Split-K enabled by cost model: ~0 on 60 SMs (measured), likely 5-15% decode GEMM time on 132-SM H100/H200 where small projections (k/v_proj N=320-1024 -> 5-16 tiles) leave >90% of SMs idle [uncertain].\n6. Attention without the 8192-key cap: 0 on tested short contexts; prevents compile failure/fallback for long-context use.\n7. Tolerances derived from dtype/depth: no speed impact; avoids false rejections on deeper models (>30 layers).",
+  "generality_and_overfitting_risk": "MODEL-OVERFIT (fitted to SmolLM/Qwen2-class small dense bf16 Llama-style models):\n- Fold thresholds _FOLD_MAX_ROUNDS_PER_PHASE=2/_FOLD_MAX_ROUNDS=6/_FOLD_MAX_PHASES=6 with 256 threads x MAP_ELEMENTS_PER_THREAD=4 (src/megabake/schedule.py:1383-1386, bodies/generic.py:441): fold cap = 2048 elements = SmolLM-1.7B hidden size; reductions fold only for <=2 rows (batch<=2 decode). Set while tuning 135M decode (bd40bf3).\n- Numerical tolerances 0.01/0.02/0.01 and bucket 0.05 (compiler.py:236-248, buckets.py:42) justified in comments by 30-layer SmolLM and SmolLM-1.7B drift.\n- BF16-only literal checks in GEMM, bias, attention numerical policy, kv_attention lowering, DecodeStep state (gemm.py:1814-1820, :1938; attention.py:107-140; lowering.py:1864-1866; hf_attention.py:174).\n- RMSNorm matcher structure = HF LlamaRMSNorm (regions.py:686-819; comment at :750 names LlamaRMSNorm); Gemma (1+w) affine and LayerNorm unmatched; RoPE matchers = HF rotate_half; gated-MLP matcher SiLU-only and dead (regions.py:2240).\n- Attention head-axis stride heuristic (regions.py:1250-1264) already broke on Gemma 3 MQA (ROADMAP.md:34) - a sign the ATen fallback path is fitted to the shapes seen.\n- Decode wrappers: StatefulSmolLM for llama (benchmarks/full_model.py:173-184) means published Llama numbers do not exercise the generic DecodeStep; StatefulCausalLM hard-codes Qwen3.5 gate detection by projection width and Gemma sandwich norms by attribute name (benchmarks/stateful_models.py:78-83, :153-157); sliding window avoided by refusing capacity > window (hf_attention.py:128-132).\n- Attention KV cap 8192 and split-context constants 16/64/0.15 (attention.py:258-271, :422-423, :748) fitted to <=2k-context benchmarks.\n- Buckets max 512 (buckets.py:38) fitted to short prompts.\nHARDWARE-SPECIFIC (SM90 / 60-SM slice):\n- TABLE_GEMM_SHARED_BYTES single layout (gemm.py:1711), 64x64x64 tile, 8 stages, setmaxnreg 40/232, 256 threads, smem capacity 'sm_90' (gemm.py:216-220), providers reject non-sm90a (gemm.py:1847, attention.py:220).\n- SWAP_AB_MAX_ROWS=64 / (16,32,64) and split-K off by default ('no gain on the 60-SM slice', ROADMAP.md:149) - decisions measured on 60 SMs at ~2.2 TB/s; on 132 SMs the balance between per-SM bandwidth and tile count changes.\n- _target_facts: arch allow-list excludes SM80/SM89, max_registers_per_thread=255 and supports_tma=True literals (compiler.py:1502-1514).\n- Evidence metadata records max_admitted_workers=60 and microsecond timings from this device (gemm.py:2232-2238) - harmless metadata but should not be used as policy.\nGENERIC:\n- Worker count from SM count x occupancy (schedule.py:1365-1378); table-launch switch based on parameter bytes (compiler.py:213-224); split_k_count divisibility logic; decode_chunks form; declared megabake::attention via HF AttentionInterface (fx_handler/hf_attention.py) - covers every HF attention model; RMSNorm body rebuilt from captured scalar programs (semantics generic).\nHOW REFERENCE SYSTEMS AVOID IT: CUTLASS/cuBLAS use nvMatmulHeuristics (analytic per-SKU ranking + profile shortlist); Triton autotune uses prune_configs_by {perf_model, top_k}; Inductor max-autotune benchmarks template choices per shape; TVM MetaSchedule/Ansor use learned cost models + search. Mirage MPK is NOT a counter-example - its builders are per model and utils.py hard-codes 96/64 grids 'enough to cover all Qwen3 model'. MegaBake already has the measured-search scaffolding (plan.py SearchBudget, PlanEvaluator, plan cache) - the overfitting comes from bypassing it for table launches and from fixed constants in providers.",
+  "hardware_portability": "SM90-bound: TMA+WGMMA G0 GEMM (CUTLASS HopperWgmmaGemmPersistentKernel), setmaxnreg 40/232 warp specialisation, swapAB via WGMMA N tiles, 227 KiB smem layout. SM100: needs tcgen05/TMEM GEMM (bodies/blackwell.py has a plain unbiased GEMM provider only - no swapAB, bias or table-launch integration), larger smem (228 KiB on B200, ~100 KiB on SM120 consumer parts) so TABLE_GEMM_SHARED_BYTES (~145 KiB) would not even fit on SM120. SM80/SM89: rejected outright by _target_facts; would need mma.sync/cp.async GEMM; grid barrier, table launch, generic bodies, attention (CUDA-core) and split-context are portable in principle - attention is unnecessarily gated on WGMMA. To stay target-generic: (1) TargetFacts from device query plus a per-arch capability table (smem/SM, regs, TMA, WGMMA, tcgen05, cluster, CLC); (2) providers declare requirements and the planner picks; (3) all tile/stage/smem constants computed from TargetFacts and the chosen per-GEMM configs; (4) calibrate barrier latency, per-SM bandwidth and HBM bandwidth with micro-benchmarks once per device at compile time and feed the cost model; (5) keep measured search as the final arbiter, cached per (device name, SM count, MIG profile).",
+  "recommended_actions": [
+    {
+      "action": "Stop forcing SearchBudget(max_plans=1,max_compilations=1) for table launches; add an analytic cost model to rank candidates and measure top-k (k=2-4) with the existing PlanEvaluator, caching per device",
+      "expected_gain": "Protection against shape/model-specific regressions; 0-5% on tested models [uncertain], larger on unseen shapes",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py:427-431, src/megabake/plan.py, src/megabake/planner.py, new src/megabake/cost_model.py",
+      "prerequisite": "Cheaper per-candidate compile (reuse compiled bodies across candidates)"
+    },
+    {
+      "action": "Replace fold round thresholds with a cost comparison: recompute_us(elements, dtype, per-SM BW) < barrier_us (calibrated once per device)",
+      "expected_gain": "Restores folding for >=4096-hidden models and batch>2 decode (~3.5 us/layer); ~17 us on 1.7B",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/schedule.py:1380-1431, src/megabake/bodies/generic.py:454-475",
+      "prerequisite": "Device calibration hook (barrier and per-SM bandwidth micro-benchmark)"
+    },
+    {
+      "action": "Per-GEMM tile and orientation in table launches (smem layout = max over chosen configs; tile candidates 16..256 N, 64/128 M/K, stages from budget), chosen by nvMatmulHeuristics-like model",
+      "expected_gain": "Removes the 64-row prefill cliff; 2-5x prefill at 128-512 tokens [uncertain]",
+      "effort": "L",
+      "generality": "hw-specific (per-arch candidate list) with generic selection",
+      "files_to_touch": "src/megabake/bodies/gemm.py:1708-1918, src/megabake/codegen.py (descriptor/smem layout), src/megabake/compiler.py:414-422",
+      "prerequisite": "Action 1 (cost model)"
+    },
+    {
+      "action": "Parametrise dtype in G0 GEMM, bias epilogue, attention and kv_attention (FP16 now, FP8 weights later)",
+      "expected_gain": "Avoids 100x generic_contraction cliff for fp16 checkpoints",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py:1743-1820,1938; src/megabake/bodies/attention.py:107-140; src/megabake/lowering.py:1855-1870; src/megabake/fx_handler/hf_attention.py:174",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Generic row-reduction+epilogue fusion replacing RMSNorm-specific matcher (covers LayerNorm, Gemma 1+w, L2 norm); generic RoPE as gather/select elementwise; delete or implement gated-MLP matcher",
+      "expected_gain": "Coverage for GPT-NeoX/Phi/OPT/Gemma without new matchers; avoids generic fallback slowdown",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/regions.py:501-1243, :2159-2288",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Make split-K decision cost-model-based instead of env-var off; validate on a non-MIG 132-SM GPU",
+      "expected_gain": "5-15% decode GEMM time on 132/148-SM parts [uncertain]; 0 on 60-SM slice",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py:422, src/megabake/bodies/gemm.py:1899-1918",
+      "prerequisite": "Action 1"
+    },
+    {
+      "action": "Flash-decoding style attention with O(tile) scratch (remove 8192-key cap); scratch sized from TargetFacts; drop WGMMA requirement for CUDA-core attention; support head_dim not multiple of 32",
+      "expected_gain": "Long-context and SM80/Blackwell portability",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py:220-271, :422-751",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Retire StatefulSmolLM in benchmarks (use DecodeStep for llama), declare gated delta rule op, implement sliding window in kv_attention",
+      "expected_gain": "Published numbers reflect the generic path; Gemma/Mistral long contexts; Qwen3.5 without wrapper",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "benchmarks/full_model.py:171-191, benchmarks/stateful_models.py, src/megabake/fx_handler/hf_attention.py:120-187, src/megabake/lowering.py",
+      "prerequisite": "ROADMAP step 6 for gated delta rule"
+    },
+    {
+      "action": "Derive numerical tolerances from dtype eps and reduction length; rely on teacher-forced per-region checks",
+      "expected_gain": "No false rejections on deep models",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py:236-248, :360-390, src/megabake/buckets.py:42",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Model-family test matrix: tiny random-weight configs on GPU for Llama, Qwen2 (bias), Qwen3 (qk-norm), Gemma3 (MQA, head_dim 256, sliding), Mistral, Phi/GPT-NeoX (LayerNorm, partial rotary), tiny MoE, FP16, batch 2-8 decode, odd hidden sizes (e.g., 3584, 5120)",
+      "expected_gain": "Detects overfitting regressions early",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "tests/gpu/test_task31_full_model.py, tests/fixtures.py, new tests/gpu/test_model_matrix.py",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Extend TargetFacts with per-arch capability table and device-calibrated metrics (barrier us, per-SM BW, HBM BW); remove literal 255/True/'sm_90'",
+      "expected_gain": "Foundation for portability to SM80/SM100/SM120 and for cost model",
+      "effort": "S",
+      "generality": "hw-specific",
+      "files_to_touch": "src/megabake/compiler.py:1497-1515, src/megabake/bodies/interface.py, src/megabake/bodies/gemm.py:216-220",
+      "prerequisite": "none"
+    }
+  ],
+  "open_questions": "1. Does the greedy seed plan differ from the best measured plan on the tested full models? Experiment: run plan search with max_plans=8 on 135M/1.7B/Qwen2 decode (table launch) and compare kernel time; if gains <2%, search is low priority for tested models but still needed for unseen ones.\n2. Where is the true swapAB vs normal crossover per GEMM shape on 60 vs 132 SMs? Experiment: standalone sweep rows 1..256 x (N,K) of tested projections with both orientations and tiles 16/32/64/128.\n3. Would raising fold caps help 1.7B (MLP activation 8192 elements)? Experiment: tools/phase_profile.py with _FOLD_MAX_ROUNDS_PER_PHASE in {2,4,8} on 1.7B and a 4096-hidden model (e.g., tiny-layer Llama-3-8B config with 2 layers).\n4. Is split-K beneficial on a full 132-SM H200? Experiment: MEGABAKE_SPLIT_K=1 vs 0 on full GPU.\n5. Does Dynamo/AOT keep Gemma's (1+weight) as a runtime op so the RMSNorm affine is left unfused? Experiment: dump regions (dump_region_graph) for Gemma-3-270M decode.\n6. How does accuracy drift scale with depth for >30-layer models under the 2% limit? Experiment: 2-, 30-, 60-layer random-weight Llama configs, teacher-forced vs end-to-end error.\n7. Is register reallocation (setmaxnreg decrease to 40) safe for generic bodies that follow a GEMM phase (PERFORMANCE_REPORT.md:287)? Experiment: compute-sanitizer/racecheck and SASS inspection.",
+  "uncertain": [
+    "core_ideas",
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake",
+    "recommended_actions"
+  ]
+}

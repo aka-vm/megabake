@@ -1,0 +1,43 @@
+fields:
+  basic_info:
+    - name: name
+      description: Research item name
+      detail_level: brief
+    - name: scope
+      description: What was examined (codebases, files, papers, URLs) and what question this item answers for MegaBake
+      detail_level: moderate
+    - name: key_sources
+      description: List of concrete sources used. Local files as repo-relative paths with line numbers (e.g. agent_space/mirage/include/mirage/persistent_kernel/runtime_header.h:120), papers/URLs as links
+      detail_level: detailed
+  technical_features:
+    - name: core_ideas
+      description: List of objects, one per idea/mechanism/optimization found. Each has {idea, how_it_works (mechanism at the level of code/hardware, not marketing), where_in_source}
+      detail_level: detailed
+    - name: megabake_status
+      description: List of objects, one per idea in core_ideas, with {idea, status (implemented | partial | missing | not_applicable), evidence (MegaBake file:line or ROADMAP/PERFORMANCE_REPORT reference), notes on how MegaBake's version differs}
+      detail_level: detailed
+    - name: megakernel_exclusive_opportunities
+      description: Optimizations in this item that are only possible (or only cheap) because the whole model runs as ONE persistent kernel, and which a graph of hundreds of separate kernels (even with CUDA Graphs, PDL/programmatic dependent launch, streams) cannot match. For each, explain WHY a multi-kernel graph cannot do it and what the nearest multi-kernel substitute achieves
+      detail_level: detailed
+  performance_metrics:
+    - name: measured_or_reported_gains
+      description: Quantitative gains reported by the source (speedups, bandwidth utilization, latency), with hardware, model and batch size. Mark unverified numbers [uncertain]
+      detail_level: moderate
+    - name: expected_impact_on_megabake
+      description: Estimated effect on MegaBake decode and prefill on H200 MIG 3g.71gb (60 SMs, ~2.2 TB/s) for the tested models, derived from MegaBake's own measured breakdown (GEMM time, barrier count ~0.7us each, RMSNorm/attention per-layer costs). Give numbers with reasoning; rank by impact
+      detail_level: detailed
+  competition_ecosystem:
+    - name: generality_and_overfitting_risk
+      description: Whether each idea is model-generic and hardware-generic, or tuned to a specific model/shape/GPU. Flag any MegaBake code paths, constants, thresholds, matchers or heuristics in this area that look tuned to the tested models (SmolLM, Qwen2, Gemma, etc.) or to the 60-SM MIG slice, with file:line evidence, and how reference systems avoid this (autotuning, cost models, search, hardware queries)
+      detail_level: detailed
+    - name: hardware_portability
+      description: Which ideas depend on SM90 features (TMA, WGMMA, clusters, setmaxnreg), which carry to SM100 (tcgen05, TMEM, CLC) and SM80, and how to keep the design target-generic
+      detail_level: moderate
+  milestone_significance:
+    - name: recommended_actions
+      description: Prioritized list of concrete MegaBake changes, each with {action, expected_gain, effort (S/M/L), generality (generic | model-specific | hw-specific), files_to_touch, prerequisite}
+      detail_level: detailed
+    - name: open_questions
+      description: Things that could not be determined and the experiment that would settle each
+      detail_level: moderate
+uncertain: []

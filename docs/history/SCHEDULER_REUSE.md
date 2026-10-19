@@ -1,8 +1,10 @@
 # Operation coverage and implementation reuse
 
+> **Historical document.** This is the 2026-10-09 Mirage reuse review. The current comparison with Mirage MPK is §2 of the [2026-10-18 gap report](../research/2026-10-18-megakernel-gap/report.md). It is kept for its evidence and history and is not maintained. The current design is [ARCHITECTURE.md](../../ARCHITECTURE.md) and the current plan is [ROADMAP.md](../../ROADMAP.md).
+
 **Date: 2026-10-09. Status: source review and one isolated host check; no production port.**
 
-This report extends [RESEARCH.md](RESEARCH.md). The resulting design is in [ARCHITECTURE.md](ARCHITECTURE.md). The scope in [north-star.md](north-star.md) is unchanged.
+This report extends [RESEARCH.md](RESEARCH.md). The resulting design is in [ARCHITECTURE.md](../../ARCHITECTURE.md). The scope in [north-star.md](../../north-star.md) is unchanged.
 
 ## 1. Decisions
 
@@ -185,11 +187,11 @@ Use Mirage's search/configuration code as the first reference for candidate gene
 
 ### Actual allocation core: passed
 
-[check_memory_planner.py](experiments/reuse_2026_10_09/check_memory_planner.py) verifies the clone revision and source SHA-256, extracts the unchanged `memory_planner` namespace, and compiles it with a small C++ harness.
+[check_memory_planner.py](../../experiments/reuse_2026_10_09/check_memory_planner.py) verifies the clone revision and source SHA-256, extracts the unchanged `memory_planner` namespace, and compiles it with a small C++ harness.
 
 The check supplies 2,000 generated lifetime sets with seed `20261009`. Each set has 1–40 allocations with nonzero sizes padded to 128 bytes. It checks first fit, best fit, worst fit, and the upstream selector. An independent pairwise interval oracle checks that simultaneously live values never overlap in storage. The check also verifies alignment, bounds, a live-byte lower bound, and two boundary cases for touching and overlapping lifetimes.
 
-All checks passed with GCC 14.3.1. This establishes that the allocation core can be extracted without the Mirage graph/compiler dependency. It does not validate upstream lifetime derivation, async uses, arbitrary alignment requirements, or global megakernel memory reuse. [Result](experiments/reuse_2026_10_09/memory_planner.json)
+All checks passed with GCC 14.3.1. This establishes that the allocation core can be extracted without the Mirage graph/compiler dependency. It does not validate upstream lifetime derivation, async uses, arbitrary alignment requirements, or global megakernel memory reuse. [Result](../../experiments/reuse_2026_10_09/memory_planner.json)
 
 Reproduce from the repository root:
 
@@ -202,7 +204,7 @@ Reproduce from the repository root:
 
 I selected Mirage's existing [attention tail test](https://github.com/mirage-project/mirage/blob/f9eb70c254acefc9f3667b2a973d0dcf25471fce/tests/runtime_python/hopper/test_attention_tail_hopper.py). It poisons shared memory before calling the real attention device function and checks active/inactive rows over 24 capacity/context cases. This is a valuable fixture: a masked probability of zero does not prevent `0 * NaN` from a stale value tile.
 
-The clone lacked CUTLASS submodule contents. The exact pinned headers were downloaded into `/tmp`; the clone was left unchanged. The test then stopped before compilation because no CUDA device was available on 2026-10-09. `nvidia-smi -L` reported no devices, and PyTorch reported zero devices. The H200 MIG used for the previous day's research was not available for this run. [Failure log](experiments/reuse_2026_10_09/attention_tail.log), [environment](experiments/reuse_2026_10_09/environment.json)
+The clone lacked CUTLASS submodule contents. The exact pinned headers were downloaded into `/tmp`; the clone was left unchanged. The test then stopped before compilation because no CUDA device was available on 2026-10-09. `nvidia-smi -L` reported no devices, and PyTorch reported zero devices. The H200 MIG used for the previous day's research was not available for this run. [Failure log](../../experiments/reuse_2026_10_09/attention_tail.log), [environment](../../experiments/reuse_2026_10_09/environment.json)
 
 The attempted command, with the temporary pinned headers present, was:
 
