@@ -4,8 +4,10 @@ ptxas warning C7519 ("wgmma.mma_async instructions are serialized due to ...")
 means every tensor-core instruction of the megakernel waits for the previous
 one: the kernel then runs 15-25% slower with the same work (43% more SASS
 instructions, mostly R2UR and WARPGROUP fences, measured on SmolLM-1.7B
-prefill). Whether it fires depends on the whole kernel's register allocation,
-so unrelated changes toggle it per model; this compile-only check is the
+prefill). Any trap behind a per-lane condition anywhere in the kernel fires it,
+because ptxas then cannot assume whole warps reach a wgmma; bodies trap through
+``runtime.trap_if``, which votes across the warp first. Whether ptxas sees such
+a divergence varies with unrelated code, so this compile-only check is the
 noise-free way to see it.
 
     .venv/bin/python tools/wgmma_serialization.py --model HuggingFaceTB/SmolLM-1.7B --mode prefill

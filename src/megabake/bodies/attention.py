@@ -544,7 +544,7 @@ def emit_attention_body(
         )
         source = f'''import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import llvm
+from megabake.runtime import trap_if
 
 
 @cute.kernel
@@ -559,10 +559,7 @@ def run(
     workers, _, _ = cute.arch.grid_dim()
     row_count = {row_count}
     current_length = tensor_bindings[{loads['attention:valid_length']}][0].to(cutlass.Int32)
-    if current_length < 0:
-        llvm.intr_trap()
-    if current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}):
-        llvm.intr_trap()
+    trap_if(current_length < 0 or current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}))
     # Each of the first {warps} warps takes whole query rows: lanes split the
     # visible keys for scores and the head dimensions for the value sum, and
     # the row's scores and probabilities stay in that warp's scratch slice.
@@ -1005,7 +1002,7 @@ def _split_decode_attention_body(
 
     source = f'''import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import llvm
+from megabake.runtime import trap_if
 
 
 @cute.kernel
@@ -1020,10 +1017,7 @@ def run(
     workers, _, _ = cute.arch.grid_dim()
     floats, counters, float_base, counter_base = epilogue
     current_length = tensor_bindings[{length_index}][0].to(cutlass.Int32)
-    if current_length < 0:
-        llvm.intr_trap()
-    if current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}):
-        llvm.intr_trap()
+    trap_if(current_length < 0 or current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}))
     keys = current_length + cutlass.Int32(1)
     in_use = (keys + cutlass.Int32({DECODE_MIN_CHUNK_KEYS - 1})) // cutlass.Int32({DECODE_MIN_CHUNK_KEYS})
     if in_use > cutlass.Int32({chunks}):

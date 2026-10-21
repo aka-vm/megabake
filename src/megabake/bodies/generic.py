@@ -239,7 +239,7 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
         "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
     trap_import = (
-        "from cutlass._mlir.dialects import llvm\n" if index_load_ids else ""
+        "from megabake.runtime import trap_if\n" if index_load_ids else ""
     )
     source = f'''import cutlass
 import cutlass.cute as cute
@@ -1160,18 +1160,14 @@ def _emit_expression(
 def _gather_bounds_lines(load: Any, hoisted_names: Mapping[str, str]) -> str:
     # Out-of-range gathers trap inside the workload kernel, matching the
     # device-side assert of the eager source instead of a per-call host check.
+    # The index is per lane, so the warp votes first (see trap_if).
     lines = ""
     for position, axis in enumerate(load.axes):
         if not isinstance(axis, DataIndex) or load.source_shape is None:
             continue
         index = hoisted_names[axis.load_id]
         size = load.source_shape[position]
-        lines += (
-            f"            if {index} < 0:\n"
-            "                llvm.intr_trap()\n"
-            f"            if {index} >= {size}:\n"
-            "                llvm.intr_trap()\n"
-        )
+        lines += f"            trap_if({index} < 0 or {index} >= {size})\n"
     return lines
 
 

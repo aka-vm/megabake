@@ -632,9 +632,9 @@ def _emit_generic_module(
     )
     launch_smem = "" if has_g0 else f"        smem={shared_memory_bytes},\n"
     runtime_import = (
-        "from megabake.runtime import cooperative_event_worker_loop, publish_event, wait_for_event"
+        "from megabake.runtime import cooperative_event_worker_loop, publish_event, trap_if, wait_for_event"
         if event_schedule is not None
-        else "from megabake.runtime import cooperative_worker_loop, grid_barrier"
+        else "from megabake.runtime import cooperative_worker_loop, grid_barrier, trap_if"
     )
     kernel_arguments = [
         "ready: cute.Tensor",
@@ -780,7 +780,8 @@ def _emit_table_module(
     epilogue_definitions: list[str] = []
     gemm_definitions: list[str] = []
     # Variants that are paired GEMMs, and each GEMM row's trailing columns:
-    # its second A slot + 1 (0 when unpaired), then its epilogue tensor slots.
+    # its second A slot + 1 (0 when unpaired), its epilogue kind, its CUTLASS
+    # (M, N, K), then its epilogue tensor slots.
     paired_variants: set[int] = set()
     gemm_extra_columns: list[tuple[int, ...]] = []
     gemm_kernel_tiles: dict[int, tuple[int, int]] = {}
@@ -790,6 +791,7 @@ def _emit_table_module(
     variant_epilogues: dict[int, list[tuple[str, tuple[Any, ...]]]] = {}
     # Per variant: what its definition and runner need once all phases are seen.
     gemm_variant_specs: dict[int, dict[str, Any]] = {}
+    # Each variant's template shape as CUTLASS (M, N, K, swapAB).
     gemm_shapes: list[tuple[int, int, int, bool]] = []
     gemm_template_phases: list[int] = []
     gemm_rows: list[tuple[int, ...]] = []
@@ -898,9 +900,16 @@ def _emit_table_module(
                 for load in fused_loads
             )
             gemm_scratch_bytes.add(phase.body.scratch.size_bytes)
-            gemm_key = (
-                tile, phase.body.scratch.size_bytes, rows, columns, reduction, splits, bias, paired
+            # CUTLASS problem shape; swapAB computes the transposed product.
+            swap_ab = is_swap_ab(phase.body)
+            row_shape = (
+                (columns, rows, reduction, True) if swap_ab else (rows, columns, reduction, False)
             )
+            # The problem shape is not part of the key: phases of every shape
+            # share one kernel body and read their (M, N, K) from their GEMM
+            # row, so the kernel inlines one wgmma mainloop per configuration
+            # instead of one per projection shape.
+            gemm_key = (tile, phase.body.scratch.size_bytes, splits, bias, paired, swap_ab)
             if gemm_key not in gemm_variants:
                 gemm_variant = len(gemm_variants)
                 gemm_variants[gemm_key] = gemm_variant
@@ -908,12 +917,7 @@ def _emit_table_module(
                 gemm_kernel_tiles[gemm_variant] = (2 * tile[0], tile[1]) if paired else tile
                 if paired:
                     paired_variants.add(gemm_variant)
-                # CUTLASS problem shape; swapAB computes the transposed product.
-                gemm_shapes.append(
-                    (columns, rows, reduction, True)
-                    if is_swap_ab(phase.body)
-                    else (rows, columns, reduction, False)
-                )
+                gemm_shapes.append(row_shape)
                 gemm_splits.append(splits)
                 gemm_template_phases.append(phase.index)
                 symbol = f"_gemm_{gemm_variant}"
@@ -923,7 +927,7 @@ def _emit_table_module(
                     "scratch": phase.body.scratch.size_bytes,
                     "splits": splits,
                     "bias_features": columns if bias else 0,
-                    "swap_ab": is_swap_ab(phase.body),
+                    "swap_ab": swap_ab,
                     "bias": bias,
                     "paired": paired,
                 }
@@ -971,11 +975,11 @@ def _emit_table_module(
             gemm_of_phase[phase.index] = gemm_index
             gemm_weights.append(_gemm_weight_rows(plan, tensor_arguments, gemm_slots[:2]))
             gemm_rows.append((gemm_variant, *gemm_slots, bias_slot))
-            gemm_extra_columns.append((second_a_slot, epilogue_kind, *fused_slots))
+            gemm_extra_columns.append(
+                (second_a_slot, epilogue_kind, *row_shape[:3], *fused_slots)
+            )
             if splits > 1:
-                output_tiles = -(-gemm_shapes[gemm_variant][0] // tile[0]) * -(
-                    -gemm_shapes[gemm_variant][1] // tile[1]
-                )
+                output_tiles = -(-row_shape[0] // tile[0]) * -(-row_shape[1] // tile[1])
                 # FP32 partials of every split of every tile, one counter per tile.
                 phase_scratch[phase.index] = (
                     output_tiles * splits * tile[0] * tile[1],
@@ -991,9 +995,8 @@ def _emit_table_module(
                 (runner_id, int(phase.barrier is not None), 0, 0, 0, 0, gemm_index)
             )
             phase_tiles.append(len(phase.work_items) * splits)
-            gemm_shape = gemm_shapes[gemm_variant]
             phase_units[phase.index] = (
-                -(-gemm_shape[0] // tile[0]) * -(-gemm_shape[1] // tile[1]) * splits
+                -(-row_shape[0] // tile[0]) * -(-row_shape[1] // tile[1]) * splits
             )
             phase_records.append(
                 PhaseEmission(
@@ -1287,6 +1290,12 @@ def _emit_table_module(
                     else []
                 ),
                 *epilogue_state,
+                "                problem_shape=(",
+                *(
+                    f"                    gemm_table[phase_table[phase, 6], {GEMM_PROBLEM_COLUMN + mode}],"
+                    for mode in range(3)
+                ),
+                "                ),",
                 "            )",
             ],
         )
@@ -1469,8 +1478,7 @@ def _emit_table_module(
         "            ),\n"
         f"            cute.make_layout({ring_words}),\n"
         "        )\n"
-        "        if _dynamic[0] != cutlass.Int64(_call):\n"
-        "            llvm.intr_trap()\n"
+        "        trap_if(_dynamic[0] != cutlass.Int64(_call))\n"
         + (
             f"        for _position in cutlass.range(_thread, {len(dynamic_slots)}, {plan.launch.threads_per_block}, unroll=1):\n"
             "            addresses[dynamic_slot_table[_position]] = _dynamic[_position + 1]\n"
@@ -1534,7 +1542,12 @@ def _emit_table_module(
         "                    addresses[gemm_table[gemm, 1]],\n"
         "                    addresses[gemm_table[gemm, 2]],\n"
         "                    addresses[gemm_table[gemm, 3]],\n"
-        f"                    {shape[:3]!r},\n"
+        "                    (\n"
+        + "".join(
+            f"                        gemm_table[gemm, {GEMM_PROBLEM_COLUMN + mode}],\n"
+            for mode in range(3)
+        )
+        + "                    ),\n"
         f"                    {shape[3]!r},\n"
         f"                    {gemm_splits[variant]!r},\n"
         + (
@@ -1581,7 +1594,7 @@ from cuda.bindings import driver as cuda
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.tensor import _Tensor
 
-from megabake.runtime import counting_grid_barrier, prefetch_gemm_weights, prefetch_l1
+from megabake.runtime import counting_grid_barrier, prefetch_gemm_weights, prefetch_l1, trap_if
 {gemm_import}
 {_GEMM_SLOT_SOURCE if any(epilogue_definitions) else ""}
 {chr(10).join(epilogue_definitions)}
@@ -1770,7 +1783,9 @@ def launch(
 # kind (0: plain), then the slots of that epilogue's tensors.
 GEMM_SECOND_A_COLUMN = 9
 GEMM_EPILOGUE_KIND_COLUMN = 10
-GEMM_EPILOGUE_COLUMN = 11
+# A GEMM row's CUTLASS (M, N, K), in three columns.
+GEMM_PROBLEM_COLUMN = 11
+GEMM_EPILOGUE_COLUMN = 14
 
 _GEMM_SLOT_SOURCE = """
 @cute.jit

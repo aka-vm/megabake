@@ -135,6 +135,20 @@ def grid_barrier(ready: cute.Tensor, workers: cutlass.Int32, epoch: cutlass.Int3
 
 
 @cute.jit
+def trap_if(condition):
+    """Trap the kernel when ``condition`` holds on any lane of this warp.
+
+    The warp votes before it branches, so the trap sits behind a warp-uniform
+    branch. Behind a per-lane branch, lanes may leave a warp early as far as
+    ptxas can tell, and it then serializes every wgmma of the megakernel
+    (C7519, "WG.AR in divergent path"). Every lane of the warp must reach the
+    call.
+    """
+    if cute.arch.vote_any_sync(condition):
+        llvm.intr_trap()
+
+
+@cute.jit
 def counting_grid_barrier(
     ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32
 ):
