@@ -23,9 +23,15 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.gemm import cute_gemm_tensors, is_swap_ab, swap_ab_rows, wants_swap_ab
+from .bodies.gemm import (
+    TABLE_DESCRIPTORS_PER_GEMM,
+    cute_gemm_tensors,
+    is_swap_ab,
+    swap_ab_rows,
+    wants_swap_ab,
+)
 from .cache import PlanCache, make_plan_key
-from .codegen import GeneratedCuTeModule, emit_cute
+from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
@@ -2462,7 +2468,9 @@ class _RuntimeState:
                 self._gemm_table = (gemm_table, _cute_view(gemm_table))
             if self._tma_descriptors is None:
                 descriptors = torch.zeros(
-                    len(launch.gemm_table) * 3 * 16, dtype=torch.int64, device=device
+                    len(launch.gemm_table) * TABLE_DESCRIPTORS_PER_GEMM * 16,
+                    dtype=torch.int64,
+                    device=device,
                 )
                 self._tma_descriptors = (
                     descriptors,
@@ -2593,9 +2601,17 @@ class _RuntimeState:
         """TMA descriptors need 16-byte-aligned operand base addresses."""
         gemm_slots = getattr(self, "_gemm_slots", None)
         if gemm_slots is None:
+            table = np.asarray(self.generated.launch.gemm_table, dtype=np.int64)
+            second = table[:, GEMM_SECOND_A_COLUMN] if table.shape[1] > GEMM_SECOND_A_COLUMN else []
             gemm_slots = np.unique(
-                # Columns 1-3 are the A, B and C slots.
-                np.asarray(self.generated.launch.gemm_table, dtype=np.int64)[:, 1:4]
+                np.concatenate(
+                    (
+                        # Columns 1-3 are the A, B and C slots; paired GEMMs
+                        # also load their second A with TMA.
+                        table[:, 1:4].ravel(),
+                        np.asarray([slot - 1 for slot in second if slot > 0], dtype=np.int64),
+                    )
+                )
             )
             self._gemm_slots = gemm_slots
         misaligned = gemm_slots[addresses[gemm_slots] % 16 != 0]
@@ -2808,7 +2824,9 @@ def _g0_operands(
 ) -> tuple[torch.Tensor, ...]:
     """CUTLASS ``(A, B, C)`` for a G0 GEMM: activation, weight and output, or
     weight, activation and the transposed output for swapAB."""
-    # A bias (addmm) is read by the GEMM epilogue, not bound as an operand.
+    # A bias (addmm) and fused epilogue operands are read by the GEMM
+    # epilogue, not bound as operands; a paired GEMM's second weight shares
+    # the first one's descriptor template.
     activation_load, *weight_loads = selected.program.loads[:2]
     activation = _g0_activation_view(
         activation_load.value_id,
@@ -2820,6 +2838,9 @@ def _g0_operands(
         for load in weight_loads
     )
     output = values[selected.program.store.value_id]
+    if output.dim() != 2:
+        # A fused epilogue stores its chain's result, viewed as the GEMM output.
+        output = output.reshape(selected.program.store.shape)
     if is_swap_ab(body):
         return (*weights, activation, output.t())
     return (activation, *weights, output)

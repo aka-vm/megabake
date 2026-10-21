@@ -193,13 +193,19 @@ def assign_storage(
                         value_id=value_id,
                         storage_id=value_id,
                         kind="output",
-                        layout=tile_maps[selected.region_id].output_layout,
+                        layout=_value_shaped(
+                            tile_maps[selected.region_id].output_layout,
+                            selection.graph.values[value_id],
+                        ),
                         region_ids=(selected.region_id, *consumers.get(value_id, ())),
                     )
                 )
                 continue
 
-            source_layout = tile_maps[selected.region_id].output_layout
+            source_layout = _value_shaped(
+                tile_maps[selected.region_id].output_layout,
+                selection.graph.values[value_id],
+            )
             conversions = tuple(
                 conversion
                 for conversion in selection.conversions
@@ -821,6 +827,16 @@ def _make_boundary_binding(
         binding_name=value.binding_name,
         aliases=value.storage_relation.aliases,
     )
+
+
+def _value_shaped(layout: CuTeLayout, value: Any) -> CuTeLayout:
+    """``layout`` in ``value``'s own shape when it is a dense reshape of it:
+    a GEMM with a fused epilogue writes its consumer's result as the 2-D GEMM
+    output, while other regions index the value in its graph shape."""
+    if value.shape is None or value.strides is None or tuple(value.shape) == layout.shape:
+        return layout
+    shaped = CuTeLayout(layout.dtype, tuple(value.shape), tuple(value.strides), layout.alignment_bytes)
+    return shaped if layout.same_dense_memory(shaped) else layout
 
 
 def _deduplicate_bindings(bindings: list[TensorBinding]) -> list[TensorBinding]:

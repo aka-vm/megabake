@@ -190,3 +190,34 @@ def test_splits_become_slices_before_import():
         for actual, expected in zip(prepared.forward(value), Model()(value), strict=True):
             torch.testing.assert_close(actual, expected)
     split_to_slices(prepared.graph)  # idempotent
+
+
+def test_eliminate_common_subexpressions_merges_pure_duplicates_only():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    from megabake.frontend import eliminate_common_subexpressions
+
+    def per_layer(positions, state):
+        # Two layers each compute the same cosines; the state write must keep
+        # its own copy of the value it mutates.
+        first = torch.cos(positions * 2.0)
+        second = torch.cos(positions * 2.0)
+        scratch = positions * 2.0
+        scratch.add_(1.0)
+        state.copy_(scratch)
+        return first + second, state
+
+    graph = make_fx(per_layer)(torch.randn(4), torch.zeros(4))
+    before = [node.target for node in graph.graph.nodes if node.op == "call_function"]
+    eliminate_common_subexpressions(graph)
+    graph.recompile()
+    after = [node.target for node in graph.graph.nodes if node.op == "call_function"]
+
+    assert before.count(torch.ops.aten.cos.default) == 2
+    assert after.count(torch.ops.aten.cos.default) == 1
+    # One shared positions * 2 for the cosines, one owned by the in-place add.
+    assert after.count(torch.ops.aten.mul.Tensor) == 2
+    positions = torch.randn(4)
+    expected = per_layer(positions, torch.zeros(4))
+    actual = graph(positions, torch.zeros(4))
+    torch.testing.assert_close(actual, expected)

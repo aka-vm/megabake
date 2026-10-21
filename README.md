@@ -35,14 +35,14 @@ Complete Hugging Face decoders compile into one cooperative CuTe kernel, in pref
 - **Small operators** (norms, RoPE, residual adds, gated activations) run generated bodies and, at decode sizes, fold into their consumer's barrier interval.
 - **Synchronization:** a counting grid barrier (~0.7 µs at 60 CTAs). Full models do not use events yet.
 
-Limits: SM90 and bf16 only; static shapes served through size buckets; prefill is slow above ~64 tokens; the compiler is still tuned to Llama-shaped models (see ROADMAP §5).
+Limits: SM90 and bf16 only; static shapes served through size buckets; prefill is slow above ~64 tokens; the compiler is still tuned to Llama-shaped models (see [ROADMAP.md](ROADMAP.md)).
 
 ## Current performance
 
-On a 60-SM H200 MIG slice, bf16 (full table in [ROADMAP.md](ROADMAP.md#measured-state)):
+On a 60-SM H200 MIG slice, bf16 (full table in [ROADMAP.md](ROADMAP.md#measured-state-2026-10-21)):
 
-- **Decode kernel time** equals Inductor's on Llama/Qwen2-shaped models and is up to 2.8x slower on Gemma 3 and Qwen3.5.
-- **Decode call time** is 1.2–5x faster, but only against Inductor without CUDA graphs. A CUDA-graph baseline is the next measurement (ROADMAP step 0).
+- **Decode, pipelined calls:** 5–55% faster than a CUDA-graphed Inductor decode on 6 of 8 models; 1.3x slower on Gemma 3 and 2.2x slower on Qwen3.5.
+- **Decode, synchronized calls:** roughly ties graphed Inductor; ~600 µs of host work per call loses four models.
 - **Prefill** is slower than Inductor + CUDA graphs on every model, and 3–21x slower at 128–300 tokens.
 
 Reproduce on an SM90 device:

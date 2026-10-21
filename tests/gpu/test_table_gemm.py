@@ -28,8 +28,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 LAYERS = 2
-# Q, K, V, O, gate, up, and down per layer, plus the vocabulary projection.
-PROJECTIONS = 7 * LAYERS + 1
+# Q, K, V, O, gate and up as one paired GEMM, and down per layer, plus the
+# vocabulary projection.
+PROJECTIONS = 6 * LAYERS + 1
 
 
 @pytest.fixture
@@ -51,7 +52,13 @@ def _assert_tuned_table_projections(backend) -> None:
         phase.body.name == "generic_contraction" for phase in compiled.plan.phases
     )
     assert len(launch.gemm_table) == PROJECTIONS
-    # Equal shapes share one variant: Q/O, K/V, gate/up, down, and vocabulary.
+    # O and down add the residual in their epilogues; gate and up run as one
+    # paired GEMM whose epilogue applies SiLU and the product.
+    names = [phase.body.name for phase in gemm_phases]
+    assert names.count("g0_range_swapab_16x64_epilogue") == 2 * LAYERS
+    assert names.count("g0_range_swapab_16x64_paired_epilogue") == LAYERS
+    # Equal shapes share one variant whatever their epilogues: Q/O, K/V,
+    # gate/up, down, and vocabulary.
     assert len(launch.gemm_template_phases) == 5
     assert compiled.plan.launch.grid_size == compiled.resources.max_cooperative_workers
     assert compiled.resources.local_memory_bytes_per_thread <= 64
@@ -109,3 +116,14 @@ def test_table_launch_runs_tuned_gemms_in_stateful_decode(tmp_path, table_launch
         torch.testing.assert_close(actual_tensor, reference_tensor, rtol=0, atol=0)
 
     _assert_tuned_table_projections(backend)
+    # Attention computes the rotated query and new key itself.
+    attention_regions = [
+        phase.region_id
+        for phase in backend.megabake_last_compiled.plan.phases
+        if phase.body.provider == "attention"
+    ]
+    assert len(attention_regions) == LAYERS
+    assert all(region.endswith(":attention_prologue") for region in attention_regions)
+    assert not any(
+        phase.region_id.endswith(":rope") for phase in backend.megabake_last_compiled.plan.phases
+    )

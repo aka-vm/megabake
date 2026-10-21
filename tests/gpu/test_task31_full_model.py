@@ -26,11 +26,12 @@ pytestmark = pytest.mark.skipif(
 
 def _assert_tuned_projections(compiled, layers: int = 30) -> None:
     # Every Q/K/V/O, gate/up/down, and vocabulary projection runs the tuned
-    # TMA GEMM inside the table launch, on every cooperative worker.
+    # TMA GEMM inside the table launch, on every cooperative worker; gate and
+    # up run as one paired GEMM.
     assert compiled.generated.launch.launch_policy == "megabake_cooperative_table"
     assert (
         sum(phase.body.provider == "g0_range" for phase in compiled.plan.phases)
-        == 7 * layers + 1
+        == 6 * layers + 1
     )
     assert compiled.plan.launch.grid_size == compiled.resources.max_cooperative_workers
 

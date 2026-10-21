@@ -137,6 +137,72 @@ def split_to_slices(graph_module: Any) -> None:
     graph.lint()
 
 
+def eliminate_common_subexpressions(graph_module: Any) -> None:
+    """Merge pure ATen nodes that apply one op to the same arguments.
+
+    Models often recompute one value per layer (RoPE cosines and sines from
+    the positions, say); each copy would cost a kernel phase. Random ops,
+    mutating ops, and nodes whose result a mutating op writes are left alone;
+    views merge too, so that the computations reading them can.
+    """
+    graph = graph_module.graph
+    written = {
+        argument
+        for node in graph.nodes
+        if node.op == "call_function" and _is_mutating(node.target)
+        for argument in node.all_input_nodes
+    }
+    seen: dict[Any, Any] = {}
+    for node in list(graph.nodes):
+        target = node.target
+        if (
+            node.op != "call_function"
+            or not isinstance(target, torch._ops.OpOverload)
+            or _is_mutating(target)
+            or torch.Tag.nondeterministic_seeded in target.tags
+            or node in written
+        ):
+            continue
+        key = _cse_key(target, node.args, node.kwargs)
+        if key is None:
+            continue
+        original = seen.setdefault(key, node)
+        if original is not node:
+            node.replace_all_uses_with(original)
+            graph.erase_node(node)
+    graph.lint()
+
+
+def _is_mutating(target: Any) -> bool:
+    schema = getattr(target, "_schema", None)
+    return schema is not None and schema.is_mutable
+
+
+def _cse_key(target: Any, args: Any, kwargs: Any) -> Any:
+    """A hashable key for ``target(*args, **kwargs)``, or None."""
+
+    def freeze(value: Any) -> Any:
+        if isinstance(value, torch.fx.Node):
+            return ("node", value)
+        if isinstance(value, (list, tuple)):
+            return (type(value).__name__, *(freeze(item) for item in value))
+        if isinstance(value, dict):
+            return ("dict", *sorted((key, freeze(item)) for key, item in value.items()))
+        if value is None or isinstance(
+            value, (bool, int, float, str, torch.dtype, torch.device, torch.layout, torch.memory_format)
+        ):
+            # Distinguish 1 from 1.0 and True.
+            return (type(value).__name__, value)
+        raise TypeError
+
+    try:
+        key = (target, freeze(args), freeze(kwargs))
+        hash(key)
+    except TypeError:
+        return None
+    return key
+
+
 def _torch_version() -> tuple[int, int]:
     match = re.match(r"(\d+)\.(\d+)", torch.__version__)
     if match is None:
@@ -460,6 +526,7 @@ def _prepare_fx_graph(
         ):
             internals.recursive_post_grad_passes(prepared_graph, is_inference=True)
         split_to_slices(prepared_graph)
+        eliminate_common_subexpressions(prepared_graph)
         prepared_graph.recompile()
         final_graphs.append(prepared_graph)
         dump_graph("post_grad", prepared_graph, dump_directory)

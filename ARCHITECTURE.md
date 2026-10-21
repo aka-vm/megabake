@@ -32,7 +32,7 @@ flowchart TD
 | Import | `graph.py` | `import_fx` into `ComputeGraph` (`Value`, `Op`, `Region`) |
 | Lowering | `lowering.py` | Tensor programs per primitive family; `UnsupportedLowering` names the gap |
 | Regions | `regions.py` | Semantic matchers (RMSNorm, RoPE, attention, gated MLP) and region formation |
-| Bodies | `bodies/` | `interface.py` contracts; `gemm.py` Hopper TMA/WGMMA; `attention.py`; `generic.py` map, reduction and contraction; `blackwell.py` correctness baseline |
+| Bodies | `bodies/` | `interface.py` contracts; `gemm.py` drives the Hopper TMA/WGMMA kernel in `cutlass_gemm.py`, a fork of the pinned CUTLASS file in `cutlass_upstream/` (`tools/vendor_cutlass.py` shows the diff); `attention.py`; `generic.py` map, reduction and contraction; `blackwell.py` correctness baseline |
 | Planning | `planner.py`, `plan.py` | Body selection, tile maps, bounded plan search |
 | Scheduling | `schedule.py` | Dependencies, phase schedule, event schedule, simulation |
 | Storage | `memory.py` | Lifetimes, workspace reuse, per-worker scratch, plan verification |
@@ -72,8 +72,9 @@ A provider receives a region's tensor program, its semantic parameters and `Targ
 | Family | Built today |
 | --- | --- |
 | Projection | Hopper TMA/WGMMA, 64x64x64, 8 stages. swapAB for launches with ≤ 64 rows (weight on WGMMA's M, tokens on N = 16/32/64). Bias epilogue. Deterministic split-K, off |
+| GEMM epilogues (swapAB) | The elementwise chain that consumes a GEMM result runs in the register epilogue: the region's `post` expression is generated into a function evaluated per output element, reading extra operands (residual, bias, scales) by output coordinates. A **paired** GEMM computes two projections of one activation (gate/up) in a 128-row tile, 64 rows of each weight loaded by two TMA descriptors into the halves of the A stage, so the chain (SiLU·mul, GELU·mul) sees both accumulators of a row in one thread. No derived weight copies |
 | Prefill attention | One warp per query row; keys in sequence |
-| Decode attention | Split context across CTAs; chunks exchange max/sum; the last chunk merges in order |
+| Decode attention | Split context across CTAs; chunks exchange max/sum; the last chunk merges in order. An elementwise producer of the query or new key (RoPE) runs as a prologue: the body evaluates its program for the row into shared scratch, and appends that key to the cache |
 | Norms, RoPE, activations, residuals | Generated map and reduction bodies; row-mode reductions |
 | Fallback contraction | Generic indexed contraction (slow; correctness path) |
 | Blackwell | `mma.sync` correctness baseline, not a performance provider |
@@ -93,7 +94,7 @@ A body processes a range of tiles while keeping its pipeline. Scratch is allocat
 | Parameter launch | Small graphs; tensors and TMA descriptors as kernel parameters | Phases or events |
 | Table launch | Parameters would exceed CUDA's 32 KB limit, which is every full model | **Phases only.** Tensors come from a device address table; TMA descriptors are written per phase in the prologue; all GEMMs share one shared-memory layout |
 
-The event schedule exists (`make_event_schedule`, `make_region_event_schedule`, `publish_event`/`wait_for_event`) but is not yet emitted for table launches. Wiring it is ROADMAP step 1.
+The event schedule exists (`make_event_schedule`, `make_region_event_schedule`, `publish_event`/`wait_for_event`) but is not yet emitted for table launches. The per-CTA profile bounds its gain by barrier release (~11% of the 135M decode kernel), so it waits until after cross-GEMM fusion and weight streaming (ROADMAP).
 
 **Memory.** Distinct slices first; reuse only after all consumers, including async readers, finish. Phase lifetimes prove reuse cheaply; events need reachability or explicit release.
 
@@ -124,7 +125,7 @@ Against CUDA-graph replay, launches removed are worth about 0.25 µs per kernel.
 
 The target keeps the frontend and the persistent runtime and adds five parts.
 
-1. **Mega bodies with hook slots.** A small, model-agnostic library: GEMM, attention, split-KV decode attention, row reduction, scan, grouped GEMM. Each has typed prologue and epilogue slots, for example RMSNorm as a row-scale prologue, residual add, SiLU·mul from a paired gate/up GEMM, RoPE in the load prologue, and a q-norm folded into the softmax scale.
+1. **Mega bodies with hook slots.** A small, model-agnostic library: GEMM, attention, split-KV decode attention, row reduction, scan, grouped GEMM. Each has typed prologue and epilogue slots, for example RMSNorm as a row-scale prologue, residual add, SiLU·mul from a paired gate/up GEMM, RoPE in the load prologue, and a q-norm folded into the softmax scale. *Built: GEMM epilogue expressions and the paired GEMM (swapAB launches), and elementwise query/key prologues in split-context decode attention (section 4).*
 2. **A contract matcher.** It absorbs neighbouring ops into those slots as expressions. RoPE style, norm variant and eps, activation, bias and casts come from the graph, matched by scalar-expression normal form rather than by ATen spelling.
 3. **Layout assignment over typed edge formats.** `EdgeFormat` = dtype + scale spec + data layout + scale layout. Bodies declare ranked input and output alternatives; the planner assigns them with a bytes-plus-phases cost.
 4. **`transform_params`.** A bake-time stage that owns derived weights (fused QKV, paired gate/up, layout permutations), proves that each transform commutes with the computation, detects changes to the source weights, and adds a transform revision to the cache key. Permuting a producer's output rows is bit-exact; permuting a consumer's reduction columns or folding a norm weight is not and needs an opt-in numerics policy.

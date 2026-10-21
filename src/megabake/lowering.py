@@ -79,6 +79,9 @@ class Load:
 @dataclass(frozen=True)
 class Accumulator:
     dtype: str
+    # Which accumulator of a paired contraction: 0 multiplies the first right
+    # operand (load 1), 1 the second (load 2) with the same left operand.
+    index: int = 0
 
 
 @dataclass(frozen=True)

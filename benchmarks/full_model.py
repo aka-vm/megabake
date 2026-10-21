@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import json
 import statistics
 import sys
@@ -86,6 +87,9 @@ def _time_calls(function, count: int) -> dict[str, object]:
 
 def _pipelined_calls(calls) -> float:
     """Mean time per call when ``calls`` are issued back to back with one sync."""
+    # A full collection over the compilers' objects takes ~0.6 s; inside the
+    # window it would add ~15 ms per call to whichever variant it lands in.
+    gc.collect()
     torch.cuda.synchronize()
     started = time.perf_counter()
     for call in calls:

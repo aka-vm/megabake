@@ -216,6 +216,11 @@ class AttentionBodyProvider:
             return reject("provider supports read-only or bounded stateful KV caches only")
         if stateful and query_length != 1:
             return reject("stateful KV attention supports one-token decode only")
+        if facts.get("prologues") and not (
+            stateful and policy.table_launch and head_dim % 32 == 0
+        ):
+            # Only the table launch's split-context decode body computes them.
+            return reject("query and key prologues need the split-context decode body")
 
         if target.architecture != "sm90a" or not target.supports_wgmma:
             return reject("provider targets WGMMA-capable sm90a only")
@@ -284,6 +289,16 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
         if length is not None
     )
     scratch_bytes = attention_scratch_rows(kv_capacity) * kv_capacity * 4
+    if stateful:
+        # The split-context decode body keeps warp statistics, warp value
+        # partials and a score row, then the computed query and new-key rows
+        # of its prologues (see _split_decode_attention_body).
+        head_dim = facts["head_grouping"]["head_dim"]
+        warps = threads // 32
+        rows = 2 if facts.get("prologues") else 0
+        scratch_bytes = max(
+            scratch_bytes, (warps + warps * head_dim + kv_capacity + rows * head_dim) * 4
+        )
     layouts = {
         load.value_id: TensorLayout(
             load.dtype,
@@ -323,6 +338,7 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
                 "numerical_policy": facts["numerical_policy"],
                 "cache_effects": facts["cache_effects"],
                 "kv_state": facts.get("kv_state"),
+                "prologues": facts.get("prologues"),
             },
             access_restrictions=(
                 (
@@ -483,10 +499,16 @@ def emit_attention_body(
             raise UnsupportedAttentionBody(
                 "stateful attention scratch must hold one score row per warp"
             )
+        prologues = facts.get("prologues") or {}
         if defer_length_publish and workers is not None and head_dim % 32 == 0:
             return _split_decode_attention_body(
                 program, loads, row_count, query_heads, group_size, head_dim,
                 kv_length, scale, threads, workers, config.scratch.size_bytes,
+                prologues,
+            )
+        if prologues:
+            raise UnsupportedAttentionBody(
+                "query and key prologues need the split-context decode body"
             )
         if defer_length_publish:
             # One warp-sized group of rows per CTA tile.
@@ -735,6 +757,38 @@ def run(
     )
 
 
+def _prologue_lines(
+    prologue: Mapping[str, Any], program: Any, head: str, target: str, name: str
+) -> str:
+    """Lines storing to ``target`` (as FP32) an elementwise producer of a
+    (batch, sequence, head, dim) attention operand evaluated at (b,
+    sequence, ``head``, d), rounded as the producer stores it, from the
+    attention's own bindings."""
+    from .generic import _HOISTED_LOADS, _cast_expression, _emit_expression, _load_access
+
+    bindings = {load.value_id: index for index, load in enumerate(program.loads)}
+    loads = tuple(prologue["loads"])
+    indices = {load.id: bindings[load.value_id] for load in loads}
+    coordinates = {"o0": "b", "o1": "sequence", "o2": head, "o3": "d"}
+    indent = "                    "
+    # Each load is bound once, which keeps the expression within the DSL
+    # preprocessor's recursion limit.
+    hoisted = {load.id: f"{name}_load_{index}" for index, load in enumerate(loads)}
+    lines = "".join(
+        f"{indent}{hoisted[load.id]} = {_load_access(load, indices[load.id], loads, coordinates).code}\n"
+        for load in loads
+    )
+    token = _HOISTED_LOADS.set(hoisted)
+    try:
+        value = _cast_expression(
+            _emit_expression(prologue["combine"], indices, coordinates, loads),
+            prologue["dtype"],
+        )
+    finally:
+        _HOISTED_LOADS.reset(token)
+    return lines + f"{indent}{target} = ({value.code}).to(cutlass.Float32)\n"
+
+
 def decode_chunks(rows: int, workers: int) -> int:
     """Chunks per query row for split-context decode at long contexts.
 
@@ -763,6 +817,7 @@ def _split_decode_attention_body(
     threads: int,
     workers: int,
     scratch_bytes: int = 0,
+    prologues: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> GeneratedAttentionBody:
     """One-token decode with the visible keys of each query row split into
     chunks that run on different CTAs (flash decoding), keeping the captured
@@ -783,7 +838,12 @@ def _split_decode_attention_body(
     in shared scratch after the warp partials whenever a full KV row fits
     there; otherwise they go through phase scratch. A single chunk in use
     skips the statistics exchange and its fences.
+
+    ``prologues`` computes the query or new key from its elementwise producer
+    (RoPE) for the item's row into shared scratch, rounded as the producer
+    stores it; the new key appended to the cache is that row.
     """
+    prologues = prologues or {}
     warps = threads // 32
     chunks = decode_chunks(row_count, workers)
     # Shared scratch: warp maxima or sums, then warp value partials, then scores.
@@ -803,6 +863,37 @@ def _split_decode_attention_body(
     floats = partial_base + row_count * chunks * head_dim
     binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
     dims_per_lane = head_dim // 32
+    # Computed query and new-key rows follow the scores in shared scratch.
+    q_row = shared_scores + (kv_length if scores_in_shared else 0)
+    k_row = q_row + head_dim
+    if prologues and (k_row + head_dim) * 4 > scratch_bytes:
+        raise UnsupportedAttentionBody("attention scratch cannot hold the prologue rows")
+    prologue_rows = "".join(
+        f"                for d in cutlass.range(thread, {head_dim}, {threads}):\n"
+        + _prologue_lines(prologues[load_id], program, head, f"scratch[{row} + d]", name)
+        for load_id, row, head, name in (
+            ("attention:q", q_row, "h", "query"),
+            ("attention:new_k", k_row, "kv_head", "key"),
+        )
+        if load_id in prologues
+    )
+    if prologues:
+        prologue_rows = (
+            "                sequence = cutlass.Int32(0)\n"
+            + prologue_rows
+            + "                cute.arch.sync_threads()\n"
+        )
+
+    def row_load(load_id: str, index: int, head: str, row: int) -> str:
+        if load_id in prologues:
+            return f"cute.make_tensor(scratch.iterator + {row}, cute.make_layout({head_dim})).load()"
+        return f"tensor_bindings[{index}][(b, 0, {head}, None)].load().to(cutlass.Float32)"
+
+    new_key_value = (
+        f"scratch[{k_row} + d].to(cutlass.BFloat16)"
+        if "attention:new_k" in prologues
+        else f"tensor_bindings[{new_k_index}][b, 0, kv_head, d]"
+    )
 
     def lines(template: str, indent: str, **values: object) -> str:
         return "\n".join(
@@ -863,7 +954,7 @@ def _split_decode_attention_body(
         + lines("scratch[" + str(warps) + " + warp * " + str(head_dim) + " + {d}] = value_{j}", "                ")
         + "\n                cute.arch.sync_threads()\n"
     )
-    score_pass = f"""                query = tensor_bindings[{q_index}][(b, 0, h, None)].load().to(cutlass.Float32)
+    score_pass = f"""{prologue_rows}                query = {row_load("attention:q", q_index, "h", q_row)}
                 # Scores: one key per thread, whole rows per load.
                 maximum = cutlass.Float32(-1.0e30)
                 for key in cutlass.range(start + thread, cached_stop, {threads}):
@@ -875,7 +966,7 @@ def _split_decode_attention_body(
                     maximum = cute.arch.fmax(maximum, score, nan=True)
                 if stop == keys:
                     if thread == 0:
-                        row = tensor_bindings[{new_k_index}][(b, 0, kv_head, None)].load().to(cutlass.Float32)
+                        row = {row_load("attention:new_k", new_k_index, "kv_head", k_row)}
                         score = cutlass.Float32((query * row).reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0))
                         score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                         score = score * cutlass.Float32({scale!r})
@@ -1072,7 +1163,7 @@ def run(
                 if h % {group_size} == 0:
                     if warp == 0:
                         for d in cutlass.range(lane, {head_dim}, 32):
-                            tensor_bindings[{k_index}][b, current_length, kv_head, d] = tensor_bindings[{new_k_index}][b, 0, kv_head, d]
+                            tensor_bindings[{k_index}][b, current_length, kv_head, d] = {new_key_value}
                             tensor_bindings[{v_index}][b, current_length, kv_head, d] = tensor_bindings[{new_v_index}][b, 0, kv_head, d]
             cute.arch.sync_threads()
 '''

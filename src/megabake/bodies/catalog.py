@@ -77,6 +77,17 @@ class GenericBodyProvider:
                     ),
                 ),
             )
+        if region.semantic_facts.get("family") == "gemm_epilogue":
+            # The fused region only pays off in a tuned GEMM body; without one
+            # the planner keeps the unfused GEMM and its consumers.
+            return CandidateSet(
+                (),
+                (
+                    ProviderRejection(
+                        self.provider_name, "GEMM epilogue fusion needs a tuned GEMM body"
+                    ),
+                ),
+            )
         if family not in {
             "elementwise",
             "copy",

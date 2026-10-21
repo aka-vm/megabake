@@ -1068,7 +1068,8 @@ def _emit_expression(
             expression.dtype,
         )
     if isinstance(expression, Accumulator):
-        return _TypedExpression("accumulator", expression.dtype)
+        name = "accumulator" if expression.index == 0 else f"accumulator_{expression.index}"
+        return _TypedExpression(name, expression.dtype)
     if isinstance(expression, AxisIndex):
         coordinate = axis_coordinates.get(expression.axis)
         if coordinate is None:
