@@ -78,7 +78,7 @@ def table_descriptors(descriptors: cute.Tensor, gemm: cutlass.Int32):
 
 
 @cute.jit
-def _bf16_tensor(address: cutlass.Int64, shape, stride):
+def _bf16_tensor(address: cutlass.Int64, shape: cutlass.Constexpr, stride: cutlass.Constexpr):
     return cute.make_tensor(
         cute.make_ptr(cutlass.BFloat16, address, cute.AddressSpace.gmem, assumed_align=16),
         cute.make_layout(shape, stride=stride),
@@ -93,7 +93,7 @@ def build_table_descriptors(
     a_address: cutlass.Int64,
     b_address: cutlass.Int64,
     c_address: cutlass.Int64,
-    mnk,
+    mnk: cutlass.Constexpr,
     c_m_major: cutlass.Constexpr = False,
     splits: cutlass.Constexpr = 1,
     a2_address=None,
@@ -105,9 +105,7 @@ def build_table_descriptors(
     ``fence_tma_desc_release`` before the grid barrier, and the GEMM body
     acquires them before its first TMA copy. Split-K variants see A and B as
     ``(rows, k / splits, splits)``: the L mode selects a split's K range.
-    Paired variants also take the second A, which shares A's template.
-    ``mnk`` is the phase's CUTLASS problem shape, read from its GEMM row at
-    run time: a variant's template serves every shape."""
+    Paired variants also take the second A, which shares A's template."""
     m, n, k = mnk
     tensor_bindings, epilogue, _ = prepared
     atoms = (tensor_bindings[0], tensor_bindings[2], epilogue[0], tensor_bindings[0])

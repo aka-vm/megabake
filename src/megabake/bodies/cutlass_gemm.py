@@ -637,7 +637,6 @@ class HopperWgmmaGemmPersistentKernel:
         bias_address=None,
         c_address=None,
         epilogue_state=None,
-        problem_shape=None,
     ):
         """Run one table-launched phase whose TMA descriptors live in global
         memory. ``prepared`` is this variant's ``prepare`` result; the kernel
@@ -646,9 +645,7 @@ class HopperWgmmaGemmPersistentKernel:
         partials, Int32 tile arrival counters, this phase's partial offset,
         its counter offset). Fused epilogues take ``epilogue_state``: a
         callable returning (the phase's epilogue kind, one tuple of extra
-        tensors per epilogue), called after the mainloop. ``problem_shape`` is
-        the phase's CUTLASS (M, N, K) at run time: GEMMs of every shape share
-        one body, and ``prepared`` holds only its template phase's shape."""
+        tensors per epilogue), called after the mainloop."""
         tensor_bindings, epilogue, tile_sched_params = prepared
         (
             tma_atom_a,
@@ -682,7 +679,6 @@ class HopperWgmmaGemmPersistentKernel:
             bias_address,
             c_address,
             epilogue_state,
-            problem_shape,
         )
 
     @cute.kernel
@@ -742,7 +738,6 @@ class HopperWgmmaGemmPersistentKernel:
         bias_address=None,
         c_address=None,
         epilogue_state=None,
-        problem_shape=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -792,38 +787,6 @@ class HopperWgmmaGemmPersistentKernel:
         desc_a2 = None
         if cutlass.const_expr(tma_descs is not None):
             desc_a, desc_b, desc_c, desc_a2 = tma_descs
-
-        # MegaBake: one body serves table GEMMs of every shape, so ptxas sees
-        # one copy of the wgmma mainloop per configuration rather than one
-        # per projection shape. The prepared TMA tensors carry the template
-        # phase's shape; this phase's TMA coordinates, extents and tile
-        # schedule come from its run-time (M, N, K) (its descriptors already
-        # hold its own shape, see build_table_descriptors).
-        if cutlass.const_expr(problem_shape is not None):
-            problem_m, problem_n, problem_k = problem_shape
-            chunk = problem_k // self.splits
-            mA_mkl = cute.make_tensor(
-                mA_mkl.iterator,
-                cute.make_layout((problem_m, chunk, self.splits), stride=mA_mkl.stride),
-            )
-            mB_nkl = cute.make_tensor(
-                mB_nkl.iterator,
-                cute.make_layout((problem_n, chunk, self.splits), stride=mB_nkl.stride),
-            )
-            mC_mnl = cute.make_tensor(
-                mC_mnl.iterator,
-                cute.make_layout((problem_m, problem_n, 1), stride=mC_mnl.stride),
-            )
-            tile_sched_params = utils.PersistentTileSchedulerParams(
-                (
-                    (problem_m + self.schedule_tile_mnk[0] - 1) // self.schedule_tile_mnk[0],
-                    (problem_n + self.schedule_tile_mnk[1] - 1) // self.schedule_tile_mnk[1],
-                    self.splits,
-                ),
-                (*self.cluster_shape_mn, 1),
-                self.swizzle_size,
-                self.raster_along_m,
-            )
 
         # Prefetch Tma desc
         if cutlass.const_expr(tma_descs is None):
@@ -1397,8 +1360,7 @@ class HopperWgmmaGemmPersistentKernel:
                 cute.make_ptr(
                     cutlass.BFloat16, bias_address, cute.AddressSpace.gmem, assumed_align=2
                 ),
-                # The phase's own feature count: shapes share this body.
-                cute.make_layout(c_extent[0] if self.bias_along_m else c_extent[1]),
+                cute.make_layout(self.bias_features),
             )
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # Copy from accumulators to D registers

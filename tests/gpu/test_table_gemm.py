@@ -57,9 +57,9 @@ def _assert_tuned_table_projections(backend) -> None:
     names = [phase.body.name for phase in gemm_phases]
     assert names.count("g0_range_swapab_16x64_epilogue") == 2 * LAYERS
     assert names.count("g0_range_swapab_16x64_paired_epilogue") == LAYERS
-    # Every shape shares one variant per configuration whatever its epilogue:
-    # the plain swapAB GEMMs (Q, K, V, O, down, vocabulary) and the paired one.
-    assert len(launch.gemm_template_phases) == 2
+    # Equal shapes share one variant whatever their epilogues: Q/O, K/V,
+    # gate/up, down, and vocabulary.
+    assert len(launch.gemm_template_phases) == 5
     assert compiled.plan.launch.grid_size == compiled.resources.max_cooperative_workers
     assert compiled.resources.local_memory_bytes_per_thread <= 64
     trace = backend.megabake_last_trace[-1]
