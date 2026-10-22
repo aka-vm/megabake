@@ -88,7 +88,8 @@ def test_table_launch_runs_tuned_gemms_in_prefill(tmp_path, table_launch):
     _assert_tuned_table_projections(backend)
 
 
-def test_table_launch_runs_tuned_gemms_in_stateful_decode(tmp_path, table_launch):
+def _run_stateful_decode(tmp_path):
+    """Four decode calls of the two-layer model, bit-exact against eager."""
     from megabake import make_backend
 
     torch.manual_seed(7)
@@ -114,6 +115,11 @@ def test_table_launch_runs_tuned_gemms_in_stateful_decode(tmp_path, table_launch
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     for actual_tensor, reference_tensor in zip(actual_state, reference_state, strict=True):
         torch.testing.assert_close(actual_tensor, reference_tensor, rtol=0, atol=0)
+    return backend
+
+
+def test_table_launch_runs_tuned_gemms_in_stateful_decode(tmp_path, table_launch):
+    backend = _run_stateful_decode(tmp_path)
 
     _assert_tuned_table_projections(backend)
     # Attention computes the rotated query and new key itself.
@@ -127,3 +133,22 @@ def test_table_launch_runs_tuned_gemms_in_stateful_decode(tmp_path, table_launch
     assert not any(
         phase.region_id.endswith(":rope") for phase in backend.megabake_last_compiled.plan.phases
     )
+
+
+def test_table_launch_streams_weights_in_stateful_decode(tmp_path, table_launch, monkeypatch):
+    import megabake.codegen as codegen
+
+    # Streaming is off by default (ROADMAP step 3); it must stay exact.
+    monkeypatch.setattr(codegen, "WEIGHT_STREAM_STAGES", 64)
+    backend = _run_stateful_decode(tmp_path)
+
+    _assert_tuned_table_projections(backend)
+    generated = backend.megabake_last_compiled.generated
+    # Every barrier before a GEMM interval streams, and every variant streams
+    # somewhere: Q/O, K/V, gate/up, down and the vocabulary projection.
+    stream_rows = generated.launch.stream_table[1:]
+    assert len(stream_rows) == 4 * LAYERS
+    assert {row[3 * cta + 1] for row in stream_rows for cta in range(len(row) // 3) if row[3 * cta]} == set(
+        range(len(generated.launch.gemm_template_phases))
+    )
+    assert generated.source.count(".preload_table(") == len(generated.launch.gemm_template_phases)

@@ -13,7 +13,11 @@ import torch
 
 from .graph import ComputeGraph
 from .plan import BodySelectionPlan, KernelPlan
-from .runtime import L2_PREFETCH_BYTES, PHASE_TIMER_SLOTS
+from .runtime import (
+    L2_PREFETCH_BYTES,
+    PHASE_TIMER_SLOTS,
+    WEIGHT_STREAM_STAGES,
+)
 
 if TYPE_CHECKING:
     from .frontend import CaptureContext
@@ -74,6 +78,7 @@ def make_plan_key(
         # Timed kernels write stamps past the barrier state of an untimed buffer.
         "phase_timer_slots": PHASE_TIMER_SLOTS,
         "l2_prefetch_bytes": L2_PREFETCH_BYTES,
+        "weight_stream_stages": WEIGHT_STREAM_STAGES,
     }
     encoded = json.dumps(
         _canonical(payload), sort_keys=True, separators=(",", ":"), allow_nan=False

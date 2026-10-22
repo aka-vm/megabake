@@ -316,3 +316,41 @@ def test_emit_cute_emits_explicit_layout_conversion(tmp_path):
         entry.kind == "layout_conversion"
         for entry in generated.source_map
     )
+
+
+def test_weight_stream_schedule_streams_each_ctas_first_gemm_of_the_next_interval():
+    from types import SimpleNamespace
+
+    from megabake.codegen import _weight_stream_schedule
+
+    # Phase 0 closes the first interval; the second runs a norm recomputed on
+    # every CTA, then q, k and v GEMMs side by side on 4 CTAs (v wraps
+    # around); the third runs o, whose weight cannot be streamed.
+    barriers = (True, False, False, False, True, True)
+    plan = SimpleNamespace(
+        phases=tuple(
+            SimpleNamespace(index=index, barrier=object() if barrier else None)
+            for index, barrier in enumerate(barriers)
+        ),
+        launch=SimpleNamespace(grid_size=4),
+    )
+    rotations = (0, -1, 0, 2, 3, 0)
+    units = {0: 1, 1: 1, 2: 2, 3: 1, 4: 3, 5: 4}
+    gemm_of_phase = {2: 0, 3: 1, 4: 2, 5: 3}
+    variants = (0, 1, 1, 0)
+
+    rows, issues = _weight_stream_schedule(
+        plan, rotations, units, gemm_of_phase, variants, {0, 1, 2}, 8
+    )
+
+    # (GEMM row + 1, variant, rotated block) per CTA: CTAs 0-1 run q tiles
+    # 0-1, CTA 2 the k tile, and CTA 3 v tile 0 (v tiles 1-2 come after q
+    # on CTAs 0-1, which stream q).
+    assert rows == [(0,) * 12, (1, 0, 0, 1, 0, 1, 2, 1, 0, 3, 1, 0)]
+    assert issues == {0: 1}
+
+    rows, issues = _weight_stream_schedule(
+        plan, rotations, units, gemm_of_phase, variants, {0, 1, 2}, 0
+    )
+    assert rows == [(0,) * 12] and issues == {}
+

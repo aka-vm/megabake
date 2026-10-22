@@ -1919,6 +1919,7 @@ class _RuntimeState:
         self._address_mirror: np.ndarray | None = None
         self._phase_table: tuple[torch.Tensor, Any] | None = None
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
+        self._stream_table: tuple[torch.Tensor, Any] | None = None
         # Phase scratch of table launches: FP32 elements and Int32 counters.
         self._phase_scratch: tuple[tuple[torch.Tensor, Any], tuple[torch.Tensor, Any]] | None = None
         # Per-invocation TMA descriptors (three 128-byte maps per table GEMM),
@@ -2466,6 +2467,11 @@ class _RuntimeState:
                     launch.gemm_table, dtype=torch.int32, device=device
                 )
                 self._gemm_table = (gemm_table, _cute_view(gemm_table))
+            if self._stream_table is None and launch.stream_table:
+                stream_table = torch.tensor(
+                    launch.stream_table, dtype=torch.int32, device=device
+                )
+                self._stream_table = (stream_table, _cute_view(stream_table))
             if self._tma_descriptors is None:
                 descriptors = torch.zeros(
                     len(launch.gemm_table) * TABLE_DESCRIPTORS_PER_GEMM * 16,
@@ -2491,7 +2497,12 @@ class _RuntimeState:
             self._phase_scratch[0][1],
             self._phase_scratch[1][1],
             *(
-                (self._gemm_table[1], self._tma_descriptors[1], *gemm_views)
+                (
+                    self._gemm_table[1],
+                    *((self._stream_table[1],) if launch.stream_table else ()),
+                    self._tma_descriptors[1],
+                    *gemm_views,
+                )
                 if launch.gemm_table
                 else ()
             ),
@@ -2519,7 +2530,12 @@ class _RuntimeState:
         ]
         if launch.gemm_table:
             arguments.extend(
-                (self._gemm_table[1], self._tma_descriptors[1], gemm_views)
+                (
+                    self._gemm_table[1],
+                    *((self._stream_table[1],) if launch.stream_table else ()),
+                    self._tma_descriptors[1],
+                    gemm_views,
+                )
             )
             if include_constants:
                 arguments.append(self._max_active_clusters)

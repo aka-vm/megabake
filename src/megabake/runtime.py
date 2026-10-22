@@ -60,6 +60,20 @@ def ready_slots(workers: int) -> int:
 L2_PREFETCH_BYTES = int(os.environ.get("MEGABAKE_L2_PREFETCH_BYTES", 0))
 
 
+# Weight streaming into shared memory (see codegen._weight_stream_schedule):
+# at the grid barrier before a GEMM interval, each CTA loads the weight
+# operand of the first K tiles of its first tile in that interval into the
+# GEMM's pipeline stages, so the loads overlap the barrier wait and the norms
+# folded into the interval. At most this many stages per CTA (the GEMM's
+# stage count bounds it); 0 disables streaming.
+# Off by default: against the same kernel with the streaming code compiled in
+# but never preloading, the preloads changed decode by -0.7% to +1.5% on a
+# 60-SM H200 slice (artifacts/step3_2026-10-21). Issuing them blocks warp 0
+# once the SM's TMA queue is full, so they overlap little beyond the barrier
+# wait.
+WEIGHT_STREAM_STAGES = int(os.environ.get("MEGABAKE_WEIGHT_STREAM_STAGES", 0))
+
+
 # Host-mapped buffers holding table launches' per-call boundary addresses;
 # launch ``n`` reads entry ``n % DYNAMIC_ADDRESS_RING``.
 DYNAMIC_ADDRESS_RING = 64
@@ -162,11 +176,30 @@ def counting_grid_barrier(
     caller keeps ``(ordinal + 1) * workers`` within int32 and resets the
     ready buffer before it would wrap.
     """
+    counting_grid_arrive(ready, workers)
+    counting_grid_wait(ready, workers, ordinal)
+
+
+@cute.jit
+def counting_grid_arrive(ready: cute.Tensor, workers: cutlass.Int32):
+    """The arrival half of ``counting_grid_barrier``: once every thread of
+    the CTA is done, thread 0 arrives. The CTA may issue work that does not
+    depend on other CTAs (weight loads) before ``counting_grid_wait``."""
     thread, _, _ = cute.arch.thread_idx()
     cute.arch.sync_threads()
     if thread == 0:
         counter = ready.iterator + workers + 1
         cute.arch.red(counter, cutlass.Int32(1), op="add", dtype="s32", sem="release", scope="gpu")
+
+
+@cute.jit
+def counting_grid_wait(
+    ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32
+):
+    """The waiting half of ``counting_grid_barrier``."""
+    thread, _, _ = cute.arch.thread_idx()
+    if thread == 0:
+        counter = ready.iterator + workers + 1
         target = (ordinal + cutlass.Int32(1)) * workers
         seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
         while seen < target:

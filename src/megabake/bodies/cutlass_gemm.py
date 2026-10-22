@@ -35,6 +35,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from collections.abc import Sequence
+import contextlib
 from typing import Optional, Tuple, Type
 import math
 from math import prod
@@ -45,6 +46,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.pipeline.helpers import MbarrierArray
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
@@ -115,6 +117,23 @@ Constraints are same as dense_gemm.py:
 * The contiguous dimension of A/B/C tensors must be at least 16 bytes aligned,
   i.e, number of elements is a multiple of 8, 16 for Float16, and Float8, respectively.
 """
+
+
+# MegaBake: the slot of the GEMM shared storage's split_arrival that holds
+# the streamed GEMM's tag; the next slot holds its streamed K tiles.
+STREAM_TAG_SLOT = 2
+
+
+@contextlib.contextmanager
+def _without_mbarrier_init():
+    """MegaBake: ``PipelineTmaAsync.create`` initializes its mbarrier arrays
+    in their constructors; while this is active, it emits no init."""
+    initialize = MbarrierArray.mbarrier_init
+    MbarrierArray.mbarrier_init = lambda self, **_: None
+    try:
+        yield
+    finally:
+        MbarrierArray.mbarrier_init = initialize
 
 
 @dsl_user_op
@@ -197,6 +216,7 @@ class HopperWgmmaGemmPersistentKernel:
         direct_store: bool = False,
         epilogues: tuple = (),
         paired: bool = False,
+        stream_stages: int = 0,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -292,6 +312,13 @@ class HopperWgmmaGemmPersistentKernel:
         if paired and tile_shape_mn[0] != 128:
             raise ValueError("paired GEMMs use a 128-row tile")
         self.paired = paired
+        # MegaBake: weight streaming. A table launch may load A (the weight of
+        # a swapAB GEMM) for up to this many leading K tiles of a CTA's first
+        # tile into the pipeline stages before the phase starts, from the
+        # previous grid barrier (preload_table). The phase then initializes
+        # no mbarriers and loads only B for those K tiles. A shared-memory tag
+        # names the GEMM whose stages a CTA loaded.
+        self.stream_stages = stream_stages
 
         self.ab_stage = None
         self.epi_stage = None
@@ -496,7 +523,9 @@ class HopperWgmmaGemmPersistentKernel:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
             ]
-            # MegaBake: the split-K arrival count, shared by the MMA threads.
+            # MegaBake: the split-K arrival count, shared by the MMA threads
+            # (slot 0), and the streamed GEMM's tag and K tiles (slots 2 and
+            # 3; see stream_stages).
             split_arrival: cute.struct.MemRange[cutlass.Int32, 4]
             sA: cute.struct.Align[
                 cute.struct.MemRange[
@@ -637,6 +666,7 @@ class HopperWgmmaGemmPersistentKernel:
         bias_address=None,
         c_address=None,
         epilogue_state=None,
+        stream_tag=None,
     ):
         """Run one table-launched phase whose TMA descriptors live in global
         memory. ``prepared`` is this variant's ``prepare`` result; the kernel
@@ -645,7 +675,9 @@ class HopperWgmmaGemmPersistentKernel:
         partials, Int32 tile arrival counters, this phase's partial offset,
         its counter offset). Fused epilogues take ``epilogue_state``: a
         callable returning (the phase's epilogue kind, one tuple of extra
-        tensors per epilogue), called after the mainloop."""
+        tensors per epilogue), called after the mainloop. Streaming variants
+        take ``stream_tag``, this phase's nonzero tag: the CTA's pipeline
+        stages are already loaded when ``preload_table`` stored that tag."""
         tensor_bindings, epilogue, tile_sched_params = prepared
         (
             tma_atom_a,
@@ -679,7 +711,146 @@ class HopperWgmmaGemmPersistentKernel:
             bias_address,
             c_address,
             epilogue_state,
+            stream_tag,
         )
+
+    @cute.jit
+    def preload_table(
+        self,
+        prepared,
+        scratch,
+        tma_descs,
+        rotated_block,
+        stream_tag,
+    ):
+        """Load A of the leading K tiles of this CTA's first tile of a later
+        table phase into the pipeline stages, and tag the stages with that
+        phase's ``stream_tag`` and the number of K tiles loaded (see
+        ``stream_stages``).
+
+        Called by warp 0 when every warp of the CTA has finished its previous
+        body (whose pipeline is drained), with the rotated block index the
+        phase will run with. Each stage expects its full A + B bytes, so it
+        completes once the phase loads B. A must not be written by the
+        launch."""
+        tensor_bindings, _, tile_sched_params = prepared
+        (
+            tma_atom_a,
+            mA_mkl,
+            _,
+            _,
+            _,
+            cta_layout_mnk,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+        ) = tensor_bindings
+        desc_a, _, _, desc_a2 = tma_descs
+        storage = scratch
+
+        mainloop_pipeline = self._mainloop_pipeline(
+            storage, a_smem_layout_staged, b_smem_layout_staged, cta_layout_mnk
+        )
+        cute.arch.mbarrier_init_fence()
+
+        a_tma_smem_layout_staged = a_smem_layout_staged
+        if cutlass.const_expr(self.paired):
+            a_tma_smem_layout_staged = self._paired_a_smem_layout_staged()
+        sA_tma = storage.sA.get_tensor(
+            a_tma_smem_layout_staged.outer, swizzle=a_tma_smem_layout_staged.inner
+        )
+        gA_mkl = cute.local_tile(mA_mkl, self.a_tma_tile, (None, None, None))
+        cluster_coord_mnk = cta_layout_mnk.get_flat_coord(
+            cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        )
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a,
+            cluster_coord_mnk[1],
+            cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape),
+            cute.group_modes(sA_tma, 0, 2),
+            cute.group_modes(gA_mkl, 0, 2),
+        )
+        block_x, block_y, _ = cute.arch.block_idx()
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, (block_x, block_y, rotated_block), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+        k_tiles = self._streamed_k_tiles(cute.size(gA_mkl, mode=[3]))
+
+        cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_a)
+        if cutlass.const_expr(self.paired):
+            cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_a2)
+        if work_tile.is_valid_tile:
+            tile_coord_mnl = work_tile.tile_idx
+            tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
+            producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.ab_stage
+            )
+            for k_tile in range(k_tiles):
+                mainloop_pipeline.producer_acquire(producer_state)
+                a_stage = producer_state.index
+                if cutlass.const_expr(self.paired):
+                    a_stage = producer_state.index * 2
+                cute.copy(
+                    tma_atom_a,
+                    tAgA_mkl[(None, producer_state.count)],
+                    tAsA[(None, a_stage)],
+                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
+                    mcast_mask=0,
+                    tma_desc_ptr=desc_a,
+                )
+                if cutlass.const_expr(self.paired):
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_mkl[(None, producer_state.count)],
+                        tAsA[(None, a_stage + 1)],
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                            producer_state
+                        ),
+                        mcast_mask=0,
+                        tma_desc_ptr=desc_a2,
+                    )
+                producer_state.advance()
+            # The phase loads A itself from K tile ``k_tiles`` on.
+            storage.split_arrival[STREAM_TAG_SLOT + 1] = k_tiles
+            storage.split_arrival[STREAM_TAG_SLOT] = stream_tag
+
+    def _streamed_k_tiles(self, k_tile_cnt):
+        """K tiles whose A ``preload_table`` loads for a tile of ``k_tile_cnt``."""
+        return cutlass.min(k_tile_cnt, min(self.ab_stage, self.stream_stages))
+
+    def _mainloop_pipeline(
+        self,
+        storage,
+        a_smem_layout_staged,
+        b_smem_layout_staged,
+        cta_layout_mnk,
+        initialize: bool = True,
+    ):
+        """The A/B mainloop pipeline over ``storage``'s mbarriers. Without
+        ``initialize`` its mbarrier init is not emitted: the caller emits it
+        under a run-time condition (see ``kernel``)."""
+        # Each warp will constribute to the arrive count with the number of mcast size
+        mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
+        consumer_arrive_cnt = (
+            mcast_size * self.num_mma_warp_groups * self.num_warps_per_warp_group
+        )
+        tma_copy_bytes = cute.size_in_bytes(
+            self.a_dtype, cute.slice_(a_smem_layout_staged, (None, None, 0))
+        ) + cute.size_in_bytes(
+            self.b_dtype, cute.slice_(b_smem_layout_staged, (None, None, 0))
+        )
+        with contextlib.nullcontext() if initialize else _without_mbarrier_init():
+            return pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.mainloop_pipeline_array_ptr.data_ptr(),
+                num_stages=self.ab_stage,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, consumer_arrive_cnt
+                ),
+                tx_count=tma_copy_bytes,
+                cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape)),
+                defer_sync=True,
+            )
 
     @cute.kernel
     def range_kernel(
@@ -738,6 +909,7 @@ class HopperWgmmaGemmPersistentKernel:
         bias_address=None,
         c_address=None,
         epilogue_state=None,
+        stream_tag=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -809,40 +981,25 @@ class HopperWgmmaGemmPersistentKernel:
 
         a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
-        a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
-        b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
-        tma_copy_bytes = cute.size_in_bytes(
-            self.a_dtype, a_smem_layout
-        ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
-
         # The enclosing worker owns shared storage for the whole range.
         storage = scratch
 
-        # mbar arrays
-        mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
-
-        # Threads/warps participating in this pipeline
-        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread
+        # MegaBake: a streamed phase's stages were loaded, and their
+        # mbarriers initialized, by preload_table; only warp 0 initializes
+        # and produces, so only it reads the tag.
+        streaming = self.stream_stages > 0 and stream_tag is not None
+        mainloop_pipeline = self._mainloop_pipeline(
+            storage,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+            cta_layout_mnk,
+            initialize=not streaming,
         )
-        # Each warp will constribute to the arrive count with the number of mcast size
-        mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_arrive_cnt = (
-            mcast_size * self.num_mma_warp_groups * self.num_warps_per_warp_group
-        )
-        mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, consumer_arrive_cnt
-        )
-
-        mainloop_pipeline = pipeline.PipelineTmaAsync.create(
-            barrier_storage=mainloop_pipeline_array_ptr,
-            num_stages=self.ab_stage,
-            producer_group=mainloop_pipeline_producer_group,
-            consumer_group=mainloop_pipeline_consumer_group,
-            tx_count=tma_copy_bytes,
-            cta_layout_vmnk=cute.make_layout((1, *cta_layout_mnk.shape)),
-            defer_sync=True,
-        )
+        if cutlass.const_expr(streaming):
+            if warp_idx == 0:
+                if storage.split_arrival[STREAM_TAG_SLOT] != stream_tag:
+                    mainloop_pipeline.sync_object_full.mbarrier_init()
+                    mainloop_pipeline.sync_object_empty.mbarrier_init()
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -960,6 +1117,12 @@ class HopperWgmmaGemmPersistentKernel:
             # writes before this thread's async-proxy TMA loads.
             cute.arch.fence_proxy("async.global")
 
+            # MegaBake: K tiles of the first tile whose A preload_table loaded.
+            if cutlass.const_expr(streaming):
+                streamed_k_tiles = cutlass.Int32(0)
+                if storage.split_arrival[STREAM_TAG_SLOT] == stream_tag:
+                    streamed_k_tiles = cutlass.Int32(storage.split_arrival[STREAM_TAG_SLOT + 1])
+
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
                 tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
@@ -968,8 +1131,12 @@ class HopperWgmmaGemmPersistentKernel:
                 mainloop_producer_state.reset_count()
 
                 for k_tile in range(k_tile_cnt):
-                    # Conditionally wait for AB buffer empty
-                    mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                    load_a = True
+                    if cutlass.const_expr(streaming):
+                        load_a = k_tile >= streamed_k_tiles
+                    if load_a:
+                        # Conditionally wait for AB buffer empty
+                        mainloop_pipeline.producer_acquire(mainloop_producer_state)
                     # Slice to global/shared memref to current k_tile
                     tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
                     a_stage = mainloop_producer_state.index
@@ -980,29 +1147,30 @@ class HopperWgmmaGemmPersistentKernel:
                     tBgB_k = tBgB_nkl[(None, mainloop_producer_state.count)]
                     tBsB_pipe = tBsB[(None, mainloop_producer_state.index)]
 
-                    # TMA load A/B
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_k,
-                        tAsA_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state
-                        ),
-                        mcast_mask=a_mcast_mask,
-                        tma_desc_ptr=desc_a,
-                    )
-                    if cutlass.const_expr(self.paired):
-                        # The second A's rows of this tile, into rows 64-127.
+                    if load_a:
+                        # TMA load A/B
                         cute.copy(
                             tma_atom_a,
                             tAgA_k,
-                            tAsA[(None, a_stage + 1)],
+                            tAsA_pipe,
                             tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                                 mainloop_producer_state
                             ),
                             mcast_mask=a_mcast_mask,
-                            tma_desc_ptr=desc_a2,
+                            tma_desc_ptr=desc_a,
                         )
+                        if cutlass.const_expr(self.paired):
+                            # The second A's rows of this tile, into rows 64-127.
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA_k,
+                                tAsA[(None, a_stage + 1)],
+                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                    mainloop_producer_state
+                                ),
+                                mcast_mask=a_mcast_mask,
+                                tma_desc_ptr=desc_a2,
+                            )
                     cute.copy(
                         tma_atom_b,
                         tBgB_k,
@@ -1018,6 +1186,8 @@ class HopperWgmmaGemmPersistentKernel:
                     mainloop_pipeline.producer_commit(mainloop_producer_state)
                     mainloop_producer_state.advance()
 
+                if cutlass.const_expr(streaming):
+                    streamed_k_tiles = cutlass.Int32(0)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 

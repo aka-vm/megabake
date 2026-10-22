@@ -1,6 +1,6 @@
 # MegaBake architecture
 
-**Revised 2026-10-19. Sections 1–8 describe the compiler as built. Section 9 is the target design from the [2026-10-18 gap report](docs/research/2026-10-18-megakernel-gap/report.md). [ROADMAP.md](ROADMAP.md) has the measured state and the order of work. [north-star.md](north-star.md) fixes the scope.**
+**Revised 2026-10-21. Sections 1–8 describe the compiler as built. Section 9 is the target design from the [2026-10-18 gap report](docs/research/2026-10-18-megakernel-gap/report.md). [ROADMAP.md](ROADMAP.md) has the measured state and the order of work. [north-star.md](north-star.md) fixes the scope.**
 
 **Build a generic compiler that keeps fast device pipelines intact when it composes them into one kernel, and that wins where only one kernel can: tile-level dataflow, cross-op weight streaming, and work for idle SMs.**
 
@@ -87,6 +87,15 @@ A body processes a range of tiles while keeping its pipeline. Scratch is allocat
 
 **Interval folding.** At decode sizes, small producers (norms, RoPE, elementwise) fold into their consumer's barrier interval: every CTA recomputes them instead of waiting at a barrier. A SmolLM layer costs about six barrier intervals instead of eleven. This is a megakernel-only trade: recompute is cheaper than a grid-wide wait.
 
+**Weight streaming.** A GEMM's weights do not depend on the phases before it, so each CTA starts loading them before the GEMM's interval begins:
+
+1. At the grid barrier that closes an interval, the CTA arrives, and warp 0 then loads the weight of its first tile in the next interval into the GEMM's pipeline stages: as many leading K tiles as the stages hold (swapAB GEMMs carry the weight as CUTLASS A). Each stage's mbarrier expects its full A + B bytes. Then the CTA waits at the barrier.
+2. A tag in the GEMM's shared storage names the GEMM row. The phase that finds its own tag skips the mbarrier init and loads only the activation (B) for those K tiles. The stage completes when B lands.
+
+Only GEMM bodies use the GEMM's shared memory, so the stages survive the phases in between. The schedule is static: rotations and tile counts fix each CTA's first tile, so a stream table holds, per streaming barrier and CTA, the GEMM row, its variant, and the CTA's rotated block. Weights qualify when no region of the launch writes them.
+
+Streaming is **off by default** (`MEGABAKE_WEIGHT_STREAM_STAGES=0`; a positive value turns it on and caps the streamed stages). Measured against the same code compiled in without preloads, it changed decode by −0.7% to +1.5% (ROADMAP step 3). Once the SM's TMA queue is full, each load blocks the issuing warp, so a CTA waits for most of its own preload, and the loads overlap only barrier wait it had anyway. Streaming can pay only with a producer warp that the CTA's other bodies do not synchronize with.
+
 **Two launch forms.**
 
 | Launch | Used when | Synchronization |
@@ -129,7 +138,7 @@ The target keeps the frontend and the persistent runtime and adds five parts.
 2. **A contract matcher.** It absorbs neighbouring ops into those slots as expressions. RoPE style, norm variant and eps, activation, bias and casts come from the graph, matched by scalar-expression normal form rather than by ATen spelling.
 3. **Layout assignment over typed edge formats.** `EdgeFormat` = dtype + scale spec + data layout + scale layout. Bodies declare ranked input and output alternatives; the planner assigns them with a bytes-plus-phases cost.
 4. **`transform_params`.** A bake-time stage that owns derived weights (fused QKV, paired gate/up, layout permutations), proves that each transform commutes with the computation, detects changes to the source weights, and adds a transform revision to the cache key. Permuting a producer's output rows is bit-exact; permuting a consumer's reduction columns or folding a norm weight is not and needs an opt-in numerics policy.
-5. **An event and prefetch scheduler.** Per-phase or per-tile completion counters replace grid barriers. CTAs that wait or have no work prefetch the next weights into L2, later into shared memory with persistent pipeline state. Static assignment only; dynamic work queues lost to static scheduling in published measurements.
+5. **An event and prefetch scheduler.** Per-phase or per-tile completion counters replace grid barriers. CTAs that wait or have no work prefetch the next weights into L2, later into shared memory with persistent pipeline state. Static assignment only; dynamic work queues lost to static scheduling in published measurements. *Built and off: weight streaming into shared memory from the barrier before each GEMM interval (section 5; no runtime gain without a decoupled producer warp), and L2 prefetch (measured slower).*
 
 Under these sits a **device-keyed cost model**: `TargetFacts` gains L2 size, bandwidth, capabilities and MIG identity, plus a one-time calibration of barrier and event latency. Each GEMM chooses its own tile, stages, swapAB and split-K; the planner measures the top few candidates per shape and caches them by device fingerprint.
 
