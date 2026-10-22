@@ -213,7 +213,7 @@ def _torch_version() -> tuple[int, int]:
 def _check_torch_version() -> None:
     if _torch_version() != _PINNED_TORCH:
         raise RuntimeError(
-            f"MegaBake Task 01 supports PyTorch {_PINNED_TORCH[0]}.{_PINNED_TORCH[1]}; "
+            f"MegaBake supports PyTorch {_PINNED_TORCH[0]}.{_PINNED_TORCH[1]}; "
             f"found {torch.__version__}"
         )
 
@@ -319,7 +319,7 @@ def _placeholder_specs(
     return names, specs, kinds, parameter_names
 
 
-def _output_structure(graph: Any) -> tuple[str, int]:
+def _output_structure(graph: Any) -> tuple[str, int, Any]:
     output_node = next(node for node in graph.graph.nodes if node.op == "output")
     output_values, output_spec = pytree.tree_flatten(output_node.args[0])
     return str(output_spec), len(output_values), output_spec
@@ -619,7 +619,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             isinstance(value, torch.Tensor) and value.requires_grad
             for value in example_inputs
         ):
-            raise RuntimeError("MegaBake Task 01 supports inference only")
+            raise RuntimeError("MegaBake supports inference only")
         input_kinds, parameter_names = _infer_parameter_bindings(
             graph, example_inputs, input_kinds, parameter_names
         )

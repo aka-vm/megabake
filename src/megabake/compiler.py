@@ -12,7 +12,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
-import uuid
 
 import cutlass
 import cutlass.cute as cute
@@ -46,7 +45,12 @@ from .plan import (
     search_plans,
 )
 from .planner import enumerate_body_selections
-from .schedule import EventSchedule, make_region_event_schedule
+from .schedule import (
+    EventSchedule,
+    _recompute_assignments,
+    _worker_assignments,
+    make_region_event_schedule,
+)
 from .regions import form_regions
 from .runtime import (
     DYNAMIC_ADDRESS_RING,
@@ -97,58 +101,33 @@ def _semantic_diagnostic(graph: ComputeGraph) -> CompilerDiagnostic | None:
     )
 
 
-def _structural_plan_exists(
-    graph: ComputeGraph,
-    target: TargetFacts,
-    policy: SelectionPolicy | None,
-    scheduler: str,
-) -> bool:
-    # One structurally complete plan proves existence; the measured search
-    # that follows builds its own candidates.
-    result = search_plans(
-        graph,
-        target,
-        policy,
-        SearchBudget(evaluator=None, max_plans=1),
-    )
-    return any(
-        candidate.plan is not None and candidate.status == "unmeasured"
-        for candidate in result.candidates
-    )
-
-
 def _preflight_complete_plan(
     graph: ComputeGraph,
     target: TargetFacts,
     policy: SelectionPolicy | None,
-    scheduler: str,
 ) -> None:
-    schedulers = ("phase", "region-events") if scheduler == "auto" else (scheduler,)
+    # One structurally complete plan proves existence; the measured search
+    # that follows builds its own candidates.
+    result = search_plans(
+        graph, target, policy, SearchBudget(evaluator=None, max_plans=1)
+    )
     if any(
-        _structural_plan_exists(graph, target, policy, scheduler_name)
-        for scheduler_name in schedulers
+        candidate.plan is not None and candidate.status == "unmeasured"
+        for candidate in result.candidates
     ):
         return
     semantic = _semantic_diagnostic(graph)
     if semantic is not None:
         raise CompilerError(semantic, safe_for_fallback=True)
-    reasons: list[str] = []
-    for scheduler_name in schedulers:
-        result = search_plans(
-            graph,
-            target,
-            policy,
-            SearchBudget(evaluator=None),
-        )
-        reasons.extend(
-            f"{candidate.description}: {candidate.reason or candidate.status}"
-            for candidate in result.candidates
-            if candidate.status != "measured"
-        )
-        reasons.extend(
-            f"{rejection.region_id}/{rejection.provider}: {rejection.reason}"
-            for rejection in result.rejections
-        )
+    result = search_plans(graph, target, policy, SearchBudget(evaluator=None))
+    reasons = [
+        f"{candidate.description}: {candidate.reason or candidate.status}"
+        for candidate in result.candidates
+        if candidate.status != "measured"
+    ] + [
+        f"{rejection.region_id}/{rejection.provider}: {rejection.reason}"
+        for rejection in result.rejections
+    ]
     raise CompilerError(
         CompilerDiagnostic(
             "plan-search",
@@ -195,13 +174,7 @@ class CompiledKernel:
 
 @dataclass(frozen=True)
 class CallableTrace:
-    invocation_id: uuid.UUID
-    epoch: int
-    stream: torch.cuda.Stream
-    input_data_ptrs: tuple[int, ...]
-    output_data_ptrs: tuple[int, ...]
     workload_kernel_launches: int
-    stream_synchronizations: int
     recurring_gpu_operations: tuple[tuple[str, int], ...]
 
 
@@ -465,7 +438,7 @@ def compile_post_grad(
         )
 
     def compile_selected() -> CompiledKernel:
-        _preflight_complete_plan(graph, selected_target, policy, scheduler)
+        _preflight_complete_plan(graph, selected_target, policy)
         state_snapshot = _StateSnapshot.create(graph, prepared.example_inputs)
         evaluation = replace(prepared, example_inputs=state_snapshot.inputs)
         with torch.no_grad():
@@ -562,9 +535,9 @@ def compile_post_grad(
         cache_hit = cache_result.hit
     else:
         compiled = compile_selected()
-    selected_candidate = next(
+    measurement = next(
         (
-            candidate
+            candidate.measurement
             for candidate in compiled.search.candidates
             if candidate.description == compiled.search.selected_description
             and candidate.measurement is not None
@@ -582,30 +555,12 @@ def compile_post_grad(
         ),
         "workspace_bytes": compiled.plan.storage.workspace_bytes,
         "performance": {
-            "median_isolated_launch_us": (
-                selected_candidate.measurement.median_isolated_launch_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
-            "median_device_event_span_us": (
-                selected_candidate.measurement.median_device_event_span_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
-            "median_complete_call_us": (
-                selected_candidate.measurement.median_complete_call_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
-            "median_device_event_span_us": (
-                selected_candidate.measurement.median_device_event_span_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
+            name: None if measurement is None else getattr(measurement, name)
+            for name in (
+                "median_isolated_launch_us",
+                "median_device_event_span_us",
+                "median_complete_call_us",
+            )
         },
     }
     parameter_tensors = _current_parameter_tensors(
@@ -1048,7 +1003,7 @@ def bind_callable(
                 launches += 1
 
             if compiled_kernel.event_schedule is None:
-                invocation = execute_phase_plan(
+                execute_phase_plan(
                     compiled_kernel.plan,
                     kernel,
                     active_stream,
@@ -1058,7 +1013,7 @@ def bind_callable(
                     synchronize=False,
                 )
             else:
-                invocation = execute_event_plan(
+                execute_event_plan(
                     compiled_kernel.event_schedule,
                     kernel,
                     active_stream,
@@ -1073,18 +1028,7 @@ def bind_callable(
             )
             trace.append(
                 CallableTrace(
-                    invocation.invocation_id,
-                    invocation.epoch,
-                    active_stream,
-                    state.input_pointers(input_tensors),
-                    tuple(
-                        output.data_ptr()
-                        for output in outputs
-                        if isinstance(output, torch.Tensor)
-                    ),
                     workload_kernel_launches=launches,
-                    # Launches are stream-ordered; the call does not block.
-                    stream_synchronizations=0,
                     recurring_gpu_operations=_recurring_operations(
                         launches, state.address_table_uploads - uploads_before
                     ),
@@ -1824,29 +1768,6 @@ def _with_worker_count(
     return replace(plan, phases=phases, storage=storage, launch=launch)
 
 
-def _recompute_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
-    from .schedule import _recompute_assignments as assignments
-
-    return assignments(region_id, tuple(work_items), worker_count)
-
-
-def _worker_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
-    from .schedule import WorkerAssignment
-
-    quotient, remainder = divmod(len(work_items), worker_count)
-    start = 0
-    assignments = []
-    for worker_id in range(worker_count):
-        count = quotient + (1 if worker_id < remainder else 0)
-        assignments.append(
-            WorkerAssignment(
-                worker_id, region_id, tuple(work_items[start : start + count])
-            )
-        )
-        start += count
-    return tuple(assignments)
-
-
 # Barrier epochs stay below int32's maximum.
 _MAX_EPOCH = 2**31 - 1
 # Calls kept in a generated callable's ``megabake_trace``.
@@ -2016,13 +1937,6 @@ class _RuntimeState:
         ):
             return
         self._refresh_values(input_tensors)
-
-    def input_pointers(self, input_tensors: Mapping[str, torch.Tensor]) -> tuple[int, ...]:
-        """Data pointers of this call's graph inputs, in graph order."""
-        rebind = self._table_rebind
-        if rebind is not None and rebind.pointers is not None:
-            return tuple(rebind.pointers[: len(rebind.inputs)].tolist())
-        return tuple(tensor.data_ptr() for tensor in input_tensors.values())
 
     def reset_ready(self) -> None:
         reset_ready(self.ready)

@@ -188,7 +188,6 @@ class KVCacheAccess:
         "write_value_cache",
         "write_valid_length",
     )
-    capacity_guard: str = "0 <= valid_length and valid_length + query_length <= capacity"
     storage_class: str = "bounded_contiguous"
     valid_length_specialized: bool = False
 
@@ -1274,7 +1273,6 @@ def _indexed_gather_program(
         raise UnsupportedLowering("gather result shape does not match its operands")
 
     output_axes = tuple(f"o{index}" for index in range(len(result.shape)))
-    index_axes = output_axes[: len(index_shape)]
     index_loads = tuple(
         IndexedLoad(
             id=f"gather:index:{index}",

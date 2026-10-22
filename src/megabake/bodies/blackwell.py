@@ -78,7 +78,6 @@ class BlackwellGemmProvider:
             completion=replace(
                 base.completion,
                 register_fragments="warp MMA FP32 accumulators are cast and stored before return",
-                output_tiles_ready="all assigned 16x32 tiles are stored before return",
             ),
             evidence=ResourceEvidence(
                 measured=False, source="megabake Blackwell warp MMA baseline",
@@ -151,9 +150,4 @@ def run(
         reduction_chunk=16, tile_count=((rows + 15) // 16) * ntiles,
         work_iterator_encoding="one row-major 16x32 output tile ordinal per CTA",
         phases=("output_tile", "warp_mma", "epilogue"),
-        phase_descriptions={
-            "output_tile": "four warps partition a predicated 16x32 output tile",
-            "warp_mma": "synchronous 16x8x16 warp MMA accumulates into FP32 registers",
-            "epilogue": "cast and store the owned output fragment with M/N predicates",
-        },
     )

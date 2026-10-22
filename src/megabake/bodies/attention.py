@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import textwrap
-
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -10,7 +8,6 @@ from .interface import (
     BodyConfig,
     CandidateSet,
     CompletionContract,
-    InvalidBodyConfig,
     LayoutContract,
     ParticipantContract,
     PipelineContract,
@@ -22,7 +19,6 @@ from .interface import (
     TargetFacts,
     TensorLayout,
     TileContract,
-    validate_body_config,
 )
 
 
@@ -241,25 +237,6 @@ class AttentionBodyProvider:
         )
 
 
-def attention_candidates(
-    region: Region,
-    target: TargetFacts,
-    policy: SelectionPolicy | None = None,
-) -> CandidateSet:
-    selected_policy = policy or SelectionPolicy()
-    result = AttentionBodyProvider().get_candidates(region, target, selected_policy)
-    configurations = []
-    rejections = list(result.rejections)
-    for config in result.configurations:
-        try:
-            validate_body_config(config, target, selected_policy)
-        except InvalidBodyConfig as error:
-            rejections.append(ProviderRejection(config.provider, str(error)))
-        else:
-            configurations.append(config)
-    return CandidateSet(tuple(configurations), tuple(rejections))
-
-
 # Each warp owns one query row at a time and keeps that row's FP32 scores in
 # shared scratch; the scratch holds at most this many rows and this many bytes.
 ATTENTION_SCRATCH_ROWS = 16
@@ -324,10 +301,6 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             source_op_ids=region.source_op_ids,
             numerical_policy="source_semantics",
             expression_hooks=("score", "mask"),
-            expression_hook_restrictions=(
-                "score hooks are row-local over query and key coordinates",
-                "mask hooks are additive tensors or causal selections",
-            ),
             access_effects={
                 "q": facts["q_access"],
                 "k": facts["k_access"],
@@ -340,13 +313,6 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
                 "kv_state": facts.get("kv_state"),
                 "prologues": facts.get("prologues"),
             },
-            access_restrictions=(
-                (
-                    "KV state is bounded, contiguous, and updated in source order"
-                    if stateful
-                    else "KV state is read-only"
-                ),
-            ),
         ),
         layouts=LayoutContract(layouts, {program.store.value_id: layouts[program.store.value_id]}),
         tiles=TileContract(
@@ -365,7 +331,6 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
                     if length is not None
                 ),
             ),
-            tail_policy="predicated",
         ),
         participants=ParticipantContract(
             participating_threads=threads,
@@ -377,7 +342,6 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             stage_count=3,
             barriers=(),
             async_operations=(),
-            shared_memory_layouts={},
             drain_rule=(
                 "the score-maximum, softmax-denominator, and value-accumulation "
                 "passes complete before return"
@@ -387,8 +351,6 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             owner="cta",
             size_bytes=scratch_bytes,
             alignment_bytes=16,
-            initial_state="unspecified; each row writes its scores first",
-            reuse_rule="each warp's score row is reused after its sync_warp",
         ),
         completion=CompletionContract(
             outputs_ready=(
@@ -396,11 +358,8 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
                 if stateful
                 else "assigned rows are stored when run returns"
             ),
-            output_tiles_ready="each assigned output element is ready after its store",
-            async_work_complete="run performs no asynchronous work",
             scratch_reusable="scratch is reusable when run returns",
             register_fragments="row score, softmax maximum and total, and value accumulators",
-            warp_roles_on_return="unchanged",
         ),
         evidence=ResourceEvidence(
             measured=not stateful,

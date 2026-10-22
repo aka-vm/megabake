@@ -626,15 +626,7 @@ def _g0_config(
             source_op_ids=region.source_op_ids,
             numerical_policy="source_semantics",
             expression_hooks=(),
-            expression_hook_restrictions=(
-                "none; the provider implements the complete source contraction",
-            ),
             access_effects=_access_effects(program),
-            access_restrictions=(
-                "BF16 2-D operands",
-                "K-major A and B, row-major C, and 16-byte-aligned base addresses",
-                "N and K are multiples of 64; partial M tiles are predicated",
-            ),
         ),
         layouts=_layouts(program, alignment_bytes=16),
         tiles=TileContract(
@@ -667,11 +659,6 @@ def _g0_config(
             stage_count=stages,
             barriers=("producer_tail", "wgmma_wait_group_0", "tma_store_producer_tail"),
             async_operations=("tma_load", "wgmma", "tma_store"),
-            shared_memory_layouts={
-                "A": "staged TMA input tile",
-                "B": "staged TMA input tile",
-                "C": "staged epilogue tile",
-            },
             descriptors={
                 "A": "TMA input descriptor",
                 "B": "TMA input descriptor",
@@ -686,24 +673,16 @@ def _g0_config(
             owner="cta",
             size_bytes=shared_bytes,
             alignment_bytes=128,
-            initial_state="CTA-local staged buffers and pipeline barriers",
-            reuse_rule="scratch is reusable only after all pipeline tails complete",
         ),
         completion=CompletionContract(
             outputs_ready=(
                 "all assigned range outputs are globally stored when run returns; "
                 "another CTA may read them after the enclosing kernel grid-synchronizes"
             ),
-            output_tiles_ready=(
-                "tile stores are submitted in the persistent range; cross-CTA "
-                "visibility requires the enclosing grid synchronization"
-            ),
-            async_work_complete="all TMA and WGMMA work is drained before return",
             scratch_reusable="scratch is reusable when run returns",
             register_fragments=(
                 "WGMMA accumulators feed the body epilogue without conversion"
             ),
-            warp_roles_on_return="drained and unchanged for the next body",
         ),
         evidence=ResourceEvidence(
             measured=True,

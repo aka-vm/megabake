@@ -9,7 +9,7 @@ from typing import Any
 from .bodies.catalog import get_candidates
 from .lowering import AxisAffine, DataIndex
 from .bodies.interface import BodyConfig, SelectionPolicy, TargetFacts
-from .graph import ComputeGraph, Region
+from .graph import DTYPE_BYTES, ComputeGraph, Region
 from .lowering import TensorProgram
 from .plan import (
     BodySelectionPlan,
@@ -790,18 +790,5 @@ def _logical_tile(
 
 
 def _conversion_cost(layout: CuTeLayout) -> int:
-    return 2 * prod(layout.shape) * _DTYPE_BYTES.get(layout.dtype, 0)
+    return 2 * prod(layout.shape) * DTYPE_BYTES.get(layout.dtype, 0)
 
-
-_DTYPE_BYTES = {
-    "torch.bool": 1,
-    "torch.uint8": 1,
-    "torch.int8": 1,
-    "torch.int16": 2,
-    "torch.int32": 4,
-    "torch.int64": 8,
-    "torch.float16": 2,
-    "torch.bfloat16": 2,
-    "torch.float32": 4,
-    "torch.float64": 8,
-}

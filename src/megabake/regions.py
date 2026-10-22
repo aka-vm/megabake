@@ -7,7 +7,7 @@ from pathlib import Path
 from math import prod
 import operator
 
-from .graph import ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
+from .graph import DTYPE_BYTES, ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
 from .lowering import (
     attention_access_axes,
     attention_tensor_program,
@@ -28,20 +28,6 @@ from .lowering import (
     TensorStore,
     Where,
 )
-
-
-_DTYPE_BYTES = {
-    "torch.bool": 1,
-    "torch.uint8": 1,
-    "torch.int8": 1,
-    "torch.int16": 2,
-    "torch.int32": 4,
-    "torch.int64": 8,
-    "torch.float16": 2,
-    "torch.bfloat16": 2,
-    "torch.float32": 4,
-    "torch.float64": 8,
-}
 
 
 def form_regions(graph: ComputeGraph) -> ComputeGraph:
@@ -1477,9 +1463,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
         return None
     q_head_axis, k_head_axis, v_head_axis = axes
     query_heads = q.shape[q_head_axis]
-    query_length = q.shape[3 - q_head_axis]
     kv_heads = k.shape[k_head_axis]
-    kv_length = k.shape[3 - k_head_axis]
     head_dim = q.shape[-1]
     if (
         query_heads % kv_heads
@@ -1918,20 +1902,6 @@ def _producer_path(value_id: str, stop: Op, graph: ComputeGraph) -> tuple[Op, ..
     return None
 
 
-def _value_root(value_id: str, graph: ComputeGraph) -> str:
-    while True:
-        operation = _producer(value_id, graph)
-        program = operation.tensor_program if operation is not None else None
-        if (
-            operation is None
-            or not isinstance(program, TensorProgram)
-            or program.family not in {"view", "copy"}
-            or len(operation.operands) != 1
-        ):
-            return value_id
-        value_id = operation.operands[0]
-
-
 def _value_root_path(
     value_id: str, graph: ComputeGraph
 ) -> tuple[str, tuple[Op, ...]]:
@@ -2186,21 +2156,6 @@ def _binary_operator(operation: Op | None, operator: str) -> bool:
     return (
         isinstance(operation.tensor_program.combine, Binary)
         and operation.tensor_program.combine.operator == operator
-    )
-
-
-def _transitive_operations(operation: Op, graph: ComputeGraph) -> tuple[Op, ...]:
-    operation_ids = {operation.id}
-    frontier = list(operation.operands)
-    while frontier:
-        value_id = frontier.pop()
-        producer = _producer(value_id, graph)
-        if producer is None or producer.id in operation_ids:
-            continue
-        operation_ids.add(producer.id)
-        frontier.extend(producer.operands)
-    return tuple(
-        candidate for candidate in graph.ops.values() if candidate.id in operation_ids
     )
 
 
@@ -2675,7 +2630,7 @@ def _same_chain_layout(left_id: str, right_id: str, graph: ComputeGraph) -> bool
 
 def _value_bytes(value_id: str, graph: ComputeGraph) -> int:
     value = graph.values[value_id]
-    return prod(value.shape or ()) * _DTYPE_BYTES.get(value.dtype or "", 0)
+    return prod(value.shape or ()) * DTYPE_BYTES.get(value.dtype or "", 0)
 
 
 def _semantic_facts(operation: Op, graph: ComputeGraph) -> dict[str, object]:

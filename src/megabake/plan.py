@@ -80,10 +80,6 @@ class CuTeLayout:
     def cute_stride(self) -> tuple[int, ...]:
         return tuple(reversed(self.strides))
 
-    @property
-    def cute_layout(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return self.cute_shape, self.cute_stride
-
     def offset(self, coordinates: Sequence[int]) -> int:
         if len(coordinates) != len(self.shape):
             raise InvalidTileMap("coordinates do not match the CuTe layout rank")

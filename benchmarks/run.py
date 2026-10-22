@@ -204,11 +204,6 @@ def main() -> None:
             if arguments.workload == "transformer-block"
             else "artifacts/task16/mlp.json"
         )
-    if arguments.workload == "transformer-block":
-        arguments.traces = Path("artifacts/task29/traces")
-        _run_transformer_block(arguments, report)
-        return
-
     torch.manual_seed(16)
     torch.set_grad_enabled(False)
     report = {
@@ -217,6 +212,11 @@ def main() -> None:
         "seed": 16,
         "records": [],
     }
+    if arguments.workload == "transformer-block":
+        arguments.traces = Path("artifacts/task29/traces")
+        _run_transformer_block(arguments, report)
+        return
+
     for batch_size in arguments.batches:
         source = torch.randn(
             batch_size, 576, dtype=torch.bfloat16, device="cuda"
