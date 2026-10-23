@@ -1,6 +1,6 @@
 # MegaBake roadmap
 
-**Updated 2026-10-21; steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the [2026-10-18 megakernel gap report](docs/research/2026-10-18-megakernel-gap/report.md); the 2026-10-20/21 measurements below supersede the report's estimates where they disagree.**
+**Updated 2026-10-23; steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the [2026-10-18 megakernel gap report](docs/research/2026-10-18-megakernel-gap/report.md); the 2026-10-20/21 measurements below supersede the report's estimates where they disagree. Steps R0–R3 come from the [2026-10-22 HazyResearch comparison](docs/research/2026-10-22-hazy-megakernels/report.md) (updated 2026-10-22). The external Llama-3.2-1B comparison (2026-10-23) follows step 3.**
 
 Where we are, in three lines:
 
@@ -8,6 +8,8 @@ Where we are, in three lines:
 - Decode is bound by fixed per-phase latency, not by grid barriers: barrier release is ~11% of the 135M kernel. Gemma 3 (1.3x) and Qwen3.5 (1.9x) decode still lose to graphed Inductor. Prefill calls lose on every model except DeepSeek draft (a tie).
 - Cross-GEMM fusion is built (step 1): residual adds and SiLU·mul run in GEMM epilogues, gate/up as one paired GEMM, RoPE inside decode attention.
 - Weight streaming into shared memory across phases is built and off (step 3): the preloads themselves change decode by −0.7% to +1.5%. Weights still stream only inside GEMM phases by default.
+- HazyResearch's megakernels suggest a different reading of what step 3, L2 prefetch and the events estimate each measured. Cross-op overlap needs three things together: fixed warp roles with a producer warp that never joins consumer syncs, shared-memory pages handed from op to op, and fine-grained counters. Megabake has tried each piece alone. The next runtime experiment is the role split (R1), not another streaming variant.
+- On an external H100 benchmark (Llama-3.2-1B, 2026-10-23), MegaBake runs 1.8x slower than both hand-written CUDA graphs + PDL and Hazy's megakernel. The causes are per-call host time, decode attention that splits short contexts across CTAs (~330 µs of a ~1,850 µs kernel at position 100), GEMMs whose tile counts do not fill the SMs, and barrier intervals that carry only RoPE. The LM head runs near peak. Graphed Inductor on the 60-SM slice hid all of it, and a wrong RoPE in the test reference hid that the Llama reference itself produced gibberish.
 
 ## Done: step 0, honest baselines (2026-10-20)
 
@@ -17,6 +19,7 @@ Where we are, in three lines:
 - [x] Re-ran all 8 models (`artifacts/full_model_2026-10-21`).
 - [ ] Inductor `max-autotune` variant (on the 60-SM slice Inductor disables GEMM autotuning; `is_big_gpu` needs 68 SMs).
 - [ ] Graphed baseline for `--decode-contexts` and bucketed prefill.
+- [ ] External baseline: run the [megakernels-vs-cuda-graphs](https://github.com/msaroufim/megakernels-vs-cuda-graphs) Llama protocol on a full-SM H100/H200 (the Hazy arm rejects partitioned GPUs, so the 60-SM slice cannot run it). The checkpoint is now available; the protocol still needs KV capacity 16,384 (step 11). Report percent of read bandwidth alongside speedups.
 
 ## Done: step 1, cross-GEMM fusion (fusion built; 0.9 ms target moved to step 3, then step 10)
 
@@ -62,7 +65,71 @@ A GEMM's weights do not depend on the phases before it. At the grid barrier that
 - [x] **Why: issuing blocks.** Once the SM's TMA queue is full, each further load blocks warp 0 until one drains. Issuing 13 stages takes a median of ~1,000 and a p90 of ~4,000 cycles (clock64). So a CTA waits for most of its own preload before it leaves the barrier, and the loads overlap only barrier wait it would have spent anyway. The per-CTA profile shows it: slowest-CTA work falls (135M 809 → 667 µs per call), but each preload-issuing interval's span grows ~1.5 µs (135M) to ~2 µs (1.7B), because the CTA that arrives last pays the issue.
 - [x] **Tried, no gain:** any stage count (2, 4, 8, all); L1-prefetching the stream-table entry; `prefetch.tensormap` of the target descriptor (the first TMA costs only ~160 cycles); a two-interval lookahead for CTAs without tiles in the next interval; adaptive issue (two stages per barrier poll, so the last CTA issues at most two).
 - [ ] **135M ≤ 0.9 ms and 1.7B ≤ 2.2 ms: not met** (now ~1,160 and ~2,650 µs off). At peak bandwidth 1.7B decode needs ~1.55 ms. gate·up already runs at ~90% of peak and the LM head at peak. The loss is in the 32-tile projections (q/k/v/o/down on 32 of 60 SMs, 70–72% of peak), attention (~4.7 µs × 24) and barrier release (~1.3 µs × 121). The targets move to steps 7 and 10.
-- [ ] Streaming can pay only with a producer warp that the CTA's other work does not wait for. Today every body synchronizes all 256 threads. That needs generic and attention bodies on 7 warps, with named barriers.
+- [ ] Streaming can pay only with a producer warp that the CTA's other work does not wait for. Today every body synchronizes all 256 threads. That needs generic and attention bodies on 7 warps, with named barriers. Now step R1.
+
+## Done: external baseline, Llama-3.2-1B (2026-10-23)
+
+A beta tester ran MegaBake (`DecodeStep`) against [megakernels-vs-cuda-graphs](https://github.com/msaroufim/megakernels-vs-cuda-graphs) on a full H100 80GB:
+
+| Arm | µs/token |
+|---|---:|
+| Hand-written CUDA GEMVs + Triton attention, CUDA graphs + PDL | 980 |
+| HazyResearch Llama-1B megakernel | 966 |
+| MegaBake | 1,784 |
+
+Their protocol uses a 32-token prompt, 127 decode steps captured in one CUDA graph with on-device argmax, and KV capacity 16,384, so the timed steps attend over 32–159 keys. We reran it on the 60-SM slice with the real checkpoint (2026-10-23); there was no H100 run, so the H100 attribution below is inferred. On the slice, the `DecodeStep` kernel takes 1,602 µs at KV position 10, 1,632 at 45, 1,853 at 95 and 1,893 at 205; pipelined calls take ~1,790 µs/token against 2,255 for graphed Inductor.
+
+- [x] **The Llama reference wrapper was wrong.** `tests/fixtures.py:rotate_half` had its second half as `x2·sin + x1·cos` instead of `x2·cos + x1·sin`. `StatefulSmolLM` (and every fixture wrapper) produced gibberish on the real checkpoint, and MegaBake matched it because tests compare against the same wrapper. Fixed; MegaBake now matches HF `generate` for 64 greedy tokens (max logit difference 0.28). Random weights could not show this: check real-checkpoint greedy text against HF `generate`, not only against our own reference.
+- [x] **Capacity 16,384 does not compile.** Decode attention keeps one FP32 score row in ≤ 32 KB of scratch, which caps KV capacity at 8,192 (`bodies/attention.py`, `ATTENTION_SCRATCH_BYTES`). `fallback=inductor` runs 5.8 ms/token, so the tester measured the real kernel at a smaller capacity. Capacity does not change kernel time, because attention reads only the valid length; context length does (below).
+- [x] **Host time: ~630 µs per call** with the GPU busy, vs 63 µs for a graph replay. Dynamo guards take ~200–300 µs. MegaBake's own call path takes ~300 µs: the `compiler.py` forward input checks, table rebind, argument packing and the CuTe DSL launch. About 430 µs of it lands before the launch, so it is exposed whenever calls synchronize. Both baselines pay ~0 per token.
+- [x] **Kernel ~1,850 µs at position 100 vs a ~1,070 µs read roofline** (2.47 GB of weights at the ~2.3 TB/s the LM head reaches on this slice): ~58% of peak. Per-CTA profile (`phase_profile.py --cta` logic, real checkpoint, `DecodeStep`), one layer:
+
+  | Interval | µs | At peak | Busy CTAs | Loss × 16 layers |
+  |---|---:|---:|---:|---:|
+  | decode attention | 21.2 (8.4 at position 40) | ~0.1 | 56 of 60 | ~330 µs |
+  | norm + gate·up (128 tiles) | 38.2 | 29 | 60 | ~150 µs |
+  | down (32 tiles) | 21.1 | 14.6 | 32 | ~105 µs |
+  | norm + q/k/v (32+8+8 tiles) | 11.7 | 5.5 | 48 | ~100 µs |
+  | elementwise (2 tiles) + RoPE (20 tiles), two intervals | 3.3 + 4.0 | 0 | 2–3 | ~115 µs |
+  | o_proj (32 tiles) | 7.9 | 3.7 | 32 | ~70 µs |
+  | LM head (2,004 tiles) | 232 | ~228 | 60 | ~0 |
+
+  Straggler wait is 460 µs of the 1,851 µs span and barrier release 105 µs. `StatefulSmolLM` has one small interval instead of two (RoPE stays outside attention for Llama with both wrappers, although step 1 fused it on SmolLM).
+- [x] **The LM head is not the problem.** It runs at ~94% of the slice's bandwidth. The earlier "~470 µs at ~1.1 TB/s" subtracted a profile taken near position 10 from a benchmark kernel measured near position 90; the difference was attention, not the head.
+- [x] **Decode attention grows with context through its split, not its bytes.** Each CTA takes 64 keys, so from 65 keys a row splits over 2 CTAs and from 129 over 3. Each split row runs three GPU-scope exchanges (max, sum, output) with spinning `atomic_cas` waits, and 32 heads × 2–3 chunks is 64–96 items on 60 CTAs, so some CTAs take two items serially. All of it moves ~200 KB of KV per layer. The baseline's Triton kernel runs one program per (query head, half of head_dim), reads the whole context in one pass and needs no cross-CTA reduction. On 132 SMs the items fit one wave, so the H100 pays the exchanges but not the second wave.
+- [x] **Why the gap grows on H100.** Tile counts follow the weight shapes, not the GPU, so q/k/v, o and down keep at most 48 of 132 SMs busy. Hazy reaches ~77% of H100 bandwidth; MegaBake's 1,784 µs is ~41%. Split-K (`MEGABAKE_SPLIT_K=1`) is also slower on the slice (1,954 vs 1,850 µs).
+- [x] **How the baseline gets there** (`llama/kernels/`):
+  - One CUDA-core GEMV body serves every projection, with norm, RoPE, the KV write, the residual add and SiLU·mul fused per mode.
+  - It launches one CTA per 2 output rows, so o_proj gets 1,024 CTAs.
+  - Weights are repacked once for 16-byte loads.
+  - Each kernel loads its weights into registers before `cudaGridDependencySynchronize()` (PDL), so the loads overlap the previous kernel.
+  - Decode attention never splits the context at these lengths.
+  - The whole 127-step loop is one graph replay.
+
+**Lessons, as compiler rules rather than Llama code** (ARCHITECTURE §9):
+
+1. A phase's work items should cover the SMs. Choose the row and K split from the shape and the SM count, not a fixed 64-row tile (step 7).
+2. Select the body by shape class: a CUDA-core streaming matvec when M is a handful of rows, WGMMA otherwise (step 7).
+3. Per-token host time is part of the product. MegaBake is one kernel, so it should be the easiest thing to capture in a graph (steps 6, 14).
+4. Load weights before waiting on the producer. The baseline gets cross-op overlap from PDL with that one ordering rule; R1's producer warp is the same rule inside one kernel.
+5. Measure against hand-tuned baselines on full-SM hardware and report percent of bandwidth (step 0). Graphs + PDL land within 1–5% of Hazy, so one launch alone is not the advantage. MegaBake's case is reaching that efficiency on any model without hand-writing it.
+6. Split decode attention only when the bytes pay for the exchange. Split first along dimensions that need no reduction (KV heads, value columns); split keys only past thousands of keys, with the chunk count chosen so items ≤ workers. Use an online softmax (one pass, no score row in scratch), and let one CTA serve all query heads of a KV head so K and V are read once (step 11).
+7. Every grid barrier must carry work. An interval with 2–20 tiles of elementwise work costs a full barrier: fold RoPE and the KV write into the QKV epilogue or the attention prologue for every wrapper, as the baseline's QKV GEMV does (steps 4, 11).
+8. Profile at the protocol's operating point. Kernel time depends on context length (1,602 → 1,893 µs from position 10 to 205), so attribute time from one run at the benchmark's positions, never by subtracting runs taken at different positions.
+9. Check real checkpoints end to end. A reference that is wrong in the same way as the compiled model passes every test; compare greedy text with HF `generate`.
+
+## Next: runtime structure (R0–R3, from the 2026-10-22 HazyResearch comparison)
+
+The [report](docs/research/2026-10-22-hazy-megakernels/report.md) has the evidence. Gains are qualitative, not measured. The only measured bounds are: barrier release ~11% of the 135M span; four GEMM intervals per layer at ~3–4 µs, mostly pipeline fill; and Hazy's 10.2 → 3.4 µs inter-instruction gap from cross-op pipelining. Every A/B runs against the inert-code control.
+
+| # | Step | Addresses | Effort | Done when |
+|---:|---|---|---|---|
+| R0 | Plumbing and oracle. Replace the positional phase-table columns with a typed `PhaseRecord` (one dataclass generates the host packer and device accessors, with a layout hash). Add per-phase, per-role timing slots behind a constexpr flag and an expected Gantt chart per model. Write the memory-model contract per sync site and type every constant | Positional-column brittleness, A/B noise, fence correctness | S–M | Timing slots compiled out leave the PTX identical; R1's profile can be checked against an expected chart |
+| R1 | Fixed role layout for the table launch. One producer warp owns all TMA traffic (GEMM stages and weight preloads). Two consumer warpgroups run generic and attention bodies with named barriers instead of `sync_threads`. `setmaxregister` per role at kernel entry (re-enable `cutlass_gemm.py:268-275`), recorded in `ParticipantContract`. Every trap stays warp-uniform | Streaming blocked on the TMA queue; whole-kernel register coupling | L | Bit-exact; `wgmma_serialization.py` clean; weight preloads issued by the producer warp beat the inert-code control |
+| R2 | Persistent GEMM pipeline state across phases: ring index and phase bits live for the whole kernel, with no per-phase mbarrier init (retire `_without_mbarrier_init` and `STREAM_TAG_SLOT`). `ResourcePlan` page pool with compiler-derived acquire/release order per CTA; per-GEMM tile configs follow (feeds step 7) | GEMM fill and drain every phase; one layout per launch | M–L | GEMM intervals on 135M decode drop measurably below ~3–4 µs; or, if a producer warp with persistent state does not hide the fill, record that as evidence against the whole family (streaming, events) |
+| R3 | Bodies as `@cute.jit` role functions with hook slots, called from generated dispatch; retire `_nested_body_source` string surgery. Check inlining with `CUTE_DSL_KEEP=ptx` first | Dropped helpers, codegen-shape artifacts | M | No body source is rewritten as text |
+
+R3 can start alongside R1 if converting bodies to roles through text replacement becomes painful. Step 10 (events) waits for R2's profile to show the producer warp stalling on a dependency that a finer counter would remove.
 
 ## Then: the ordered list
 
@@ -72,15 +139,15 @@ Effort: S small, M medium, L large. Gains are estimates unless marked measured.
 |---:|---|---|---|---|
 | 4 | Qwen3.5 and Gemma 3 decode: profile with `phase_profile.py --cta`, remove generic-body fallbacks; semantic matching by scalar-expression normal form (norms, RoPE incl. GPT-J and partial rotary, activations); retire `StatefulSmolLM` | Closes the 1.3x / 2.2x gaps | M | Both within 1.1x of graphed Inductor in decode |
 | 5 | Declared gated delta rule (chunked prefill: `cumsum`, triangular solve) | Coverage | M | Qwen3.5 prefill compiles |
-| 6 | Host work per call (Dynamo guards, binding: ~600 µs today) | Wins the synced comparison | M | Synced decode call ≤ kernel + 150 µs |
-| 7 | `TargetFacts` + per-GEMM configs + cost model: query L2, bandwidth, capabilities and MIG; each GEMM chooses tile, stages, swapAB and split-K; measure the top 3–5 and cache by device fingerprint; re-enable search for table launches (`compile_plan` forces `max_plans=1`). The 32-tile projections of 1.7B run at 70–72% of peak bandwidth on 32 of 60 SMs | 1.7B −0.2–0.45 ms; removes the >64-row prefill cliff | M–L | No GEMM constant fitted to a model or the 60-SM slice remains; 1.7B decode kernel ≤ 2.2 ms |
+| 6 | Host work per call: Dynamo guards ~200–300 µs and MegaBake binding and launch ~300 µs (~630 µs measured on Llama-1B). Make the launch CUDA-graph capturable: positions read on the device, no per-call rebind | Wins the synced comparison; ~430 µs per synced token | M | Synced decode call ≤ kernel + 150 µs; a decode step captures in a CUDA graph |
+| 7 | `TargetFacts` + per-GEMM configs + cost model: query L2, bandwidth, SM count, capabilities and MIG. Each GEMM chooses tile, stages, swapAB and split-K, with work items ≥ SM count, and a CUDA-core matvec body when M is a few rows. Measure the top 3–5 candidates and cache them by device fingerprint; re-enable search for table launches (`compile_plan` forces `max_plans=1`). The 32-tile projections of 1.7B run at 70–72% of peak bandwidth on 32 of 60 SMs. Llama-1B's q/k/v/o/down use ≤ 48 of 132 H100 SMs (on the slice: down waits 9.2 µs per layer on stragglers); its LM head already runs at ~94% of peak | 1.7B −0.2–0.45 ms; Llama-1B toward the ~980 µs external baselines; removes the >64-row prefill cliff | M–L | No GEMM constant fitted to a model or the 60-SM slice remains; 1.7B decode kernel ≤ 2.2 ms; Llama-1B decode kernel ≥ 70% of read bandwidth |
 | 8 | CI generality guard: a tiny-model zoo (LayerNorm, GELU, MQA, head_dim 256, sliding window, MoE, gated delta) against synthetic targets (60/108/132/148 SMs; sm80/90/100/120); fail on any silent generic-body fallback; keep held-out models | Prevents regressions | M | Runs in CI |
 | 9 | Split-K for projections with fewer tiles than workers (built, off: no gain on the 60-SM slice) | Narrow projections | S | Re-measured after 1 and 7 |
-| 10 | Event counters in the table launch | ≤ barrier release share (~11% measured) | M | Only after 1 and 3, if barrier release is still ≥ 10% of the kernel; 135M decode kernel ≤ 0.9 ms |
-| 11 | Derive fold limits, attention chunking and tolerances from cost, dtype and depth | Small on SmolLM, large on wide models | S | No fitted constant left in `schedule.py`/`attention.py` |
+| 10 | Event counters in the table launch, only on edges a running-ahead producer can use (GEMM→GEMM activation subsets, attention chunks, KV append with last-block-only wait); targets derived from tile overlap with RAW/WAR lists; `>=` waits on epoch targets | ≤ barrier release share (~11% measured) plus overlap R1–R2 unlock | M | Only after R1–R2, if the profile shows producer stalls a finer counter removes; 135M decode kernel ≤ 0.9 ms |
+| 11 | Derive fold limits, attention chunking and tolerances from cost, dtype and depth. Decode attention: split along KV heads and value columns before keys; split keys only when the bytes pay for the exchange, with items ≤ workers; one CTA serves all query heads of a KV head; an online softmax over key tiles removes the FP32 score row and with it the 8,192-key cap. Fold RoPE and the KV write into the QKV epilogue or attention prologue for every wrapper, so no barrier interval carries only elementwise work | Llama-1B: ~330 µs per token at position 100 from attention, ~115 µs from the RoPE intervals (measured on the slice); runs the external protocol | M | No fitted constant left in `schedule.py`/`attention.py`; KV capacity 16,384 compiles; Llama-1B attention interval ≤ 5 µs at 159 keys; no interval with < 8 tiles stands alone |
 | 12 | Per-sequence KV lengths → paged KV → ragged mixed prefill/decode step | ~12–15x tokens/s at batch 16 | S → L | Batch 16 with different lengths |
 | 13 | Prefill: tensor-core attention, >64-row GEMM path; optional Inductor fallback above a measured crossover | 3–21x at 128–300 tokens | L | Prefill ≤ Inductor + graphs at 128 tokens |
-| 14 | Multi-step decode loop with on-device argmax; then speculative verify | −10–25% per token; 2–4x with speculation | L | — |
+| 14 | Multi-step decode loop with on-device argmax (both external baselines time 127 steps as one graph replay); then speculative verify | −10–25% per token; 2–4x with speculation | L | — |
 | 15 | Typed edge formats; opt-in fp8 weights | 1.7B about −0.9 ms, different numerics | M–L | — |
 | 16 | In-cluster DSMEM split-K with a searched split factor | Narrow projections | M | — |
 | 17 | Real SM100 provider (tcgen05, TMEM, CLC) and SM80 provider | Portability | L | — |
@@ -92,7 +159,14 @@ Effort: S small, M medium, L large. Gains are estimates unless marked measured.
 - **L2 weight prefetch** of the next GEMM interval's weights (`cp.async.bulk.prefetch.L2`): 16–24% slower issued by every CTA, 8–10% slower issued only by idle CTAs (`artifacts/chunk3_2026-10-20`, `chunk4_2026-10-20`). Built and off (`MEGABAKE_L2_PREFETCH_BYTES=0`).
 - **Events as the first runtime step.** The report estimated −17–30% on 135M; the per-CTA profile bounds the gain by barrier release, ~11%.
 
-**Do not build:** a dynamic work queue for batch-1 decode (measured slower than static scheduling elsewhere), or a port of the Mirage superoptimizer (report §2).
+**Do not build:** a dynamic work queue for batch-1 decode (measured slower than static scheduling elsewhere; Hazy found it pays only for ~100 µs instructions), or a port of the Mirage superoptimizer (report §2). From the Hazy comparison:
+- a generic on-GPU opcode interpreter (deleted from ThunderKittens main; it forces every op into one union register budget);
+- hand-written page-release tables or literal barrier counts inside bodies;
+- host-side counter resets per call (epoch ordinals already avoid them);
+- exact-equality counter waits;
+- sixteen thin consumer warps;
+- green contexts for SM partitioning;
+- agent-written bespoke megakernels in place of the compiler.
 
 ## What exists and what is missing
 
@@ -153,11 +227,15 @@ Correctness: 135M and Qwen2-0.5B decode are bit-exact with eager over advancing 
 
 ## Open questions
 
-- Why does 135M decode run 6.8% faster with 239 registers than with 174, and can the compiler get that without unrelated code? (Step 3's inert-code control; 1.7B and the Qwen2 shape do not gain.)
+- Why does 135M decode run 6.8% faster with 239 registers than with 174, and can the compiler get that without unrelated code? (Step 3's inert-code control; 1.7B and the Qwen2 shape do not gain.) Per-role register budgets (R1) may answer it.
+- Does a dedicated producer warp with persistent pipeline state (R1–R2) hide the GEMM fill? If not, stop investing in cross-op overlap.
+- Would a CUDA-core matvec decode body with 16- or 32-row output tiles fill the idle SMs (32 of 60 on the 1.7B projections)? Hazy found CUDA cores better than tensor cores for batch-1 matvec on Hopper. Partly answered: the external baseline's CUDA-core GEMV, at one CTA per 2 output rows, reaches ~75% of H100 bandwidth (2026-10-23). Still open: whether a generated body matches it inside the megakernel.
+- Is mk-v2's relaxed spin plus one `fence.acquire.gpu` cheaper than our `ld.acquire` polling?
+- Why does RoPE stay outside decode attention on Llama-1B (one 2-tile interval with `StatefulSmolLM`, a 2-tile and a 20-tile interval with `DecodeStep`) when step 1 fused it on SmolLM? Llama 3's `rope_type="llama3"` tables or the `DecodeStep` graph shape may miss the matcher.
 
 - What L2 share does the MIG slice give, and why did idle-CTA L2 prefetch still slow decode?
 - Does the RMSNorm GEMM prologue stay bit-exact against HF's bf16 rounding?
-- Does split-K help on a full 132-SM H100/H200?
+- Does split-K help on a full 132-SM H100/H200? (On the 60-SM slice it slows Llama-1B decode: 1,954 vs 1,850 µs.)
 - Does the plan cache key cover matcher and body source? `make_plan_key` takes `body_revisions` only when the caller passes them.
 
 ## Known smaller gaps
@@ -168,4 +246,6 @@ Correctness: 135M and Qwen2-0.5B decode are bit-exact with eager over advancing 
 - `test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid` fails; `test_task24_compiles_exact_rope_with_supported_stride` is flaky.
 - A new body must not call `llvm.intr_trap()` directly: use `runtime.trap_if`, or C7519 returns (check with `tools/wgmma_serialization.py`).
 - Whole-kernel register allocation moves decode by up to ±7% with unrelated code. A/B a feature against "off" **and** against the same code compiled in but inert (step 3).
-- Gemma 3 checkpoints are gated; there is no HF token in this environment.
+- The environment is logged in to Hugging Face with access to `meta-llama/Llama-3.2-1B-Instruct` (2026-10-23); Gemma 3 access is unchecked.
+- `tools/phase_profile.py` sets `MEGABAKE_PHASE_TIMER` at import from its own `sys.argv`, so a script that imports it without `--cta` gets a 1-element CTA stamp buffer and crashes reading it. The command-line `--cta` run works on Llama-1B decode.
+- `phase_profile.py` times decode only at the first ~15 positions; decode attention cost depends on context length, so pass the benchmark's positions when attributing time.
