@@ -97,16 +97,27 @@ python src/main.py export --callable module:callable --arg '[[1.0, 2.0]]'
 
 ## Environment setup
 
-The checked-in requirements target Python 3.13, PyTorch with CUDA 13.0, and CuTe DSL's CUDA 13 package. Use an NVIDIA GPU and driver supported by that PyTorch wheel. Kernel compilation needs the CUDA 13.0 development toolkit and its `nvcc`; installing Python requirements does not install `nvcc`. The CUDA version reported by `nvidia-smi` describes driver support, not the installed compiler toolkit.
+Use Python 3.12–3.14, an NVIDIA GPU and driver compatible with PyTorch's CUDA 13.0 build, and the CUDA 13.0 development toolkit. Python dependencies do not install `nvcc`; the CUDA version shown by `nvidia-smi` describes driver support, not the installed toolkit.
 
-From the repository root, create and activate a virtual environment, then install the project and its pinned direct dependencies:
+For development, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run from your checkout:
 
 ```bash
-python3.13 -m venv .venv
+uv sync --locked --extra dev --python 3.13
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+megabake demo --device cpu
+python -m pytest tests/unit
 ```
+
+This installs the project in editable mode with development dependencies. `pyproject.toml` defines dependencies; `uv.lock` pins their versions. After changing dependencies, run `uv lock` and commit both files.
+
+For a library installation with pip, run from the checkout in an active Python environment:
+
+```bash
+python -m pip install 'torch>=2.14' --index-url https://download.pytorch.org/whl/cu130
+python -m pip install .
+```
+
+For a pip development install, replace `.` with `-e '.[dev]'`. To install directly from GitHub, replace `.` with `'megabake @ git+https://github.com/aka-vm/megabake.git'`. The package exposes `import megabake` and the `megabake` CLI. Pip needs the explicit PyTorch install above because it does not read UV's CUDA index configuration.
 
 Point `CUDA_HOME` at the CUDA 13.0 toolkit before compiling kernels, especially if `/usr/local/cuda` selects another version:
 
