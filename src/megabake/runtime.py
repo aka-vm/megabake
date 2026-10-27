@@ -369,9 +369,12 @@ def execute_phase_plan(
     ready: torch.Tensor | None = None,
     epoch: int | None = None,
     synchronize: bool = True,
+    capturable: bool = False,
 ) -> RuntimeInvocation:
     """Launch ``kernel`` on ``stream``. With ``synchronize=False`` the call
-    returns once the launch is enqueued; its results are stream-ordered."""
+    returns once the launch is enqueued; its results are stream-ordered.
+    ``capturable`` declares that ``kernel`` takes its epochs from the device,
+    so a CUDA graph may capture it."""
     active_stream = stream or torch.cuda.current_stream()
     device = active_stream.device
     selected_admission = admission
@@ -379,7 +382,7 @@ def execute_phase_plan(
         with torch.cuda.device(device):
             selected_admission = admit_runtime(plan)
 
-    if _stream_is_capturing(active_stream):
+    if not capturable and _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for phase plans")
     with torch.cuda.stream(active_stream):
         selected_ready = (

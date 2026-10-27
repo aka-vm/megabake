@@ -1456,6 +1456,7 @@ def _emit_table_module(
     # buffers whose base never changes; the call counter selects this call's
     # entry, whose first word repeats the counter. The first CTA checks it and
     # copies the addresses into the device table before the first barrier.
+    # A stamp of -1 marks a CUDA graph's ring, whose addresses fit every call.
     ring_words = len(dynamic_slots) + 1
     dynamic_writes = (
         "        _dynamic = cute.make_tensor(\n"
@@ -1467,7 +1468,7 @@ def _emit_table_module(
         "            ),\n"
         f"            cute.make_layout({ring_words}),\n"
         "        )\n"
-        "        trap_if(_dynamic[0] != cutlass.Int64(_call))\n"
+        "        trap_if((_dynamic[0] != cutlass.Int64(_call)) & (_dynamic[0] != cutlass.Int64(-1)))\n"
         + (
             f"        for _position in cutlass.range(_thread, {len(dynamic_slots)}, {plan.launch.threads_per_block}, unroll=1):\n"
             "            addresses[dynamic_slot_table[_position]] = _dynamic[_position + 1]\n"

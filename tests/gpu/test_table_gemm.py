@@ -152,3 +152,47 @@ def test_table_launch_streams_weights_in_stateful_decode(tmp_path, table_launch,
         range(len(generated.launch.gemm_template_phases))
     )
     assert generated.source.count(".preload_table(") == len(generated.launch.gemm_template_phases)
+
+
+def test_graphed_stateful_decode_matches_eager(tmp_path, table_launch):
+    """Replays of a CUDA-graphed decode step advance the KV state bit-exactly."""
+    from megabake import graphed, make_backend
+
+    torch.manual_seed(7)
+    model = StatefulSmolLMArchitecture(layers=LAYERS, device="cuda", dtype=torch.bfloat16)
+
+    def state():
+        return (
+            *(torch.zeros(1, 6, 3, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2 * LAYERS)),
+            *(torch.zeros(1, device="cuda", dtype=torch.int32) for _ in range(LAYERS)),
+        )
+
+    actual_state, reference_state = state(), state()
+    backend = make_backend(
+        mode="decode", compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase"
+    )
+    optimized = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.no_grad():
+        step = graphed(
+            optimized,
+            torch.tensor([[1]], device="cuda"),
+            torch.tensor([[0]], device="cuda"),
+            *actual_state,
+        )
+        # Warm-up calls must leave the state as it was.
+        for tensor in actual_state:
+            assert not tensor.any()
+        for position, token in enumerate((5, 6, 7, 8)):
+            token_ids = torch.tensor([[token]], device="cuda")
+            position_ids = torch.tensor([[position]], device="cuda")
+            actual = step(token_ids, position_ids, *actual_state)
+            expected = model(token_ids, position_ids, *reference_state)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # Eager calls on the same compiled step still line up with the device counter.
+        token_ids = torch.tensor([[9]], device="cuda")
+        position_ids = torch.tensor([[4]], device="cuda")
+        actual = optimized(token_ids, position_ids, *actual_state)
+        expected = model(token_ids, position_ids, *reference_state)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for actual_tensor, reference_tensor in zip(actual_state, reference_state, strict=True):
+        torch.testing.assert_close(actual_tensor, reference_tensor, rtol=0, atol=0)

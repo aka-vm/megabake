@@ -31,7 +31,7 @@ import torch
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import make_backend  # noqa: E402
+from megabake import graphed, make_backend  # noqa: E402
 from benchmarks.measure import kernel_trace  # noqa: E402
 from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config  # noqa: E402
 from megabake.fx_handler.hf_attention import (  # noqa: E402
@@ -43,7 +43,7 @@ from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  #
 from megabake.lowering import kv_attention  # noqa: E402
 
 PROMPT = [1, 504, 3458, 314]
-VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake")
+VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake", "megabake_graphed")
 
 
 def _load(name: str, revision: str | None, attention: str = "eager") -> torch.nn.Module:
@@ -292,6 +292,7 @@ def bench_decode(model, args) -> dict:
         "megabake": lambda: torch.compile(
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),
+        "megabake_graphed": None,
     }
     calls = 1 + args.warmup + 2 * args.samples + 1
     if calls > args.capacity:
@@ -310,6 +311,15 @@ def bench_decode(model, args) -> dict:
             if name == "inductor_graphed":
                 build = lambda state=state: GraphedStep(  # noqa: E731
                     torch.compile(stateful, fullgraph=True, dynamic=False), token, state
+                )
+            if name == "megabake_graphed":
+                build = lambda state=state: graphed(  # noqa: E731
+                    torch.compile(
+                        stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
+                    ),
+                    token,
+                    torch.zeros((1, 1), dtype=torch.long, device="cuda"),
+                    *state,
                 )
 
             def step(function, state=state, position=position):
@@ -360,6 +370,9 @@ def bench_decode_contexts(model, args) -> dict:
         "megabake": lambda: torch.compile(
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),
+        # Built per variant below: the capture binds that variant's state tensors.
+        "inductor_graphed": None,
+        "megabake_graphed": None,
     }
     results: dict[str, object] = {"capacity": capacity, "contexts": contexts}
     with torch.no_grad():
@@ -374,7 +387,21 @@ def bench_decode_contexts(model, args) -> dict:
                     for shape, dtype in layer
                 ]
                 lengths = [t for t in state if t.dtype == torch.int32 and t.numel() == 1]
-                function = build()
+                if name == "inductor_graphed":
+                    function = GraphedStep(
+                        torch.compile(stateful, fullgraph=True, dynamic=False), token, state
+                    )
+                elif name == "megabake_graphed":
+                    function = graphed(
+                        torch.compile(
+                            stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
+                        ),
+                        token,
+                        torch.tensor([[0]], device="cuda"),
+                        *state,
+                    )
+                else:
+                    function = build()
                 function(token, torch.tensor([[0]], device="cuda"), *state)
                 rows = {}
                 for context in contexts:
@@ -456,7 +483,7 @@ def main() -> None:
         default="eager",
         help="prefill attention: eager (pattern-matched by MegaBake) or the declared megabake op",
     )
-    parser.add_argument("--modes", nargs="+", choices=("prefill", "decode"), default=["prefill", "decode"])
+    parser.add_argument("--modes", nargs="*", choices=("prefill", "decode"), default=["prefill", "decode"])
     parser.add_argument(
         "--variants",
         nargs="+",

@@ -396,6 +396,10 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
 # chunks, each one CTA work item, with at least this many keys per chunk.
 DECODE_MAX_CHUNKS = 16
 DECODE_MIN_CHUNK_KEYS = 64
+# shortcut: below the ~700-key crossover measured on Llama-3.2-1B and
+# SmolLM-1.7B, 60-SM H200 slice (2026-10-23); replace with step 11's
+# cost-derived split.
+DECODE_SECOND_WAVE_KEYS = 512
 
 
 def emit_attention_body(
@@ -802,6 +806,16 @@ def _split_decode_attention_body(
     prologues = prologues or {}
     warps = threads // 32
     chunks = decode_chunks(row_count, workers)
+    # Below DECODE_SECOND_WAVE_KEYS a second wave of chunks costs more than it
+    # saves: keep the chunks in use to one wave of items.
+    wave = max(1, workers // row_count)
+    one_wave = (
+        f"    if keys < cutlass.Int32({DECODE_SECOND_WAVE_KEYS}):\n"
+        f"        if in_use > cutlass.Int32({wave}):\n"
+        f"            in_use = cutlass.Int32({wave})\n"
+        if wave < chunks
+        else ""
+    )
     # Shared scratch: warp maxima or sums, then warp value partials, then scores.
     shared_scores = warps + warps * head_dim
     scores_in_shared = (shared_scores + kv_length) * 4 <= scratch_bytes
@@ -981,7 +995,7 @@ def run(
     in_use = (keys + cutlass.Int32({DECODE_MIN_CHUNK_KEYS - 1})) // cutlass.Int32({DECODE_MIN_CHUNK_KEYS})
     if in_use > cutlass.Int32({chunks}):
         in_use = cutlass.Int32({chunks})
-    chunk_keys = (keys + in_use - cutlass.Int32(1)) // in_use
+{one_wave}    chunk_keys = (keys + in_use - cutlass.Int32(1)) // in_use
     warp = thread // 32
     lane = thread % 32
     # Only the chunks in use are items, row-major so a row's items are

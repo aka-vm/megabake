@@ -57,6 +57,7 @@ from .runtime import (
     EventRuntimeAdmission,
     RuntimeAdmission,
     admit_event_runtime,
+    _stream_is_capturing,
     admit_runtime,
     execute_event_plan,
     execute_phase_plan,
@@ -977,6 +978,21 @@ def bind_callable(
             active_stream = torch.cuda.current_stream(
                 next(iter(input_tensors.values())).device
             )
+            capturing = _stream_is_capturing(active_stream)
+            if capturing and (
+                _graph_capture is None
+                or state is None
+                or compiled_kernel.event_schedule is not None
+                or compiled_kernel.generated.launch.launch_policy
+                != "megabake_cooperative_table"
+            ):
+                raise CompilerError(
+                    CompilerDiagnostic(
+                        "callable-binding",
+                        "CUDA graph capture needs megabake.graphed and a table launch",
+                        requirement="graphed table launch",
+                    )
+                )
 
             if state is None:
                 ready = _initial_ready(compiled_kernel, active_stream.device)
@@ -1011,6 +1027,7 @@ def bind_callable(
                     ready=state.ready,
                     epoch=next_epoch,
                     synchronize=False,
+                    capturable=capturing,
                 )
             else:
                 execute_event_plan(
@@ -1051,6 +1068,83 @@ def bind_callable(
     forward.megabake_context = context
     forward.megabake_runtime_state = state
     return forward
+
+
+# Runtime states launched by the capture in progress; None outside ``graphed``.
+_graph_capture: list[_RuntimeState] | None = None
+
+
+class GraphedCall:
+    """One MegaBake call captured in a CUDA graph; made by ``graphed``."""
+
+    def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
+        global _graph_capture
+        self._inputs, self._spec = pytree.tree_flatten(args)
+        saved = [
+            leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs
+        ]
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(warmup):
+                function(*args)
+            # Warm-up calls advance stateful arguments (KV caches); undo them.
+            for leaf, original in zip(self._inputs, saved, strict=True):
+                if original is not None:
+                    leaf.copy_(original)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        del saved
+        self._graph = torch.cuda.CUDAGraph()
+        _graph_capture = []
+        try:
+            with torch.cuda.graph(self._graph):
+                self.output = function(*args)
+            self._states = tuple(dict.fromkeys(_graph_capture))
+        finally:
+            _graph_capture = None
+        if not self._states:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "callable-binding",
+                    "the captured call launched no MegaBake kernel",
+                    requirement="a MegaBake-compiled function",
+                )
+            )
+
+    def __call__(self, *args: Any) -> Any:
+        leaves, spec = pytree.tree_flatten(args)
+        if spec != self._spec:
+            raise ValueError("a graphed call takes the argument structure it was captured with")
+        for given, captured in zip(leaves, self._inputs, strict=True):
+            if given is captured:
+                continue
+            if not isinstance(captured, torch.Tensor):
+                if given != captured:
+                    raise ValueError(f"graphed call captured {captured!r}, got {given!r}")
+            elif given.shape != captured.shape or given.dtype != captured.dtype:
+                raise ValueError(
+                    f"graphed call captured a {captured.dtype} {tuple(captured.shape)} tensor, "
+                    f"got {given.dtype} {tuple(given.shape)}"
+                )
+            else:
+                captured.copy_(given)
+        for state in self._states:
+            state.graph_replayed()
+        self._graph.replay()
+        return self.output
+
+
+def graphed(function: Callable[..., Any], *args: Any, warmup: int = 2) -> GraphedCall:
+    """Capture one call of a MegaBake-compiled ``function`` in a CUDA graph.
+
+    Each later call copies tensor arguments passed as new objects into the
+    captured ones (pass the captured tensors, updated in place, to skip even
+    that), then replays the graph: no guards, binding or launch work on the
+    host. It returns the captured outputs, which the next call overwrites.
+    ``warmup`` calls run first; tensor arguments are restored afterwards.
+    """
+    return GraphedCall(function, args, max(warmup, 2))
 
 
 def _post_grad_graph(
@@ -1870,6 +1964,9 @@ class _RuntimeState:
         # (arguments, packed execution arguments, what keeps them alive)
         self._packed_arguments: tuple[Any, Any, Any] | None = None
         self._work_iterator_views: tuple[Any, ...] | None = None
+        # Address rings of CUDA graphs that captured this state; kept alive
+        # with the state because the graphs read them on every replay.
+        self._graph_rings: list[torch.Tensor] = []
 
     @classmethod
     def create(
@@ -1941,6 +2038,26 @@ class _RuntimeState:
     def reset_ready(self) -> None:
         reset_ready(self.ready)
         self._calls = 0
+
+    def _wrap_calls(self) -> None:
+        """Restart the call counter before barrier epochs would pass int32."""
+        # Counting barriers reach (ordinal + 1) * workers within a call.
+        stride = max(self.generated.launch.barrier_epochs, 1)
+        if (self._calls + 1) * stride * self.plan.launch.grid_size > _MAX_EPOCH:
+            if self._prepared_calls != self._calls_run:
+                raise CompilerError(
+                    CompilerDiagnostic(
+                        "runtime-binding",
+                        "the call counter wraps while launches are still prepared",
+                        requirement="ordered table launches",
+                    )
+                )
+            self.reset_ready()
+
+    def graph_replayed(self) -> None:
+        """Account for one replay of a graph that captured this state's launch."""
+        self._wrap_calls()
+        self._calls += 1
 
     def poison_workspace(self, value: int = 0xE5) -> None:
         self.workspace_base.fill_(value)
@@ -2278,7 +2395,11 @@ class _RuntimeState:
         return tuple(arguments)
 
     def _table_arguments(
-        self, stream: cuda.CUstream, *, include_constants: bool = False
+        self,
+        stream: cuda.CUstream,
+        *,
+        include_constants: bool = False,
+        ring: torch.Tensor | None = None,
     ) -> tuple[Any, ...]:
         """Kernel arguments of a table launch.
 
@@ -2425,6 +2546,7 @@ class _RuntimeState:
         handle = int(stream)
         if (
             not include_constants
+            and ring is None
             and cached is not None
             and cached[2] == handle
             and len(cached[0]) == len(parts)
@@ -2437,7 +2559,7 @@ class _RuntimeState:
             parts[1],
             self._phase_table[1],
             self._work_iterator_views,
-            cutlass.Int64(self._dynamic_ring[0].data_ptr()),
+            cutlass.Int64((self._dynamic_ring[0] if ring is None else ring).data_ptr()),
             self._dynamic_slot_table[1],
             self._phase_scratch[0][1],
             self._phase_scratch[1][1],
@@ -2455,7 +2577,7 @@ class _RuntimeState:
                 arguments.append(self._max_active_clusters)
         arguments.append(stream)
         result = tuple(arguments)
-        if not include_constants:
+        if not include_constants and ring is None:
             self._table_argument_cache = (parts, result, handle)
         return result
 
@@ -2475,18 +2597,20 @@ class _RuntimeState:
             arguments = self.arguments(epoch, cu_stream)
             execution, keep = _pack_arguments(compiled, arguments)
             return (None, arguments, execution, keep)
-        # Counting barriers reach (ordinal + 1) * workers within a call.
-        stride = max(self.generated.launch.barrier_epochs, 1)
-        if (self._calls + 1) * stride * self.plan.launch.grid_size > _MAX_EPOCH:
-            if self._prepared_calls != self._calls_run:
-                raise CompilerError(
-                    CompilerDiagnostic(
-                        "runtime-binding",
-                        "the call counter wraps while launches are still prepared",
-                        requirement="ordered table launches",
-                    )
-                )
-            self.reset_ready()
+        if _stream_is_capturing(stream):
+            # A graph replays these addresses on every call, so every ring
+            # entry holds them, stamped -1; the eager ring stays untouched.
+            ring = torch.empty(
+                (DYNAMIC_ADDRESS_RING, len(self.generated.launch.dynamic_slots) + 1),
+                dtype=torch.int64,
+            ).pin_memory()
+            arguments = self._table_arguments(cu_stream, ring=ring)
+            ring[:, 0] = -1
+            ring[:, 1:] = torch.from_numpy(self._pending_dynamic_addresses)
+            self._graph_rings.append(ring)
+            _graph_capture.append(self)
+            return (None, arguments, *_pack_arguments(compiled, arguments))
+        self._wrap_calls()
         arguments = self._table_arguments(cu_stream)
         call = self._calls
         host, rows, events = self._dynamic_ring
