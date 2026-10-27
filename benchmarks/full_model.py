@@ -30,16 +30,16 @@ import torch
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import make_backend  # noqa: E402
-from benchmarks.measure import kernel_trace  # noqa: E402
-from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config  # noqa: E402
-from megabake.fx_handler.hf_attention import (  # noqa: E402
+from benchmarks.measure import kernel_trace
+from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config
+from megabake import make_backend
+from megabake.fx_handler.hf_attention import (
     ATTENTION_IMPLEMENTATION,
     DecodeStep,
     register_transformers_attention,
 )
-from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  # noqa: E402
-from megabake.lowering import kv_attention  # noqa: E402
+from megabake.lowering import kv_attention
+from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM
 
 PROMPT = [1, 504, 3458, 314]
 VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake")
@@ -304,7 +304,7 @@ def bench_decode(model, args) -> dict:
             ]
             position = [0]
             if name == "inductor_graphed":
-                build = lambda state=state: GraphedStep(  # noqa: E731
+                build = lambda state=state: GraphedStep(
                     torch.compile(stateful, fullgraph=True, dynamic=False), token, state
                 )
 
@@ -394,7 +394,7 @@ def bench_decode_contexts(model, args) -> dict:
                         complete.append((time.perf_counter() - started) * 1e6)
                     pipelined = _pipelined_calls(
                         [
-                            lambda position=position: function(token, position, *state)
+                            lambda position=position: function(token, position, *state)  # noqa: B023  # Callback is consumed within this loop iteration.
                             for position in positions[4 + args.samples :]
                         ]
                     )

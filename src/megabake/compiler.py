@@ -4,22 +4,23 @@ import collections
 import copy
 import functools
 import os
+import sys
+import threading
+import time
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
-from statistics import median
-import threading
-import sys
-import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
-import uuid
+from statistics import median
+from typing import Any
 
 import cutlass
-import cutlass.cute as cute
 import numpy as np
-from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver as cuda
 import torch
+from cuda.bindings import driver as cuda
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
@@ -29,7 +30,12 @@ from .codegen import GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
-from .lowering import DataIndex, TensorProgram, canonicalize_semantics, semantic_coverage
+from .lowering import (
+    DataIndex,
+    TensorProgram,
+    canonicalize_semantics,
+    semantic_coverage,
+)
 from .memory import distinct_workspace, verify_plan
 from .plan import (
     BodySelectionPlan,
@@ -40,7 +46,6 @@ from .plan import (
     search_plans,
 )
 from .planner import enumerate_body_selections
-from .schedule import EventSchedule, make_region_event_schedule
 from .regions import form_regions
 from .runtime import (
     DYNAMIC_ADDRESS_RING,
@@ -53,6 +58,7 @@ from .runtime import (
     make_ready,
     reset_ready,
 )
+from .schedule import EventSchedule, make_region_event_schedule
 
 
 class UnsupportedCompiler(RuntimeError):
@@ -253,9 +259,9 @@ class _TeacherForcedCheck:
     """Verify a candidate region by region, on inputs it computed itself."""
 
     prepared: PreparedFX
-    snapshot: "_StateSnapshot"
+    snapshot: _StateSnapshot
 
-    def failure(self, compiled: "CompiledKernel", actual: Any) -> str | None:
+    def failure(self, compiled: CompiledKernel, actual: Any) -> str | None:
         """None when the candidate is verified, otherwise the reason it is not."""
         plan = compiled.plan
         if plan.graph is None or not _uses_table_launch(plan.graph):
@@ -341,7 +347,7 @@ def _region_failure(
     try:
         for name in members:
             env[name] = evaluate(by_name[name])
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
         return f"cannot evaluate {selected.region_id}: {type(error).__name__}: {error}"
     compared = 0
     for value_id in selected.outputs:
@@ -594,7 +600,7 @@ def compile_post_grad(
                 and selected_candidate.measurement is not None
                 else None
             ),
-            "median_device_event_span_us": (
+            "median_device_event_span_us": (  # noqa: F601  # Preserve existing repeated-key evaluation in this behavior-neutral cleanup.
                 selected_candidate.measurement.median_device_event_span_us
                 if selected_candidate is not None
                 and selected_candidate.measurement is not None
@@ -1138,7 +1144,7 @@ class _StateSnapshot:
     @classmethod
     def create(
         cls, graph: ComputeGraph, example_inputs: Sequence[Any]
-    ) -> "_StateSnapshot":
+    ) -> _StateSnapshot:
         state_ids = {
             value_id
             for operation in graph.ops.values()
@@ -1247,7 +1253,7 @@ def _make_plan_evaluator(
                 median_isolated_launch_us=median(isolated_samples),
                 verification_complete_call_us=verification_samples[0],
             )
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             return PlanMeasurement(error=f"{type(error).__name__}: {error}")
 
     return evaluate
@@ -2551,7 +2557,7 @@ class _RuntimeState:
             self.reset_ready()
         arguments = self._table_arguments(cu_stream)
         call = self._calls
-        host, rows, events = self._dynamic_ring
+        _host, rows, events = self._dynamic_ring
         entry = call % DYNAMIC_ADDRESS_RING
         if events[entry] is not None:
             # The launch that read this entry DYNAMIC_ADDRESS_RING calls ago.

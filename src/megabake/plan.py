@@ -4,8 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import product
 from time import monotonic
-from typing import TYPE_CHECKING
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .bodies.interface import (
     AxisExpression,
@@ -507,7 +506,7 @@ def search_plans(
                 worker_counts.add(max(1, default_workers // 2))
             if default_workers >= 4:
                 worker_counts.add(max(1, default_workers // 4))
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             candidates.append(
                 PlanCandidate(
                     None,
@@ -574,7 +573,7 @@ def search_plans(
                     )
                 )
                 continue
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             candidates.append(
                 PlanCandidate(
                     None,
@@ -632,7 +631,7 @@ def search_plans(
             measurement = selected_budget.evaluator(
                 candidate.plan, selected_budget
             )
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             measurement = PlanMeasurement(error=f"evaluator failed: {error}")
         status = (
             "measured"

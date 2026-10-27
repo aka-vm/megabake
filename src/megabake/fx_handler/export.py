@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 import torch
 from torch.export.graph_signature import InputKind
-from torch.utils import _pytree as pytree
 
 from ..frontend import CaptureContext, prepare_fx_graph
 

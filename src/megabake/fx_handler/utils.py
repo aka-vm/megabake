@@ -4,7 +4,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 PHASE_FILES = {
     "input": "phase_0_input_fx.txt",
     "normalized": "phase_1_normalized.txt",

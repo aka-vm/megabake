@@ -4,12 +4,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megabake.bodies.blackwell import BlackwellGemmProvider
+from benchmarks.isolated import _graph_ordered_inputs
 from megabake.bodies import SelectionPolicy, validate_body_config
+from megabake.bodies.blackwell import BlackwellGemmProvider
 from megabake.bodies.catalog import get_candidates
 from megabake.lowering import Constant
 from tests.unit.test_bodies import _regions, _target
-from benchmarks.isolated import _graph_ordered_inputs
 
 
 class Gemm(torch.nn.Module):

@@ -4,11 +4,10 @@ import importlib.util
 import sys
 
 import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 import pytest
 import torch
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from megabake.bodies.catalog import get_candidates
 from megabake.bodies.generic import emit_map_body
@@ -16,7 +15,6 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="map-body launcher requires CUDA"
@@ -139,8 +137,8 @@ def test_map_body_launcher_handles_two_expressions_partial_tiles_and_strides(
 
     add_program, add_config = _program(Add(), left, right)
     cast_program, cast_config = _program(Cast(), value)
-    add_module, add_body = _load_body(add_program, add_config, "add", tmp_path)
-    cast_module, cast_body = _load_body(cast_program, cast_config, "cast", tmp_path)
+    _add_module, add_body = _load_body(add_program, add_config, "add", tmp_path)
+    _cast_module, cast_body = _load_body(cast_program, cast_config, "cast", tmp_path)
 
     assert add_body.threads_per_cta == cast_body.threads_per_cta == 128
     assert "tensor_bindings[1][0, o1_0]" in add_body.source

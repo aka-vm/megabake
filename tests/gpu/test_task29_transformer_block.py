@@ -10,7 +10,6 @@ from torch.autograd import DeviceType
 from megabake import make_backend, verify_plan
 from tests.fixtures import StatefulTransformerBlock, TransformerBlock
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="task 29 requires an SM90 CUDA device",

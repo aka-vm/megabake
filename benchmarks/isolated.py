@@ -28,10 +28,10 @@ from cuda.bindings import driver as cuda
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import make_backend
-from megabake.compiler import _initial_ready, _input_tensors, _RuntimeState
 from benchmarks.measure import kernel_trace
 from benchmarks.workloads import mlp
+from megabake import make_backend
+from megabake.compiler import _initial_ready, _input_tensors, _RuntimeState
 
 
 def _single(launch, prepare, count):
@@ -240,7 +240,7 @@ def main() -> None:
         eager_graph, eager_result = _capture(mlp, inputs)
         modes["eager_graph"] = _measure(
             "eager_graph",
-            lambda _: eager_graph.replay(),
+            lambda _: eager_graph.replay(),  # noqa: B023  # Callback is consumed within this loop iteration.
             lambda: None,
             arguments,
             traces,
@@ -257,7 +257,7 @@ def main() -> None:
         inductor_graph, inductor_result = _capture(inductor, inputs)
         modes["inductor_graph"] = _measure(
             "inductor_graph",
-            lambda _: inductor_graph.replay(),
+            lambda _: inductor_graph.replay(),  # noqa: B023  # Callback is consumed within this loop iteration.
             lambda: None,
             arguments,
             traces,
@@ -277,7 +277,7 @@ def main() -> None:
         # The isolated launcher below owns private buffers and epoch state.
         modes["megabake_bound"] = _measure(
             "megabake_bound",
-            lambda _: bound(*inputs),
+            lambda _: bound(*inputs),  # noqa: B023  # Callback is consumed within this loop iteration.
             lambda: None,
             arguments,
             traces,

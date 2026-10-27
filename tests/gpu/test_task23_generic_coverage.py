@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import pytest
-import torch
-
 import subprocess
 import sys
 
-from megabake import make_backend
+import pytest
+import torch
 
+from megabake import make_backend
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
@@ -105,6 +104,7 @@ def test_task23_out_of_range_gather_traps_inside_the_kernel():
     # assert; that poisons the CUDA context, so run it in a child process.
     completed = subprocess.run(
         [sys.executable, "-c", _OUT_OF_RANGE_SCRIPT],
+        check=False,  # A device-side trap is expected to fail the subprocess.
         capture_output=True,
         text=True,
         timeout=1800,

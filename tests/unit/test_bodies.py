@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+
 import pytest
 import torch
 
@@ -18,8 +19,7 @@ from megabake.bodies import (
 from megabake.bodies.catalog import get_candidates
 from megabake.bodies.gemm import gemm_candidates
 from megabake.frontend import prepare_fx_graph
-from megabake.graph import import_fx
-from megabake.graph import Region
+from megabake.graph import Region, import_fx
 from megabake.lowering import (
     Accumulator,
     Binary,

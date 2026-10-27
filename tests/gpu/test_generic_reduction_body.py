@@ -4,11 +4,11 @@ import importlib.util
 import sys
 from dataclasses import replace
 
+import cuda.bindings.driver as cuda
 import pytest
 import torch
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
-import cuda.bindings.driver as cuda
-import cutlass.cute as cute
 
 from megabake.bodies import emit_reduction_body
 from megabake.bodies.catalog import get_candidates
@@ -24,7 +24,6 @@ from megabake.lowering import (
     canonicalize_semantics,
 )
 from megabake.regions import form_regions
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="reduction-body launcher requires CUDA"
@@ -118,7 +117,7 @@ def _view(tensor):
 
 
 def _run_body(name, program, config, source, output, tmp_path):
-    body_module, body = _load_body(program, config, name, tmp_path)
+    _body_module, body = _load_body(program, config, name, tmp_path)
     launcher = _load_launcher(
         f"megabake_{name}_body", len(program.loads) + 1, tmp_path
     )

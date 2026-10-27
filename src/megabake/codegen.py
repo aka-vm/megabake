@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, replace
 import hashlib
 import inspect
 import json
-from pathlib import Path
 import textwrap
-from typing import Any
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any
 
+from .bodies.attention import emit_attention_body
+from .bodies.blackwell import emit_blackwell_gemm
 from .bodies.gemm import (
     HopperWgmmaGemmPersistentKernel,
     has_bias,
@@ -17,8 +19,6 @@ from .bodies.gemm import (
     kernel_tile,
     split_k,
 )
-from .bodies.attention import emit_attention_body
-from .bodies.blackwell import emit_blackwell_gemm
 from .bodies.generic import (
     emit_contraction_body,
     emit_map_body,
@@ -724,7 +724,7 @@ def launch(
         + (("max_active_clusters",) if has_g0 else ())
         + ("stream",),
         tuple(work_iterators),
-        tuple((*tensor_arguments, *g0_tensor_arguments)),
+        (*tensor_arguments, *g0_tensor_arguments),
         tuple(phase_records),
         launch_policy=(
             "megabake_cooperative_events"

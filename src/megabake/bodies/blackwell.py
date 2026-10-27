@@ -12,8 +12,15 @@ from ..graph import Region
 from ..lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
 from .generic import GeneratedContractionBody
 from .interface import (
-    BodyConfig, CandidateSet, ParticipantContract, ProviderRejection, ResourceEvidence,
-    SelectionPolicy, TargetFacts, TileContract, validate_body_config,
+    BodyConfig,
+    CandidateSet,
+    ParticipantContract,
+    ProviderRejection,
+    ResourceEvidence,
+    SelectionPolicy,
+    TargetFacts,
+    TileContract,
+    validate_body_config,
 )
 
 BLACKWELL_ARCHITECTURES = frozenset({"sm100", "sm103", "sm120", "sm121"})

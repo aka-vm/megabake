@@ -27,20 +27,22 @@ from pathlib import Path
 
 os.environ["MEGABAKE_PHASE_TIMER"] = "cta" if "--cta" in sys.argv else "1"
 
-import torch  # noqa: E402
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import megabake.compiler as compiler  # noqa: E402
-from megabake import make_backend  # noqa: E402
-from megabake.runtime import (  # noqa: E402
+from benchmarks.full_model import PROMPT, _load, decode_module
+from megabake import (
+    compiler,
+    make_backend,
+)
+from megabake.runtime import (
     CTA_TIMER_STRIDE,
     GRID_TIMER_SLOTS,
     PHASE_TIMER_SLOTS,
 )
-from benchmarks.full_model import PROMPT, _load, decode_module  # noqa: E402
-from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION  # noqa: E402
+from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION
 
 
 def _category(phase) -> str:
@@ -90,7 +92,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
         run()
         torch.cuda.synchronize()
         samples.append(_cta_stamps(callable_, compiled))
-    median = lambda values: sorted(values)[len(values) // 2]  # noqa: E731
+    median = lambda values: sorted(values)[len(values) // 2]
     keys = ("span", "critical", "mean_busy", "straggler_wait", "release", "busy_ctas")
     intervals = []
     previous, members = None, []
@@ -102,7 +104,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
         for stamps in samples:
             # 32-bit nanosecond stamps, unwrapped relative to CTA 0's start.
             reference = stamps[0][0 if previous is None else 2 + 2 * previous]
-            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: E731
+            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: B023  # Callback is consumed within this loop iteration.
             starts = [relative(row[0 if previous is None else 2 + 2 * previous]) for row in stamps]
             dones = [relative(row[1 + 2 * index]) for row in stamps]
             exits = [relative(row[2 + 2 * index]) for row in stamps]
@@ -123,7 +125,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
         times, fastest, typical = [], [], []
         for stamps in samples:
             reference = stamps[0][0]
-            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: E731
+            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: B023  # Callback is consumed within this loop iteration.
             per_cta = sorted(
                 relative(row[1 + 2 * index]) - relative(row[0 if index == 0 else 2 * index])
                 for row in stamps
@@ -201,7 +203,7 @@ def profile(callable_, compiled, run, calls: int) -> dict:
         run()
         torch.cuda.synchronize()
         samples.append(_stamps(callable_, compiled))
-    median = lambda values: sorted(values)[len(values) // 2]  # noqa: E731
+    median = lambda values: sorted(values)[len(values) // 2]
     intervals, members, previous = [], [], len(phases)
     for index, phase in enumerate(phases):
         members.append(phase)
@@ -275,7 +277,7 @@ def main() -> None:
             ids = torch.tensor([PROMPT], device="cuda")
             mask = torch.ones_like(ids)
             compiled_model = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
-            run = lambda: compiled_model(ids, attention_mask=mask)  # noqa: E731
+            run = lambda: compiled_model(ids, attention_mask=mask)
         else:
             stateful, shapes = decode_module(model, args.capacity)
             state = [torch.zeros(s, device="cuda", dtype=d) for layer in shapes for s, d in layer]

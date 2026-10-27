@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from dataclasses import replace
 
 import pytest
@@ -13,12 +14,11 @@ from megabake import (
     verify_plan,
 )
 from megabake.bodies import TargetFacts
+from megabake.compiler import _workspace_view
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
-from megabake.memory import InvalidStorage
-from megabake.memory import _allocate_workspace, _make_workspace_request
-from megabake.compiler import _workspace_view
+from megabake.memory import InvalidStorage, _allocate_workspace, _make_workspace_request
 from megabake.regions import form_regions
 
 
@@ -333,5 +333,5 @@ def test_assign_storage_can_keep_every_intermediate_distinct():
         (assignment.offset_bytes, assignment.offset_bytes + assignment.size_bytes)
         for assignment in distinct.storage.workspace
     )
-    assert all(end <= start for (_, end), (start, _) in zip(slices, slices[1:]))
+    assert all(end <= start for (_, end), (start, _) in itertools.pairwise(slices))
     assert distinct.storage.workspace_bytes >= reused.storage.workspace_bytes

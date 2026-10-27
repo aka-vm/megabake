@@ -9,7 +9,6 @@ from torch.autograd import DeviceType
 from megabake import make_backend
 from megabake.bodies.attention import attention_scratch_rows
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="task 26 requires an SM90 CUDA device",
@@ -124,7 +123,7 @@ def test_task26_compiles_attention_with_partial_rows(tmp_path):
         Attention().eval(), tmp_path, (source, key, value, mask)
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    assert [
+    assert [  # noqa: RUF015  # Keep sequence indexing and its existing empty-result exception.
         (selection.program.source_target, selection.body.name)
         for selection in backend.megabake_last_compiled.plan.selection.selections
     ][0] in {
@@ -160,7 +159,7 @@ def test_task26_fully_masked_rows_return_zero(tmp_path):
     value = torch.randn(2, 7, 2, 8, device="cuda", dtype=torch.bfloat16)
     mask = torch.randn(2, 1, 5, 7, device="cuda", dtype=torch.bfloat16)
     mask[0, 0, 0].fill_(float("-inf"))
-    backend, actual, expected = compile_and_compare(
+    _backend, actual, expected = compile_and_compare(
         Attention().eval(), tmp_path, (source, key, value, mask)
     )
     masked = torch.isnan(expected)
@@ -184,17 +183,16 @@ def test_task26_repeated_mixed_body_resident_bindings(tmp_path):
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    with torch.no_grad():
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ]
-        ) as profiler:
-            second_actual = backend.megabake_optimized(
-                source, key, value, second_mask, weight, residual
-            )
-            torch.cuda.synchronize()
+    with torch.no_grad(), torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as profiler:
+        second_actual = backend.megabake_optimized(
+            source, key, value, second_mask, weight, residual
+        )
+        torch.cuda.synchronize()
     second_expected = AttentionNorm().eval()(
         source, key, value, second_mask, weight, residual
     )

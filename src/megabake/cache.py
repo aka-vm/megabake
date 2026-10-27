@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass
 import hashlib
 import json
 import platform
 import threading
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, is_dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 import cutlass
 import torch
@@ -141,7 +142,7 @@ def _diagnostics(compiled: Any) -> Mapping[str, Any]:
     if callable(report):
         try:
             return report()
-        except Exception:
+        except Exception:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             return {}
     return {}
 
@@ -184,7 +185,7 @@ def _canonical(value: Any) -> Any:
     if isinstance(value, (str, bool, int)) or value is None:
         return value
     if isinstance(value, float):
-        return value if value == value and abs(value) != float("inf") else str(value)
+        return value if value == value and abs(value) != float("inf") else str(value)  # noqa: PLR0124  # Self-comparison intentionally detects NaN.
     if isinstance(value, (type, Callable)):
         return {
             "__callable__": type(value).__qualname__,

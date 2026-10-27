@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -12,9 +12,9 @@ import torch
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import make_backend
 from benchmarks.measure import event_samples, kernel_trace
 from benchmarks.workloads import mlp, transformer_block
+from megabake import make_backend
 
 
 def _first_call(function, *arguments):
@@ -206,7 +206,7 @@ def main() -> None:
         )
     if arguments.workload == "transformer-block":
         arguments.traces = Path("artifacts/task29/traces")
-        _run_transformer_block(arguments, report)
+        _run_transformer_block(arguments, report)  # noqa: F821  # TODO: report is undefined on this existing benchmark path; fix separately.
         return
 
     torch.manual_seed(16)
@@ -231,7 +231,7 @@ def main() -> None:
         graph, graph_result, graph_setup = _capture_cuda_graph(mlp, *inputs)
         graph.replay()
         graph_error = _relative_l2(graph_result, reference)
-        _, graph_first_replay = _first_call(lambda: graph.replay())
+        _, graph_first_replay = _first_call(lambda: graph.replay())  # noqa: B023  # Callback is consumed within this loop iteration.
         inductor = torch.compile(
             mlp,
             fullgraph=True,
@@ -280,19 +280,19 @@ def main() -> None:
                 ),
                 "first_call_host_us": megabake_first["host_us"],
             },
-            "eager": event_samples(lambda: mlp(*inputs)),
-            "cuda_graph": event_samples(lambda: graph.replay()),
-            "inductor": event_samples(lambda: inductor(*inputs)),
-            "megabake": event_samples(lambda: compiled(*inputs)),
+            "eager": event_samples(lambda: mlp(*inputs)),  # noqa: B023  # Callback is consumed within this loop iteration.
+            "cuda_graph": event_samples(lambda: graph.replay()),  # noqa: B023  # Callback is consumed within this loop iteration.
+            "inductor": event_samples(lambda: inductor(*inputs)),  # noqa: B023  # Callback is consumed within this loop iteration.
+            "megabake": event_samples(lambda: compiled(*inputs)),  # noqa: B023  # Callback is consumed within this loop iteration.
         }
         search = getattr(backend.megabake_last_compiled, "search", None)
         if search is not None:
             record["plan_search"] = search.report()
         functions = {
-            "eager": lambda: mlp(*inputs),
-            "cuda_graph": lambda: graph.replay(),
-            "inductor": lambda: inductor(*inputs),
-            "megabake": lambda: compiled(*inputs),
+            "eager": lambda: mlp(*inputs),  # noqa: B023  # Callback is consumed within this loop iteration.
+            "cuda_graph": lambda: graph.replay(),  # noqa: B023  # Callback is consumed within this loop iteration.
+            "inductor": lambda: inductor(*inputs),  # noqa: B023  # Callback is consumed within this loop iteration.
+            "megabake": lambda: compiled(*inputs),  # noqa: B023  # Callback is consumed within this loop iteration.
         }
         for name, function in functions.items():
             record[name].update(

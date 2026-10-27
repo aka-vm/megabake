@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import operator
 import copy
 import math
+import operator
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -398,7 +398,7 @@ def _broadcast_axes(value: Value, output_shape: Sequence[int]) -> tuple[str | in
     return tuple(axes)
 
 
-def _constant(value: int | float | bool) -> Constant:
+def _constant(value: float | bool) -> Constant:
     if isinstance(value, bool):
         dtype = "torch.bool"
     elif isinstance(value, int):
@@ -931,7 +931,7 @@ def _contraction_post(
     accumulator_dtype: str,
     result_dtype: str,
     bias_load: Load | None,
-    beta: int | float = 1,
+    beta: float = 1,
 ) -> ScalarExpression:
     combined = Accumulator(accumulator_dtype)
     if bias_load is None or beta == 0:
@@ -957,8 +957,8 @@ def _contraction_program(
     logical_right_shape: tuple[int, int],
     right_axes: tuple[str | int, ...],
     bias: Value | None,
-    alpha: int | float,
-    beta: int | float,
+    alpha: float,
+    beta: float,
 ) -> TensorProgram:
     result = _result_value(op, graph)
     if result.shape is None or len(result.shape) != 2:
@@ -1271,7 +1271,7 @@ def _indexed_gather_program(
         raise UnsupportedLowering("gather result shape does not match its operands")
 
     output_axes = tuple(f"o{index}" for index in range(len(result.shape)))
-    index_axes = output_axes[: len(index_shape)]
+    _index_axes = output_axes[: len(index_shape)]
     index_loads = tuple(
         IndexedLoad(
             id=f"gather:index:{index}",
@@ -2472,7 +2472,7 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
             except UnsupportedLowering as error:
                 tensor_program = None
                 reason = f"unsupported lowering for FX target {target}: {error}"
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
                 tensor_program = None
                 reason = (
                     f"lowering rule failed for FX target {target}: "

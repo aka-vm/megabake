@@ -6,7 +6,6 @@ import torch.nn.functional as F
 
 from megabake import make_backend
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="task 15 requires an SM90 CUDA device",

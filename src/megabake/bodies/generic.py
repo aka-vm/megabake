@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import re
-
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from math import prod
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from ..lowering import (
+    Accumulator,
     AxisAffine,
     AxisIndex,
-    DataIndex,
-    IndexedLoad,
-    Accumulator,
     Binary,
     Cast,
     Constant,
+    DataIndex,
+    IndexedLoad,
     Load,
     ScalarExpression,
     TensorProgram,
@@ -126,7 +126,7 @@ UnsupportedContractionBody = UnsupportedMapBody
 
 
 _HOISTED_LOADS: ContextVar[Mapping[str, str]] = ContextVar(
-    "megabake_hoisted_loads", default={}
+    "megabake_hoisted_loads", default={}  # noqa: B039  # The shared empty mapping is read-only; scoped mappings use ContextVar.set().
 )
 
 _CUTLASS_TYPES = {
@@ -997,7 +997,7 @@ def _maximum_code(left: str, right: str) -> str:
     return f"cute.arch.fmax({left}, {right}, nan=True)"
 
 
-def _constant_code(value: int | float | bool) -> str:
+def _constant_code(value: float | bool) -> str:
     if isinstance(value, float) and value == float("-inf"):
         return 'float("-inf")'
     return repr(value)

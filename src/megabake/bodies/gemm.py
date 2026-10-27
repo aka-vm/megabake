@@ -31,19 +31,16 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from collections.abc import Sequence
-from typing import Optional, Tuple, Type
 import math
-from math import prod
 import re
-import cuda.bindings.driver as cuda
+from collections.abc import Sequence
+from math import prod
 
+import cuda.bindings.driver as cuda
 import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
+from cutlass import cute, pipeline, utils
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 
 """
@@ -403,7 +400,7 @@ class HopperWgmmaGemmPersistentKernel:
             self.epi_tile,
         )
 
-        tile_sched_params, grid = self._compute_grid(
+        tile_sched_params, _grid = self._compute_grid(
             c,
             self.tile_shape_mnk,
             self.cluster_shape_mn,
@@ -503,7 +500,6 @@ class HopperWgmmaGemmPersistentKernel:
             min_blocks_per_mp=1,
             stream=stream,
         )
-        return
 
     @cute.jit
     def run(
@@ -685,7 +681,7 @@ class HopperWgmmaGemmPersistentKernel:
         # different CTAs, so the scheduler sees a rotated block index.
         schedule_block = cute.arch.block_idx()
         if cutlass.const_expr(rotated_block is not None):
-            block_x, block_y, block_z = schedule_block
+            block_x, block_y, _block_z = schedule_block
             schedule_block = (block_x, block_y, rotated_block)
 
         # MegaBake: table launches pass per-phase descriptors in global
@@ -1353,7 +1349,7 @@ class HopperWgmmaGemmPersistentKernel:
         tile_shape_mnk: tuple[int, int, int],
         element_type: type[cutlass.Numeric],
         is_cooperative: bool = False,
-        epi_tile_override: Optional[tuple[int, int]] = None,
+        epi_tile_override: tuple[int, int] | None = None,
     ) -> tuple[int, int]:
         """Compute the epilogue tile shape or use override if provided.
 
@@ -1589,10 +1585,10 @@ class HopperWgmmaGemmPersistentKernel:
 
     @staticmethod
     def is_valid_dtypes(
-        a_dtype: Type[cutlass.Numeric],
-        b_dtype: Type[cutlass.Numeric],
-        acc_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
+        a_dtype: type[cutlass.Numeric],
+        b_dtype: type[cutlass.Numeric],
+        acc_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
         a_major: str,
         b_major: str,
     ) -> bool:
@@ -1695,8 +1691,8 @@ class HopperWgmmaGemmPersistentKernel:
         n: int,
         k: int,
         l: int,
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
+        ab_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
         a_major: str,
         b_major: str,
         c_major: str,
@@ -1761,7 +1757,6 @@ from .interface import (
     TileContract,
     validate_body_config,
 )
-
 
 # Pipeline barriers (1 KiB), eight 64x64x64 BF16 A/B stages, and four 64x32
 # BF16 epilogue stages; HopperWgmmaGemmPersistentKernel derives eight stages

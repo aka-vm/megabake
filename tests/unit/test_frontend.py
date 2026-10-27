@@ -1,7 +1,7 @@
 import pytest
 import torch
-from torch.fx import GraphModule
 from torch._inductor import compile_fx as inductor_compile_fx
+from torch.fx import GraphModule
 
 from megabake import CompilerError, make_backend, prepare_fx_graph
 

@@ -7,18 +7,17 @@ from math import prod
 from typing import Any
 
 from .bodies.catalog import get_candidates
-from .lowering import AxisAffine, DataIndex
 from .bodies.interface import BodyConfig, SelectionPolicy, TargetFacts
 from .graph import ComputeGraph, Region
-from .lowering import TensorProgram
+from .lowering import AxisAffine, DataIndex, TensorProgram
 from .plan import (
     BodySelectionPlan,
     ConversionBody,
     CuTeLayout,
     InvalidTileMap,
     LogicalTile,
-    ResourceRequirements,
     RejectionRecord,
+    ResourceRequirements,
     SelectedBody,
     TileAccess,
     TileGrid,

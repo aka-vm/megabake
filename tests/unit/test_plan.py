@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 import megabake.planner as planner_module
 from megabake import make_tile_maps, select_bodies

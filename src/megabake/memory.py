@@ -5,7 +5,6 @@ from dataclasses import dataclass, replace
 
 from .bodies.interface import TargetFacts
 from .graph import ComputeGraph
-from .lowering import KVCacheAccess
 from .plan import (
     BodySelectionPlan,
     CuTeLayout,
@@ -263,7 +262,7 @@ def assign_storage(
     bindings.extend(_boundary_bindings(selection, tile_maps))
     bindings = _deduplicate_bindings(bindings)
     worker_scratch = _worker_scratch(plan)
-    offsets, workspace_bytes = (
+    offsets, _workspace_bytes = (
         _allocate_workspace(workspace_requests)
         if reuse_workspace
         else _allocate_distinct_workspace(workspace_requests)

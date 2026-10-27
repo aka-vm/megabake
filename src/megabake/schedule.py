@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import heapq
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from bisect import bisect_left, bisect_right
-import heapq
 
 from .bodies.interface import BodyConfig, ParticipantContract, WorkItem
 from .graph import ComputeGraph
@@ -1463,9 +1463,9 @@ def _fold_small_intervals(
         costs = [rounds(region_id) for region_id in interval]
         if all(cost is not None for cost in costs):
             def fits() -> bool:
-                phases = sum(len(group) for group in pending) + len(interval)
+                phases = sum(len(group) for group in pending) + len(interval)  # noqa: B023  # Called immediately; intentionally reads current pending state after flush().
                 return (
-                    pending_rounds + sum(costs) <= _FOLD_MAX_ROUNDS
+                    pending_rounds + sum(costs) <= _FOLD_MAX_ROUNDS  # noqa: B023  # Called immediately; intentionally reads current pending state after flush().
                     and phases <= _FOLD_MAX_PHASES
                 )
 

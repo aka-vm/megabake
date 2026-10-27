@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import textwrap
-
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from ..graph import Region
 from .interface import (

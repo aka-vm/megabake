@@ -1,10 +1,10 @@
-from .catalog import get_candidates
 from .attention import (
     GeneratedAttentionBody,
     UnsupportedAttentionBody,
     attention_candidates,
     emit_attention_body,
 )
+from .catalog import get_candidates
 from .gemm import gemm_candidates
 from .generic import (
     GeneratedContractionBody,
@@ -29,27 +29,27 @@ from .interface import (
 )
 
 __all__ = [
-    "get_candidates",
-    "gemm_candidates",
-    "GeneratedAttentionBody",
-    "UnsupportedAttentionBody",
-    "attention_candidates",
-    "emit_attention_body",
-    "GeneratedContractionBody",
-    "GeneratedMapBody",
-    "GeneratedReductionBody",
-    "UnsupportedContractionBody",
-    "UnsupportedMapBody",
-    "UnsupportedReductionBody",
-    "emit_contraction_body",
-    "emit_map_body",
-    "emit_reduction_body",
     "BodyConfig",
     "BodyProvider",
     "CandidateSet",
     "DeviceBody",
+    "GeneratedAttentionBody",
+    "GeneratedContractionBody",
+    "GeneratedMapBody",
+    "GeneratedReductionBody",
     "InvalidBodyConfig",
     "SelectionPolicy",
     "TargetFacts",
+    "UnsupportedAttentionBody",
+    "UnsupportedContractionBody",
+    "UnsupportedMapBody",
+    "UnsupportedReductionBody",
+    "attention_candidates",
+    "emit_attention_body",
+    "emit_contraction_body",
+    "emit_map_body",
+    "emit_reduction_body",
+    "gemm_candidates",
+    "get_candidates",
     "validate_body_config",
 ]

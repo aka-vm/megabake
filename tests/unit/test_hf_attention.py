@@ -8,7 +8,12 @@ transformers = pytest.importorskip("transformers")
 
 
 def _tiny_models():
-    from transformers import Gemma3TextConfig, Gemma3ForCausalLM, LlamaConfig, LlamaForCausalLM
+    from transformers import (
+        Gemma3ForCausalLM,
+        Gemma3TextConfig,
+        LlamaConfig,
+        LlamaForCausalLM,
+    )
 
     llama = LlamaConfig(
         vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
@@ -89,7 +94,7 @@ def test_decode_step_matches_hugging_face_decode(name, model_class, config):
 
 
 def test_decode_step_rejects_undeclared_token_mixers():
-    from transformers import Qwen3_5TextConfig, Qwen3_5ForCausalLM
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
     from megabake.fx_handler import DecodeStep
 

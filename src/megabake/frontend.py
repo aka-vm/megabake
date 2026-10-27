@@ -3,17 +3,17 @@ from __future__ import annotations
 import hashlib
 import operator
 import re
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 import torch
 from torch.utils import _pytree as pytree
 
-from .fx_handler.utils import dump_graph
 from .diagnostics import CompilerError
-
+from .fx_handler.utils import dump_graph
 
 _PINNED_TORCH = (2, 14)
 
@@ -154,6 +154,7 @@ def _check_torch_version() -> None:
 
 def _torch_internals() -> SimpleNamespace:
     from torch._functorch.aot_autograd import aot_module_simplified, make_boxed_func
+    from torch._inductor import config as inductor_config
     from torch._inductor.compile_fx import (
         _recursive_post_grad_passes,
         _recursive_record_original_output_strides,
@@ -164,7 +165,6 @@ def _torch_internals() -> SimpleNamespace:
         partition_fn,
         run_pre_grad_passes,
     )
-    from torch._inductor import config as inductor_config
     from torch._inductor.decomposition import select_decomp_table
     from torch._inductor.fx_passes.post_grad import view_to_reshape
     from torch._inductor.virtualized import V
@@ -631,7 +631,7 @@ def _can_auto_compile(example_inputs: Sequence[Any]) -> bool:
         return False
     try:
         capability = torch.cuda.get_device_capability(tensors[0].device)
-    except Exception:
+    except Exception:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
         return False
     return capability in {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)}
 

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import operator
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-import operator
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 from torch.fx.operator_schemas import normalize_function
 from torch.utils._pytree import tree_flatten, tree_unflatten
-
 
 _MISSING = object()
 
@@ -443,7 +443,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
         for operand_id in operand_ids:
             operand = values[operand_id]
             values[operand_id] = replace(
-                operand, users=tuple((*operand.users, op_id))
+                operand, users=(*operand.users, op_id)
             )
 
     output_node = next(node for node in graph.graph.nodes if node.op == "output")

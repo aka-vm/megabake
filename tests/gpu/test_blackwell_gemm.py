@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import torch
 import pytest
-import cutlass.cute as cute
+import torch
 from cuda.bindings import driver as cuda
+from cutlass import cute
 
 from megabake.bodies import SelectionPolicy
 from megabake.bodies.blackwell import BlackwellGemmProvider, emit_blackwell_gemm
@@ -12,7 +12,7 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-from tests.gpu.test_generic_contraction_body import _load_module, _load_launcher, _view
+from tests.gpu.test_generic_contraction_body import _load_launcher, _load_module, _view
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in {10, 12},
@@ -57,10 +57,10 @@ def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input
 
 @pytest.mark.parametrize("scheduler", ["phase", "region-events"])
 def test_blackwell_complete_mlp_one_kernel_and_private_isolated_state(tmp_path, scheduler):
-    from megabake import make_backend
-    from benchmarks.workloads import mlp
-    from benchmarks.isolated import _MegaBakeKernel, _graph_ordered_inputs
+    from benchmarks.isolated import _graph_ordered_inputs, _MegaBakeKernel
     from benchmarks.measure import kernel_trace
+    from benchmarks.workloads import mlp
+    from megabake import make_backend
 
     torch.manual_seed(123)
     args = (torch.randn(5, 17, device="cuda", dtype=torch.bfloat16) / 4,

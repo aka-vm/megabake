@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import cutlass
 import cuda.bindings.driver as cuda
+import cutlass
 import pytest
 import torch
 
@@ -15,7 +15,6 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),

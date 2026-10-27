@@ -11,7 +11,6 @@ from megabake import (
     verify_plan,
 )
 from megabake.bodies import SelectionPolicy, TargetFacts
-from megabake.frontend import prepare_fx_graph
 from megabake.fx_handler.export import capture_exported_program
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics

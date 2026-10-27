@@ -5,8 +5,8 @@ from typing import Any
 
 from ..graph import Region
 from .attention import AttentionBodyProvider
-from .gemm import G0RangeBodyProvider
 from .blackwell import BlackwellGemmProvider
+from .gemm import G0RangeBodyProvider
 from .interface import (
     BodyConfig,
     CandidateSet,
@@ -25,7 +25,6 @@ from .interface import (
     TileContract,
     validate_body_config,
 )
-
 
 _DTYPE_BYTES = {
     "torch.bool": 1,

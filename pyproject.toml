@@ -37,3 +37,13 @@ megabake = "megabake.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff.lint]
+extend-ignore = [
+    # Generated CUDA source and diagnostics intentionally concatenate string fragments.
+    "ISC004",
+    # Nested guards separate CuTe compile-time conditions from device conditions.
+    "SIM102",
+    # Keep nested context managers readable, especially CUDA capture/error scopes.
+    "SIM117",
+]

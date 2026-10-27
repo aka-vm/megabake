@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 import uuid
+from dataclasses import dataclass
 from typing import Protocol
 
 import cutlass
-import cutlass.cute as cute
 import torch
 from cuda.bindings import driver as cuda
+from cutlass import cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -57,7 +57,7 @@ def ready_slots(workers: int) -> int:
 # Off by default: on a 60-SM H200 slice it slowed decode by 16-24% issued by
 # every CTA (artifacts/chunk3_2026-10-20) and by 8-10% issued only by CTAs
 # idle in the issuing phase (artifacts/chunk4_2026-10-20).
-L2_PREFETCH_BYTES = int(os.environ.get("MEGABAKE_L2_PREFETCH_BYTES", 0))
+L2_PREFETCH_BYTES = int(os.environ.get("MEGABAKE_L2_PREFETCH_BYTES", "0"))
 
 
 # Host-mapped buffers holding table launches' per-call boundary addresses;

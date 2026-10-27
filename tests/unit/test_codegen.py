@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import replace
 import json
+from dataclasses import replace
 
 import torch
 
@@ -10,17 +10,16 @@ from megabake import (
     assign_storage,
     derive_dependencies,
     emit_cute,
-    KernelPlan,
     make_phase_schedule,
     select_bodies,
 )
-from megabake.schedule import make_region_event_schedule
-from megabake.plan import ConversionBody, CuTeLayout
 from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
+from megabake.plan import ConversionBody, CuTeLayout
 from megabake.regions import form_regions
+from megabake.schedule import make_region_event_schedule
 
 
 def _target() -> TargetFacts:

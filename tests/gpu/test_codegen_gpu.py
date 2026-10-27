@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import importlib.util
 import sys
+from dataclasses import replace
 
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver as cuda
 import pytest
 import torch
+from cuda.bindings import driver as cuda
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from megabake import (
     assign_storage,
@@ -27,10 +27,9 @@ from megabake.bodies.gemm import (
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
-from megabake.regions import form_regions
 from megabake.plan import ConversionBody, CuTeLayout
+from megabake.regions import form_regions
 from megabake.runtime import make_ready
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),

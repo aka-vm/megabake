@@ -34,7 +34,7 @@ PROJECTIONS = 7 * LAYERS + 1
 
 @pytest.fixture
 def table_launch(monkeypatch):
-    import megabake.compiler as compiler
+    from megabake import compiler
 
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
 

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver as cuda
 import pytest
 import torch
+from cuda.bindings import driver as cuda
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from megabake import (
     derive_dependencies,
@@ -19,7 +19,6 @@ from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
 from megabake.runtime import publish_event, wait_for_event
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"

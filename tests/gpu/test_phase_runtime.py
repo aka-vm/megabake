@@ -3,11 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver as cuda
 import pytest
 import torch
+from cuda.bindings import driver as cuda
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from megabake import (
     admit_runtime,
@@ -22,9 +22,13 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-from megabake.runtime import cooperative_worker_loop, grid_barrier, make_ready
+from megabake.runtime import (
+    cooperative_worker_loop,
+    grid_barrier,
+    make_ready,
+    ready_slots,
+)
 from megabake.schedule import WorkerAssignment
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -181,8 +185,8 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
         source = torch.ones(257, device=device, dtype=torch.float32)
-        produced = torch.empty(60, device=device, dtype=torch.float32)
-        ready = make_ready(60, device)
+        produced = torch.empty(max(4, sms), device=device, dtype=torch.float32)
+        ready = make_ready(4, device)
         sink = torch.empty(1, device=device, dtype=torch.float32)
         compiled = cute.compile(
             _launch,
@@ -203,7 +207,7 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
             _flat(produced),
             _flat(ready_tensor),
             _flat(sink),
-            cutlass.Int32(ready_tensor.numel() - 2),
+            cutlass.Int32(ready_tensor.numel() - ready_slots(0)),
             cutlass.Int32(epoch),
             cuda.CUstream(active_stream.cuda_stream),
         )
@@ -212,7 +216,8 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
     assert admit_runtime(four_worker_plan).max_workers >= 4
     invocation = execute_phase_plan(four_worker_plan, kernel, stream)
     assert invocation.epoch == 0
-    assert invocation.barrier_count == 2
+    # The independent sum and amax share one barrier before their addition.
+    assert invocation.barrier_count == 1
     assert sink.item() == 300_000.0
 
     current_source = torch.full((257,), 2.0, device=device, dtype=torch.float32)

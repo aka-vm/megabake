@@ -30,9 +30,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import make_backend  # noqa: E402
-from megabake.compiler import _RuntimeState  # noqa: E402
-from tests.fixtures import (  # noqa: E402
+from megabake import make_backend
+from megabake.compiler import _RuntimeState
+from tests.fixtures import (
     SMOLLM_MODEL_NAME,
     SMOLLM_REVISION,
     SmolLMArchitecture,

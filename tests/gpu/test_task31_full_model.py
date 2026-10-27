@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-
 import os
 
 import pytest
@@ -9,7 +8,6 @@ import torch
 from torch.autograd import DeviceType
 
 from tests.fixtures import SmolLMArchitecture, StatefulSmolLMArchitecture
-
 
 
 def _sm90_available() -> bool:

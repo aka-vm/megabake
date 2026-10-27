@@ -1,34 +1,33 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from collections.abc import Callable, Mapping
-from typing import Any
-from pathlib import Path
-from math import prod
 import operator
+from collections.abc import Callable, Mapping
+from dataclasses import replace
+from math import prod
+from pathlib import Path
+from typing import Any
 
 from .graph import ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
 from .lowering import (
-    attention_access_axes,
-    attention_tensor_program,
+    Accumulator,
     AxisAffine,
+    AxisIndex,
     AxisPredicate,
     AxisTerm,
     Binary,
+    Cast,
     Constant,
     IndexedLoad,
     IterationDomain,
-    Accumulator,
-    AxisIndex,
-    Cast,
     Load,
     ScalarExpression,
     TensorProgram,
-    Unary,
     TensorStore,
+    Unary,
     Where,
+    attention_access_axes,
+    attention_tensor_program,
 )
-
 
 _DTYPE_BYTES = {
     "torch.bool": 1,
@@ -1084,7 +1083,7 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
         or cos.shape[-1] % 2
         or output.shape[-1] < cos.shape[-1]
         or output.dtype not in {"torch.float32", "torch.bfloat16"}
-        or not {x.dtype, cos.dtype, sin.dtype, output.dtype} == {output.dtype}
+        or {x.dtype, cos.dtype, sin.dtype, output.dtype} != {output.dtype}
         or any(stride < 0 for stride in (*x.strides, *cos.strides, *sin.strides, *output.strides))
     ):
         return None
@@ -1356,9 +1355,9 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
         return None
     q_head_axis, k_head_axis, v_head_axis = axes
     query_heads = q.shape[q_head_axis]
-    query_length = q.shape[3 - q_head_axis]
+    _query_length = q.shape[3 - q_head_axis]
     kv_heads = k.shape[k_head_axis]
-    kv_length = k.shape[3 - k_head_axis]
+    _kv_length = k.shape[3 - k_head_axis]
     head_dim = q.shape[-1]
     if (
         query_heads % kv_heads

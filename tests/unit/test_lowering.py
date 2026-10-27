@@ -14,12 +14,12 @@ from megabake.graph import import_fx
 from megabake.lowering import (
     Accumulator,
     AxisAffine,
-    DataIndex,
     AxisIndex,
     Binary,
     CanonicalProgram,
     Cast,
     Constant,
+    DataIndex,
     Load,
     ScalarExpression,
     TensorProgram,
