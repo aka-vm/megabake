@@ -36,12 +36,18 @@ import re
 from collections.abc import Sequence
 from math import prod
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import cute, pipeline, utils
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
+from ..platform import (
+    TensorMapManager,
+    TensorMapUpdateMode,
+    cuda,
+    cute,
+    cutlass,
+    pipeline,
+    pipeline_init_arrive,
+    pipeline_init_wait,
+    sm90_utils,
+    utils,
+)
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -980,7 +986,10 @@ class HopperWgmmaGemmPersistentKernel:
                 gC_direct = cute.local_tile(
                     cute.make_tensor(
                         cute.make_ptr(
-                            self.c_dtype, c_address, cute.AddressSpace.gmem, assumed_align=16
+                            self.c_dtype,
+                            c_address,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
                         ),
                         cute.make_layout(
                             (c_extent[0], c_extent[1], 1),
@@ -1065,7 +1074,8 @@ class HopperWgmmaGemmPersistentKernel:
                         accumulators,
                         tile_coord_mnl,
                         cute.size(gC_mnl, mode=[3]),
-                        tidx - self.num_dma_warp_groups * self.num_threads_per_warp_group,
+                        tidx
+                        - self.num_dma_warp_groups * self.num_threads_per_warp_group,
                         storage.split_arrival.data_ptr(),
                         split_state,
                     )
@@ -1146,7 +1156,9 @@ class HopperWgmmaGemmPersistentKernel:
         last = cute.arch.load(arrival_flag, cutlass.Int32) == self.splits - 1
         if last:
             cute.arch.fence_acq_rel_gpu()
-            first = partial_base + tile * self.splits * tile_elements + mma_thread * count
+            first = (
+                partial_base + tile * self.splits * tile_elements + mma_thread * count
+            )
             for index in cutlass.range_constexpr(count):
                 total = cutlass.Float32(0.0)
                 for split in cutlass.range_constexpr(self.splits):
@@ -1219,7 +1231,10 @@ class HopperWgmmaGemmPersistentKernel:
         if cutlass.const_expr(self.bias_features > 0):
             bias = cute.make_tensor(
                 cute.make_ptr(
-                    cutlass.BFloat16, bias_address, cute.AddressSpace.gmem, assumed_align=2
+                    cutlass.BFloat16,
+                    bias_address,
+                    cute.AddressSpace.gmem,
+                    assumed_align=2,
                 ),
                 cute.make_layout(self.bias_features),
             )
@@ -1260,15 +1275,14 @@ class HopperWgmmaGemmPersistentKernel:
                     column = store_n * self.epi_tile[1] + coordinate[1]
                     if (
                         tile_coord_mnl[0] * self.tile_shape_mnk[0] + row < c_extent[0]
-                        and tile_coord_mnl[1] * self.tile_shape_mnk[1] + column < c_extent[1]
+                        and tile_coord_mnl[1] * self.tile_shape_mnk[1] + column
+                        < c_extent[1]
                     ):
                         gC_mnl_slice[row, column] = tRS_rD_out[epi_v]
                 continue
 
             # Copy from D registers to shared memory
-            epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(
-                tRS_sD, mode=[3]
-            )
+            epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(tRS_sD, mode=[3])
             cute.copy(
                 tiled_copy_r2s,
                 tRS_rD_out,
@@ -1738,6 +1752,7 @@ class HopperWgmmaGemmPersistentKernel:
             is_valid = False
         return is_valid
 
+
 from ..graph import Region
 from .interface import (
     BodyConfig,
@@ -1793,9 +1808,13 @@ def table_descriptors(descriptors: cute.Tensor, gemm: cutlass.Int32):
 
 
 @cute.jit
-def _bf16_tensor(address: cutlass.Int64, shape: cutlass.Constexpr, stride: cutlass.Constexpr):
+def _bf16_tensor(
+    address: cutlass.Int64, shape: cutlass.Constexpr, stride: cutlass.Constexpr
+):
     return cute.make_tensor(
-        cute.make_ptr(cutlass.BFloat16, address, cute.AddressSpace.gmem, assumed_align=16),
+        cute.make_ptr(
+            cutlass.BFloat16, address, cute.AddressSpace.gmem, assumed_align=16
+        ),
         cute.make_layout(shape, stride=stride),
     )
 
@@ -1824,17 +1843,25 @@ def build_table_descriptors(
     atoms = (tensor_bindings[0], tensor_bindings[2], epilogue[0])
     chunk = k // splits
     tensors = (
-        _bf16_tensor(a_address, (m, chunk, splits), (k, 1, chunk if splits > 1 else m * k)),
-        _bf16_tensor(b_address, (n, chunk, splits), (k, 1, chunk if splits > 1 else n * k)),
+        _bf16_tensor(
+            a_address, (m, chunk, splits), (k, 1, chunk if splits > 1 else m * k)
+        ),
+        _bf16_tensor(
+            b_address, (n, chunk, splits), (k, 1, chunk if splits > 1 else n * k)
+        ),
         # swapAB writes C^T, so its C is M-major.
-        _bf16_tensor(c_address, (m, n, 1), (1, m, m * n) if c_m_major else (n, 1, m * n)),
+        _bf16_tensor(
+            c_address, (m, n, 1), (1, m, m * n) if c_m_major else (n, 1, m * n)
+        ),
     )
     for operand in cutlass.range_constexpr(3):
         pointer = table_descriptor(descriptors, gemm, operand, cute.AddressSpace.gmem)
         with cute.arch.elect_one():
             cute.nvgpu.cpasync.copy_tensormap(atoms[operand], pointer)
         cute.arch.sync_warp()
-        cute.nvgpu.cpasync.update_tma_descriptor(atoms[operand], tensors[operand], pointer)
+        cute.nvgpu.cpasync.update_tma_descriptor(
+            atoms[operand], tensors[operand], pointer
+        )
         cute.arch.sync_warp()
 
 
@@ -1896,7 +1923,9 @@ class G0RangeBodyProvider:
             or right_strides["o1"] != reduction_size
             or program.store.strides != (columns, 1)
         ):
-            return reject("provider requires K-major BF16 operands and row-major output")
+            return reject(
+                "provider requires K-major BF16 operands and row-major output"
+            )
         if target.architecture != "sm90a":
             return reject("provider targets sm90a only")
         if not target.supports_tma or not target.supports_wgmma:
@@ -1908,10 +1937,14 @@ class G0RangeBodyProvider:
             if policy.table_gemm_swap_ab:
                 token_tile = policy.table_gemm_swap_ab_rows
                 if rows > token_tile:
-                    return reject(f"swapAB GEMMs of this launch take at most {token_tile} rows")
+                    return reject(
+                        f"swapAB GEMMs of this launch take at most {token_tile} rows"
+                    )
                 splits = (
                     split_k_count(
-                        -(-columns // 64), reduction_size // 64, target.multiprocessor_count
+                        -(-columns // 64),
+                        reduction_size // 64,
+                        target.multiprocessor_count,
                     )
                     if policy.table_gemm_split_k
                     else 1
@@ -1919,8 +1952,13 @@ class G0RangeBodyProvider:
                 return CandidateSet(
                     (
                         _g0_config(
-                            region, program, (token_tile, 64), 8,
-                            TABLE_GEMM_SHARED_BYTES, swap_ab=True, splits=splits,
+                            region,
+                            program,
+                            (token_tile, 64),
+                            8,
+                            TABLE_GEMM_SHARED_BYTES,
+                            swap_ab=True,
+                            splits=splits,
                         ),
                     ),
                     (),
@@ -2125,9 +2163,18 @@ def g0_range_resources(compiled, threads, shared_bytes):
             raise RuntimeError(f"failed to open compiled kernel {symbol}: {status}")
         values = {"name": symbol}
         for label, attribute in (
-            ("registers_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS),
-            ("static_shared_bytes", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
-            ("local_bytes_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            (
+                "registers_per_thread",
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS,
+            ),
+            (
+                "static_shared_bytes",
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+            ),
+            (
+                "local_bytes_per_thread",
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+            ),
         ):
             status, value = cuda.cuKernelGetAttribute(attribute, kernel, 0)
             if int(status) != 0:
@@ -2136,7 +2183,7 @@ def g0_range_resources(compiled, threads, shared_bytes):
         status, function = cuda.cuKernelGetFunction(kernel)
         if int(status) != 0:
             raise RuntimeError(f"failed to get kernel function: {status}")
-        status, = cuda.cuFuncSetAttribute(
+        (status,) = cuda.cuFuncSetAttribute(
             function,
             cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             shared_bytes,
@@ -2149,7 +2196,10 @@ def g0_range_resources(compiled, threads, shared_bytes):
         if int(status) != 0:
             raise RuntimeError(f"failed to query occupancy: {status}")
         values.update(
-            {"shared_storage_bytes": shared_bytes, "active_blocks_per_sm": active_blocks}
+            {
+                "shared_storage_bytes": shared_bytes,
+                "active_blocks_per_sm": active_blocks,
+            }
         )
         resources.append(values)
     if len(resources) != 1:

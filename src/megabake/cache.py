@@ -9,11 +9,11 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-import cutlass
 import torch
 
 from .graph import ComputeGraph
 from .plan import BodySelectionPlan, KernelPlan
+from .platform import cutlass
 from .runtime import L2_PREFETCH_BYTES, PHASE_TIMER_SLOTS
 
 if TYPE_CHECKING:
@@ -43,9 +43,7 @@ class PlanCache:
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
 
-    def get_or_compile(
-        self, key: str, compiler: Callable[[], Any]
-    ) -> PlanCacheResult:
+    def get_or_compile(self, key: str, compiler: Callable[[], Any]) -> PlanCacheResult:
         with self._lock:
             entry = self.entries.get(key)
             if entry is not None:
@@ -84,9 +82,7 @@ def make_plan_key(
 
 def _context_data(context: CaptureContext) -> dict[str, Any]:
     requirements = {
-        key: value
-        for key, value in context.requirements.items()
-        if key != "execution"
+        key: value for key, value in context.requirements.items() if key != "execution"
     }
     return {
         "mode": context.mode,
@@ -121,9 +117,7 @@ def _plan_data(
                 body.evidence.revision,
                 body.semantic.numerical_policy,
             )
-            for body in (
-                selected.body for selected in selection.selections
-            )
+            for body in (selected.body for selected in selection.selections)
         ),
     }
 

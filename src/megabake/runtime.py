@@ -5,15 +5,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
-import cutlass
 import torch
-from cuda.bindings import driver as cuda
-from cutlass import cute
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op
 
 from .memory import verify_plan
 from .plan import KernelPlan
+from .platform import cuda, cute, cutlass, dsl_user_op, llvm
 from .schedule import EventSchedule, simulate_event_schedule
 
 
@@ -152,7 +148,9 @@ def counting_grid_barrier(
     cute.arch.sync_threads()
     if thread == 0:
         counter = ready.iterator + workers + 1
-        cute.arch.red(counter, cutlass.Int32(1), op="add", dtype="s32", sem="release", scope="gpu")
+        cute.arch.red(
+            counter, cutlass.Int32(1), op="add", dtype="s32", sem="release", scope="gpu"
+        )
         target = (ordinal + cutlass.Int32(1)) * workers
         seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
         while seen < target:
@@ -354,7 +352,9 @@ def admit_runtime(plan: KernelPlan) -> RuntimeAdmission:
             f"plan architecture {plan.launch.architecture} does not match the current device"
         )
     if properties.multi_processor_count != target.multiprocessor_count:
-        raise InvalidRuntime("plan multiprocessor count does not match the current device")
+        raise InvalidRuntime(
+            "plan multiprocessor count does not match the current device"
+        )
     if not _cooperative_launch_supported():
         raise InvalidRuntime("the current device does not support cooperative launch")
 
@@ -418,10 +418,7 @@ def admit_event_runtime(schedule: EventSchedule) -> EventRuntimeAdmission:
     if any(event.trigger_count < 1 for event in schedule.events):
         raise InvalidRuntime("event plans require at least one producer per event")
     max_invocations = min(
-        (
-            _MAX_INT32 // event.trigger_count
-            for event in schedule.events
-        ),
+        (_MAX_INT32 // event.trigger_count for event in schedule.events),
         default=_MAX_INT32,
     )
     if max_invocations < 1:
@@ -449,19 +446,22 @@ def execute_event_plan(
     if _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for event plans")
     with torch.cuda.stream(active_stream):
-        selected_events = events if events is not None else torch.zeros(
-            selected_admission.event_count,
-            dtype=torch.int32,
-            device=device,
+        selected_events = (
+            events
+            if events is not None
+            else torch.zeros(
+                selected_admission.event_count,
+                dtype=torch.int32,
+                device=device,
+            )
         )
         if tuple(selected_events.shape) != (selected_admission.event_count,):
             raise InvalidRuntime("event tensor shape does not match the event plan")
         if selected_events.dtype != torch.int32 or selected_events.device != device:
-            raise InvalidRuntime("event tensor must be an int32 tensor on the stream device")
-        if (
-            epoch is not None
-            and not 0 <= epoch < selected_admission.max_invocations
-        ):
+            raise InvalidRuntime(
+                "event tensor must be an int32 tensor on the stream device"
+            )
+        if epoch is not None and not 0 <= epoch < selected_admission.max_invocations:
             raise InvalidRuntime("event epoch would overflow int32 counters")
         selected_epoch = 0 if epoch is None else epoch
         if events is not None and validate_counters:
@@ -472,7 +472,10 @@ def execute_event_plan(
                     )
             else:
                 for event in schedule.events:
-                    if selected_events[event.id].item() != selected_epoch * event.trigger_count:
+                    if (
+                        selected_events[event.id].item()
+                        != selected_epoch * event.trigger_count
+                    ):
                         raise InvalidRuntime(
                             f"event {event.id} counters do not match epoch {selected_epoch}"
                         )
@@ -502,6 +505,6 @@ def _cooperative_launch_supported() -> bool:
 
 def _stream_is_capturing(stream: torch.cuda.Stream) -> bool:
     status, capture = cuda.cuStreamIsCapturing(cuda.CUstream(stream.cuda_stream))
-    return int(status) == 0 and int(
-        capture
-    ) == int(cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE)
+    return int(status) == 0 and int(capture) == int(
+        cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE
+    )

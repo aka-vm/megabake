@@ -23,7 +23,8 @@ import time
 from pathlib import Path
 
 import torch
-from cuda.bindings import driver as cuda
+
+from megabake.platform import cuda
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -122,9 +123,7 @@ def _capture(function, inputs):
 
 
 def _relative_l2(actual, expected):
-    return (
-        (actual.float() - expected.float()).norm() / expected.float().norm()
-    ).item()
+    return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
 
 
 def _graph_ordered_inputs(compiled, inputs):
@@ -189,7 +188,9 @@ class _MegaBakeKernel:
         epoch = self.epoch
         self.epoch += self.stride
         # Table launches number their calls and stage per-call addresses.
-        return self.state.prepare_launch(self.executor, epoch, torch.cuda.current_stream())
+        return self.state.prepare_launch(
+            self.executor, epoch, torch.cuda.current_stream()
+        )
 
     def packed(self):
         return self.arguments()
@@ -203,7 +204,9 @@ class _MegaBakeKernel:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("artifacts/isolated/mlp.json"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("artifacts/isolated/mlp.json")
+    )
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 4, 256])
     parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--burst", type=int, default=32)
@@ -225,9 +228,9 @@ def main() -> None:
         "records": [],
     }
     for batch_size in arguments.batches:
-        source = torch.randn(
-            batch_size, 576, dtype=torch.bfloat16, device="cuda"
-        ) / (576**0.5)
+        source = torch.randn(batch_size, 576, dtype=torch.bfloat16, device="cuda") / (
+            576**0.5
+        )
         weights = tuple(
             torch.randn(rows, columns, dtype=torch.bfloat16, device="cuda")
             / (columns**0.5)
@@ -314,7 +317,9 @@ def main() -> None:
 
         for name, mode in modes.items():
             if not mode["relative_l2_error"] < 0.01:
-                raise RuntimeError(f"{name} relative L2 error {mode['relative_l2_error']}")
+                raise RuntimeError(
+                    f"{name} relative L2 error {mode['relative_l2_error']}"
+                )
 
         artifact = root / f"m{batch_size}-megabake-kernel"
         artifact.mkdir(parents=True, exist_ok=True)

@@ -15,12 +15,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-import cutlass
 import numpy as np
 import torch
-from cuda.bindings import driver as cuda
-from cutlass import cute
-from cutlass.cute.runtime import from_dlpack
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
@@ -46,6 +42,7 @@ from .plan import (
     search_plans,
 )
 from .planner import enumerate_body_selections
+from .platform import cuda, cute, cutlass, from_dlpack
 from .regions import form_regions
 from .runtime import (
     DYNAMIC_ADDRESS_RING,
@@ -76,7 +73,9 @@ def _source_location(operation: Any) -> str:
 
 def _semantic_diagnostic(graph: ComputeGraph) -> CompilerDiagnostic | None:
     unresolved = tuple(
-        operation for operation in graph.ops.values() if operation.tensor_program is None
+        operation
+        for operation in graph.ops.values()
+        if operation.tensor_program is None
     )
     if not unresolved:
         return None
@@ -224,7 +223,9 @@ def _uses_table_launch(graph: ComputeGraph) -> bool:
     if len(graph.ops) > _TABLE_LAUNCH_OPS:
         return True
     parameter_bytes = sum(
-        8 + 16 * len(value.shape) for value in graph.values.values() if value.shape is not None
+        8 + 16 * len(value.shape)
+        for value in graph.values.values()
+        if value.shape is not None
     )
     return parameter_bytes > _TABLE_LAUNCH_PARAMETER_BYTES
 
@@ -238,6 +239,8 @@ def _gemm_shapes(graph: ComputeGraph) -> tuple[tuple[int, int], ...]:
         and operation.tensor_program.family == "contraction"
         and len(operation.tensor_program.store.shape) == 2
     )
+
+
 # A measured candidate must match the captured reference within this
 # relative L2 error before it can be selected. Deep table-launched graphs
 # accumulate bf16 rounding differences: on the 30-layer pinned SmolLM the
@@ -291,7 +294,11 @@ class _TeacherForcedCheck:
             name: originals.get(id(value), value)
             for name, value in zip(placeholders, self.snapshot.inputs, strict=True)
         }
-        state = {name for name, value in inputs.items() if any(value is o for o in originals.values())}
+        state = {
+            name
+            for name, value in inputs.items()
+            if any(value is o for o in originals.values())
+        }
         by_name = {node.name: node for node in nodes}
         order = {node.name: index for index, node in enumerate(nodes)}
         for selected in plan.selection.selections:
@@ -307,7 +314,8 @@ def _region_failure(
     selected, values, inputs, state, by_name, order, module=None
 ) -> str | None:
     members = sorted(
-        (op_id.removeprefix("op:") for op_id in selected.source_op_ids), key=order.__getitem__
+        (op_id.removeprefix("op:") for op_id in selected.source_op_ids),
+        key=order.__getitem__,
     )
     env: dict[str, Any] = {}
 
@@ -330,7 +338,11 @@ def _region_failure(
             return tuple(parts)
         # Not materialized (a view of a materialized value, say): recompute it
         # with PyTorch from what the candidate did materialize.
-        if argument.op == "placeholder" or getattr(argument.target, "_schema", None) is not None and argument.target._schema.is_mutable:
+        if (
+            argument.op == "placeholder"
+            or getattr(argument.target, "_schema", None) is not None
+            and argument.target._schema.is_mutable
+        ):
             raise KeyError(f"{name} is not materialized")
         env[name] = evaluate(argument)
         return env[name]
@@ -356,7 +368,9 @@ def _region_failure(
         expected = env.get(name)
         if index and isinstance(expected, (tuple, list)):
             expected = expected[int(index)]
-        if not isinstance(actual, torch.Tensor) or not isinstance(expected, torch.Tensor):
+        if not isinstance(actual, torch.Tensor) or not isinstance(
+            expected, torch.Tensor
+        ):
             continue
         compared += 1
         if actual.shape != expected.shape:
@@ -407,9 +421,7 @@ def compile_post_grad(
 ) -> Callable[..., Any]:
     compile_started = time.perf_counter()
     if scheduler not in {"phase", "region-events", "auto"}:
-        raise ValueError(
-            "scheduler must be 'phase', 'region-events', or 'auto'"
-        )
+        raise ValueError("scheduler must be 'phase', 'region-events', or 'auto'")
     graph, selected_target = _post_grad_graph(prepared, target)
     if policy is not None and policy.mode != prepared.context.mode:
         raise ValueError(
@@ -511,14 +523,10 @@ def compile_post_grad(
                 chosen.selected,
                 chosen.selected_compiled,
                 tuple(
-                    candidate
-                    for labeled in choices
-                    for candidate in labeled.candidates
+                    candidate for labeled in choices for candidate in labeled.candidates
                 ),
                 tuple(
-                    rejection
-                    for labeled in choices
-                    for rejection in labeled.rejections
+                    rejection for labeled in choices for rejection in labeled.rejections
                 ),
                 any(labeled.budget_exhausted for labeled in choices),
                 chosen.selected_description,
@@ -619,9 +627,7 @@ def compile_post_grad(
     return forward
 
 
-def compile_inductor_fallback(
-    prepared: PreparedFX, reason: str
-) -> Callable[..., Any]:
+def compile_inductor_fallback(prepared: PreparedFX, reason: str) -> Callable[..., Any]:
     from torch._inductor.compile_fx import compile_fx
 
     graph = copy.deepcopy(prepared.graph)
@@ -734,7 +740,9 @@ def compile_plan(
             )
         )
     with torch.cuda.device(device):
-        artifact_dir = Path(output_dir) if output_dir is not None else Path("artifacts/generated")
+        artifact_dir = (
+            Path(output_dir) if output_dir is not None else Path("artifacts/generated")
+        )
         input_tensors = _input_tensors(plan.graph, example_inputs)
         event_schedule = (
             make_region_event_schedule(
@@ -954,7 +962,9 @@ def bind_callable(
         if name in compiled_kernel.parameter_names
     }
     runtime_positions = [
-        index for index in range(len(context.input_order)) if index not in parameter_positions
+        index
+        for index in range(len(context.input_order))
+        if index not in parameter_positions
     ]
     current_parameters = dict(parameter_tensors or {})
     # The most recent calls only; a decode loop would otherwise grow it forever.
@@ -1363,9 +1373,7 @@ def _isolated_kernel_samples(
             return arguments, arguments, arguments
         packed = compiled_kernel.compiled.generate_execution_args(*arguments)
         execution = (
-            packed[0]
-            if isinstance(packed, tuple) and len(packed) == 2
-            else packed
+            packed[0] if isinstance(packed, tuple) and len(packed) == 2 else packed
         )
         return execution, packed, arguments
 
@@ -1404,8 +1412,7 @@ def _graph_ordered_inputs(
     example_inputs: Sequence[Any],
 ) -> tuple[Any, ...]:
     positions = {
-        spec.name: position
-        for position, spec in enumerate(context.input_specs)
+        spec.name: position for position, spec in enumerate(context.input_specs)
     }
     ordered: list[Any] = [None] * len(example_inputs)
     for graph_name in compiled_kernel.input_order:
@@ -1459,7 +1466,9 @@ def _output_relative_l2(expected: Any, actual: Any) -> float:
         return float("inf")
     numerator = 0.0
     denominator = 0.0
-    for expected_value, actual_value in zip(expected_values, actual_values, strict=True):
+    for expected_value, actual_value in zip(
+        expected_values, actual_values, strict=True
+    ):
         if type(expected_value) is not type(actual_value):
             return float("inf")
         if not isinstance(expected_value, torch.Tensor):
@@ -1523,9 +1532,7 @@ def _target_facts(device: torch.device) -> TargetFacts:
 
 def _common_cuda_device(example_inputs: Sequence[Any]) -> torch.device:
     devices = {
-        value.device
-        for value in example_inputs
-        if isinstance(value, torch.Tensor)
+        value.device for value in example_inputs if isinstance(value, torch.Tensor)
     }
     if not devices or any(device.type != "cuda" for device in devices):
         raise UnsupportedCompiler("all captured tensor inputs must be CUDA tensors")
@@ -1652,7 +1659,9 @@ def _epoch_stride(compiled_kernel: CompiledKernel) -> int:
     )
 
 
-def _validate_data_indices(plan: KernelPlan, inputs: Mapping[str, torch.Tensor]) -> None:
+def _validate_data_indices(
+    plan: KernelPlan, inputs: Mapping[str, torch.Tensor]
+) -> None:
     """Check gather-index bindings; index ranges trap inside the generated body."""
     for selected in plan.selection.selections:
         for load in selected.program.loads:
@@ -1660,7 +1669,8 @@ def _validate_data_indices(plan: KernelPlan, inputs: Mapping[str, torch.Tensor])
                 if not isinstance(axis, DataIndex):
                     continue
                 index_load = next(
-                    candidate for candidate in selected.program.loads
+                    candidate
+                    for candidate in selected.program.loads
                     if candidate.id == axis.load_id
                 )
                 index_tensor = inputs.get(index_load.value_id)
@@ -1800,7 +1810,9 @@ def _with_worker_count(
             workers=(
                 _recompute_assignments(phase.region_id, phase.work_items, worker_count)
                 if phase.recompute
-                else _worker_assignments(phase.region_id, phase.work_items, worker_count)
+                else _worker_assignments(
+                    phase.region_id, phase.work_items, worker_count
+                )
             ),
             barrier=None
             if phase.barrier is None
@@ -1824,7 +1836,9 @@ def _with_worker_count(
     return replace(plan, phases=phases, storage=storage, launch=launch)
 
 
-def _recompute_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
+def _recompute_assignments(
+    region_id: str, work_items: Sequence[Any], worker_count: int
+):
     from .schedule import _recompute_assignments as assignments
 
     return assignments(region_id, tuple(work_items), worker_count)
@@ -1907,9 +1921,7 @@ class _RuntimeState:
         self._values_stale = False
         self.g0_tensors = g0_tensors
         self._normal_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
-        self._work_iterator_view_cache: dict[
-            str, tuple[tuple[Any, ...], Any]
-        ] = {}
+        self._work_iterator_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
         self._g0_view_cache: dict[
             int, tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...]]
         ] = {}
@@ -1920,7 +1932,9 @@ class _RuntimeState:
         self._phase_table: tuple[torch.Tensor, Any] | None = None
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
         # Phase scratch of table launches: FP32 elements and Int32 counters.
-        self._phase_scratch: tuple[tuple[torch.Tensor, Any], tuple[torch.Tensor, Any]] | None = None
+        self._phase_scratch: (
+            tuple[tuple[torch.Tensor, Any], tuple[torch.Tensor, Any]] | None
+        ) = None
         # Per-invocation TMA descriptors (three 128-byte maps per table GEMM),
         # rewritten by every call's kernel prologue.
         self._tma_descriptors: tuple[torch.Tensor, Any] | None = None
@@ -1944,7 +1958,9 @@ class _RuntimeState:
         self._prepared_calls = 0
         self._calls_run = 0
         # (bound views, the argument tuple, its stream handle)
-        self._table_argument_cache: tuple[tuple[Any, ...], tuple[Any, ...], int] | None = None
+        self._table_argument_cache: (
+            tuple[tuple[Any, ...], tuple[Any, ...], int] | None
+        ) = None
         # (arguments, packed execution arguments, what keeps them alive)
         self._packed_arguments: tuple[Any, Any, Any] | None = None
         self._work_iterator_views: tuple[Any, ...] | None = None
@@ -2016,7 +2032,9 @@ class _RuntimeState:
             return
         self._refresh_values(input_tensors)
 
-    def input_pointers(self, input_tensors: Mapping[str, torch.Tensor]) -> tuple[int, ...]:
+    def input_pointers(
+        self, input_tensors: Mapping[str, torch.Tensor]
+    ) -> tuple[int, ...]:
         """Data pointers of this call's graph inputs, in graph order."""
         rebind = self._table_rebind
         if rebind is not None and rebind.pointers is not None:
@@ -2038,7 +2056,9 @@ class _RuntimeState:
         again here, keeping this call's outputs, when something reads them."""
         if self._values_stale:
             self._values_stale = False
-            outputs = {value_id: self._values[value_id] for value_id in self._allocated_outputs}
+            outputs = {
+                value_id: self._values[value_id] for value_id in self._allocated_outputs
+            }
             self._refresh_values(self.input_tensors, reuse_outputs=outputs)
         return self._values
 
@@ -2068,9 +2088,7 @@ class _RuntimeState:
                 values[binding.value_id] = input_tensors[binding.value_id]
                 continue
             if binding.kind in {"alias", "output"}:
-                internal_alias = _internal_alias(
-                    binding.value_id, plan.graph, values
-                )
+                internal_alias = _internal_alias(binding.value_id, plan.graph, values)
                 if internal_alias is not None and binding.layout is not None:
                     alias_id, alias_tensor = internal_alias
                     values[binding.value_id] = alias_tensor.as_strided(
@@ -2128,9 +2146,7 @@ class _RuntimeState:
         self.input_tensors = input_tensors
         self._values = values
         self._values_stale = False
-        self.outputs = {
-            value_id: values[value_id] for value_id in plan.graph.outputs
-        }
+        self.outputs = {value_id: values[value_id] for value_id in plan.graph.outputs}
         if reuse_outputs is not None:
             # Diagnostic re-derivation keeps the fast path and its templates.
             return
@@ -2154,7 +2170,10 @@ class _RuntimeState:
         roots = [*inputs, self.workspace_base, *(self.values[v] for v in outputs)]
         index = {value_id: position for position, value_id in enumerate(graph.inputs)}
         index.update(
-            {value_id: len(inputs) + 1 + position for position, value_id in enumerate(outputs)}
+            {
+                value_id: len(inputs) + 1 + position
+                for position, value_id in enumerate(outputs)
+            }
         )
         workspace_ids = {
             binding.value_id
@@ -2303,11 +2322,7 @@ class _RuntimeState:
             self._cached_gemm_tensors(group_index, tensors)
             for group_index, tensors in enumerate(self.g0_tensors)
         )
-        g0_views = tuple(
-            view
-            for group in g0_view_groups
-            for view in group
-        )
+        g0_views = tuple(view for group in g0_view_groups for view in group)
         g0_names = [
             argument.name
             for argument in self.generated.launch.tensors
@@ -2318,10 +2333,7 @@ class _RuntimeState:
         arguments = []
         for name in self.generated.launch.arguments:
             if name == "ready":
-                if (
-                    self._ready_view is None
-                    or self._ready_view[0] is not self.ready
-                ):
+                if self._ready_view is None or self._ready_view[0] is not self.ready:
                     self._ready_view = (self.ready, _cute_view(self.ready))
                 arguments.append(self._ready_view[1])
             elif name == "workers":
@@ -2407,7 +2419,9 @@ class _RuntimeState:
                 )
             addresses = addresses[self._resolved_index]
         if self._dynamic_slot_indices is None:
-            self._dynamic_slot_indices = np.asarray(launch.dynamic_slots, dtype=np.int64)
+            self._dynamic_slot_indices = np.asarray(
+                launch.dynamic_slots, dtype=np.int64
+            )
         dynamic_slots = self._dynamic_slot_indices
         static_addresses = addresses.copy()
         static_addresses[dynamic_slots] = 0
@@ -2482,7 +2496,9 @@ class _RuntimeState:
             gemm_views = ()
         parts = (
             self._ready_view[1],
-            self._cached_view(self._normal_view_cache, "addresses", self._address_table),
+            self._cached_view(
+                self._normal_view_cache, "addresses", self._address_table
+            ),
             self._phase_table[1],
             self._work_iterator_views,
             self._dynamic_slot_table[1],
@@ -2684,13 +2700,20 @@ def _pack_arguments(compiled: Any, arguments: tuple[Any, ...]) -> tuple[Any, Any
         return None, None
     generated = compiled.generate_execution_args(*arguments)
     execution = (
-        generated[0] if isinstance(generated, tuple) and len(generated) == 2 else generated
+        generated[0]
+        if isinstance(generated, tuple) and len(generated) == 2
+        else generated
     )
     return execution, generated
 
 
 def _tensor_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
-    return (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+    return (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+    )
 
 
 def _validate_state_capacities(
@@ -2724,17 +2747,15 @@ def _workspace_view(base: torch.Tensor, assignment: Any) -> torch.Tensor:
                 requirement="dtype-aligned workspace slice",
             )
         )
-    storage = base.narrow(
-        0, assignment.offset_bytes, assignment.required_bytes
-    ).view(dtype)
+    storage = base.narrow(0, assignment.offset_bytes, assignment.required_bytes).view(
+        dtype
+    )
     return storage.as_strided(assignment.layout.shape, assignment.layout.strides)
 
 
 def _allocate(layout: Any, device: torch.device) -> torch.Tensor:
     dtype = getattr(torch, layout.dtype.removeprefix("torch."))
-    return torch.empty_strided(
-        layout.shape, layout.strides, dtype=dtype, device=device
-    )
+    return torch.empty_strided(layout.shape, layout.strides, dtype=dtype, device=device)
 
 
 def _boundary_alias(
