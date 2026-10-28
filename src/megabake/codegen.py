@@ -10,7 +10,7 @@ import textwrap
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from .bodies.gemm import (
+from .bodies.cuda.sm90.gemm import (
     HopperWgmmaGemmPersistentKernel,
     epilogue_loads,
     epilogue_source,
@@ -22,10 +22,10 @@ from .bodies.gemm import (
     split_k,
     table_gemm_shared_bytes,
 )
-from .bodies.cutlass_gemm import STREAM_TAG_SLOT
-from .bodies.attention import emit_attention_body
-from .bodies.blackwell import emit_blackwell_gemm
-from .bodies.generic import (
+from .bodies.cuda.sm90.cutlass_gemm import STREAM_TAG_SLOT
+from .bodies.cuda.sm90.attention import emit_attention_body
+from .bodies.cuda.sm100.gemm import emit_blackwell_gemm
+from .bodies.cuda.generic import (
     emit_contraction_body,
     emit_map_body,
     emit_reduction_body,
@@ -655,7 +655,7 @@ from cuda.bindings import driver as cuda
 from cutlass._mlir.dialects import llvm
 
 {runtime_import}
-from megabake.bodies.gemm import HopperWgmmaGemmPersistentKernel
+from megabake.bodies.cuda.sm90.gemm import HopperWgmmaGemmPersistentKernel
 
 {"\n\n".join(g0_definitions)}
 
@@ -1583,7 +1583,7 @@ def _emit_table_module(
     )
     phase_table_width = len(phase_table[0])
     gemm_import = (
-        "from megabake.bodies.gemm import (\n"
+        "from megabake.bodies.cuda.sm90.gemm import (\n"
         "    HopperWgmmaGemmPersistentKernel,\n"
         "    build_table_descriptors,\n"
         "    table_descriptors,\n"

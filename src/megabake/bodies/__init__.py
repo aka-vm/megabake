@@ -1,11 +1,11 @@
 from .catalog import get_candidates
-from .attention import (
+from .cuda.sm90.attention import (
     GeneratedAttentionBody,
     UnsupportedAttentionBody,
     emit_attention_body,
 )
-from .gemm import gemm_candidates
-from .generic import (
+from .cuda.sm90.gemm import gemm_candidates
+from .cuda.generic import (
     GeneratedContractionBody,
     GeneratedMapBody,
     GeneratedReductionBody,

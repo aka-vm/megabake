@@ -22,7 +22,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.gemm import (
+from .bodies.cuda.sm90.gemm import (
     TABLE_DESCRIPTORS_PER_GEMM,
     cute_gemm_tensors,
     is_swap_ab,

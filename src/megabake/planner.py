@@ -664,7 +664,7 @@ def _output_tile_shape(program: TensorProgram, body: BodyConfig) -> tuple[int, .
         # One tile per reduced row, as the reduction body runs: axes that only
         # the post-reduction expression reads (a norm's feature axis) span
         # the whole tile.
-        from .bodies.generic import reduced_row_axes
+        from .bodies.cuda.generic import reduced_row_axes
 
         row_axes = reduced_row_axes(program)
         output_axes = [

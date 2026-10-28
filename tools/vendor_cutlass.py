@@ -1,7 +1,7 @@
 """Show how MegaBake's CUTLASS GEMM fork differs from its pinned upstream file.
 
-``src/megabake/bodies/cutlass_gemm.py`` is the kernel MegaBake runs and edits
-directly. ``src/megabake/bodies/cutlass_upstream/`` keeps the upstream file
+``src/megabake/bodies/cuda/sm90/cutlass_gemm.py`` is the kernel MegaBake runs and edits
+directly. ``src/megabake/bodies/cuda/sm90/cutlass_upstream/`` keeps the upstream file
 unmodified, with its revision and SHA-256 in ``UPSTREAM``.
 
     .venv/bin/python tools/vendor_cutlass.py          # diff upstream -> fork
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BODIES = ROOT / "src" / "megabake" / "bodies"
+BODIES = ROOT / "src" / "megabake" / "bodies" / "cuda" / "sm90"
 UPSTREAM = BODIES / "cutlass_upstream"
 # Upstream file -> MegaBake's fork of it.
 FORKS = {"dense_gemm_persistent.py": BODIES / "cutlass_gemm.py"}

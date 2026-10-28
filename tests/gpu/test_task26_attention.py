@@ -7,7 +7,7 @@ import torch
 from torch.autograd import DeviceType
 
 from megabake import make_backend
-from megabake.bodies.attention import attention_scratch_rows
+from megabake.bodies.cuda.sm90.attention import attention_scratch_rows
 
 
 pytestmark = pytest.mark.skipif(

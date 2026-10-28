@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from math import prod
 from typing import Any, Mapping, Sequence
 
-from ..graph import DTYPE_BYTES
-from ..lowering import (
+from ...graph import DTYPE_BYTES
+from ...lowering import (
     AxisAffine,
     AxisIndex,
     DataIndex,
@@ -23,7 +23,7 @@ from ..lowering import (
     Unary,
     Where,
 )
-from .interface import BodyConfig, validate_body_config
+from ..interface import BodyConfig, validate_body_config
 
 
 @dataclass(frozen=True)

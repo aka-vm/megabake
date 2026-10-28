@@ -32,7 +32,7 @@ flowchart TD
 | Import | `graph.py` | `import_fx` into `ComputeGraph` (`Value`, `Op`, `Region`) |
 | Lowering | `lowering.py` | Tensor programs per primitive family; `UnsupportedLowering` names the gap |
 | Regions | `regions.py` | Semantic matchers (RMSNorm, RoPE, attention, gated MLP) and region formation |
-| Bodies | `bodies/` | `interface.py` contracts; `gemm.py` drives the Hopper TMA/WGMMA kernel in `cutlass_gemm.py`, a fork of the pinned CUTLASS file in `cutlass_upstream/` (`tools/vendor_cutlass.py` shows the diff); `attention.py`; `generic.py` map, reduction and contraction; `blackwell.py` correctness baseline |
+| Bodies | `bodies/` | Arch-neutral `interface.py` contracts and `catalog.py` provider registry. `cuda/generic.py`: map, reduction and contraction for any SM. `cuda/sm90/` (Hopper): `gemm.py` drives the TMA/WGMMA kernel in `cutlass_gemm.py`, a fork of the pinned CUTLASS file in `cutlass_upstream/` (`tools/vendor_cutlass.py` shows the diff); `attention.py`. `cuda/sm100/` (Blackwell, SM10x/SM12x): `gemm.py` warp-MMA correctness baseline |
 | Planning | `planner.py`, `plan.py` | Body selection, tile maps, bounded plan search |
 | Scheduling | `schedule.py` | Dependencies, phase schedule, event schedule, simulation |
 | Storage | `memory.py` | Lifetimes, workspace reuse, per-worker scratch, plan verification |

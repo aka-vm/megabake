@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from ..graph import DTYPE_BYTES, Region
-from .attention import AttentionBodyProvider
-from .gemm import G0RangeBodyProvider, _access_effects
-from .blackwell import BlackwellGemmProvider
+from .cuda.sm90.attention import AttentionBodyProvider
+from .cuda.sm90.gemm import G0RangeBodyProvider, _access_effects
+from .cuda.sm100.gemm import BlackwellGemmProvider
 from .interface import (
     BodyConfig,
     CandidateSet,

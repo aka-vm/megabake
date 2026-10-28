@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from ..graph import Region
-from ..lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
-from .generic import GeneratedContractionBody
-from .interface import (
+from ....graph import Region
+from ....lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
+from ..generic import GeneratedContractionBody
+from ...interface import (
     BodyConfig, CandidateSet, ParticipantContract, ProviderRejection, ResourceEvidence,
     SelectionPolicy, TargetFacts, TileContract, validate_body_config,
 )
@@ -60,7 +60,7 @@ class BlackwellGemmProvider:
                 or program.combine != Binary("add", acc, product, "torch.float32")
                 or program.post != Cast(acc, dtype, "round_nearest_even")):
             return reject("provider requires an unscaled FP32 accumulation and result cast")
-        from .catalog import _generic_config
+        from ...catalog import _generic_config
         base = _generic_config(region, program)
         return CandidateSet((replace(
             base,

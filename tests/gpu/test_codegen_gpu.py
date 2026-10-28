@@ -19,7 +19,7 @@ from megabake import (
     select_bodies,
 )
 from megabake.bodies import SelectionPolicy, TargetFacts
-from megabake.bodies.gemm import (
+from megabake.bodies.cuda.sm90.gemm import (
     compile_g0_range_gemm,
     cute_gemm_tensors,
     g0_range_body,

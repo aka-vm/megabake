@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from ..graph import Region
-from .interface import (
+from ....graph import Region
+from ...interface import (
     BodyConfig,
     CandidateSet,
     CompletionContract,
@@ -724,7 +724,7 @@ def _prologue_lines(
     (batch, sequence, head, dim) attention operand evaluated at (b,
     sequence, ``head``, d), rounded as the producer stores it, from the
     attention's own bindings."""
-    from .generic import _HOISTED_LOADS, _cast_expression, _emit_expression, _load_access
+    from ..generic import _HOISTED_LOADS, _cast_expression, _emit_expression, _load_access
 
     bindings = {load.value_id: index for index, load in enumerate(program.loads)}
     loads = tuple(prologue["loads"])

@@ -1398,7 +1398,7 @@ def _fold_small_intervals(
     only what it has written itself. A run does not fold if the receiving
     interval writes storage the run reads or writes.
     """
-    from .bodies.generic import single_cta_rounds
+    from .bodies.cuda.generic import single_cta_rounds
 
     graph = selection.graph
     threads = max(

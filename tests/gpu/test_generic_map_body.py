@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from megabake.bodies.catalog import get_candidates
-from megabake.bodies.generic import emit_map_body
+from megabake.bodies.cuda.generic import emit_map_body
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics

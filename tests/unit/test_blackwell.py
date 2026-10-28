@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megabake.bodies.blackwell import BlackwellGemmProvider
+from megabake.bodies.cuda.sm100.gemm import BlackwellGemmProvider
 from megabake.bodies import SelectionPolicy, validate_body_config
 from megabake.bodies.catalog import get_candidates
 from megabake.lowering import Constant

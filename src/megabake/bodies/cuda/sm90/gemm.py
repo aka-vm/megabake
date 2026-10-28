@@ -17,8 +17,8 @@ from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 
 from .cutlass_gemm import HopperWgmmaGemmPersistentKernel
 
-from ..graph import Region
-from .interface import (
+from ....graph import Region
+from ...interface import (
     BodyConfig,
     CandidateSet,
     CompletionContract,
@@ -168,7 +168,7 @@ def table_gemm_shared_bytes(tiles: Sequence[tuple[int, int]], capacity: int) -> 
 
 def plain_contraction(program) -> bool:
     """Whether ``program``'s result is its accumulator rounded once."""
-    from ..lowering import Accumulator, Cast
+    from ....lowering import Accumulator, Cast
 
     return (
         len(program.loads) == 2
@@ -180,7 +180,7 @@ def plain_contraction(program) -> bool:
 def paired_contraction(program) -> bool:
     """Whether ``program`` multiplies one left operand by two right operands
     (loads 1 and 2), its post reading accumulator 1 for the second."""
-    from ..lowering import Accumulator
+    from ....lowering import Accumulator
 
     def reads_second(expression) -> bool:
         if isinstance(expression, Accumulator):
@@ -203,7 +203,7 @@ def epilogue_source(program, symbol: str) -> str:
     """A CuTe function ``symbol(accumulator, accumulator_1, o0, o1,
     tensor_bindings)`` evaluating ``program.post`` at output (o0, o1), with
     ``tensor_bindings`` holding the tensors of ``epilogue_loads(program)``."""
-    from .generic import _cast_expression, _emit_expression
+    from ..generic import _cast_expression, _emit_expression
 
     loads = epilogue_loads(program)
     value = _cast_expression(
@@ -224,8 +224,8 @@ def epilogue_source(program, symbol: str) -> str:
 
 def _epilogue_rejection(program, policy: SelectionPolicy) -> str | None:
     """Why ``program``'s fused epilogue does not fit the GEMM, or None."""
-    from ..lowering import AxisAffine
-    from .generic import UnsupportedMapBody
+    from ....lowering import AxisAffine
+    from ..generic import UnsupportedMapBody
 
     if not (policy.table_launch and policy.table_gemm_swap_ab):
         return "fused epilogues run in swapAB table GEMMs, which store from registers"
@@ -419,7 +419,7 @@ def _bias_epilogue_rejection(program) -> str | None:
     The epilogue adds a contiguous BF16 bias over the output columns to the
     FP32 accumulators and rounds once, exactly ``post`` with alpha = beta = 1.
     """
-    from ..lowering import Accumulator, Binary, Cast, Load
+    from ....lowering import Accumulator, Binary, Cast, Load
 
     bias = program.loads[2]
     columns = program.store.shape[1]
@@ -687,7 +687,7 @@ def _g0_config(
         evidence=ResourceEvidence(
             measured=True,
             source=(
-                "src/megabake/bodies/gemm.py from NVIDIA CUTLASS; "
+                "src/megabake/bodies/cuda/sm90/gemm.py from NVIDIA CUTLASS; "
                 "experiments/g0_2026_10_09/resident_range.json"
             ),
             revision="0b55a2f691d69981583568fd9eb69687b1f0de8a",
