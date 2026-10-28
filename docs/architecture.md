@@ -1,6 +1,6 @@
 # MegaBake architecture
 
-**Revised 2026-10-22. Sections 1–8 describe the compiler as built. Section 9 is the target design from the [2026-10-18 gap report](docs/research/2026-10-18-megakernel-gap/report.md), revised by the [2026-10-22 HazyResearch comparison](docs/research/2026-10-22-hazy-megakernels/report.md). [ROADMAP.md](ROADMAP.md) has the measured state and the order of work. [north-star.md](north-star.md) fixes the scope.**
+**Revised 2026-10-22. Sections 1–8 describe the compiler as built. Section 9 is the target design from the 2026-10-18 megakernel gap analysis, revised by the 2026-10-22 HazyResearch comparison. [roadmap.md](roadmap.md) has the measured state and the order of work. [north-star.md](north-star.md) fixes the scope.**
 
 **Build a generic compiler that keeps fast device pipelines intact when it composes them into one kernel, and that wins where only one kernel can: tile-level dataflow, cross-op weight streaming, and work for idle SMs.**
 
@@ -8,7 +8,7 @@
 
 1. **The captured graph is the semantic reference.** Every fusion preserves guards, outputs, mutations, aliases and explicit casts.
 2. **Generic by meaning, not by name.** Coverage comes from primitive families and declared ops. A named matcher (RMSNorm, RoPE) is an optimization; when it misses, generic lowering must still compile the graph.
-3. **No model-keyed constants.** Tuning is keyed by device facts and problem shape, ranked by a cost model, and corrected by measurement. A constant fitted to one model or one GPU partition is a bug ([gap report §4](docs/research/2026-10-18-megakernel-gap/report.md#4-overfitting-confirmed)).
+3. **No model-keyed constants.** Tuning is keyed by device facts and problem shape, ranked by a cost model, and corrected by measurement. A constant fitted to one model or one GPU partition is a bug.
 4. **A device body keeps its pipeline.** The outer compiler composes tuned GEMM and attention pipelines; it never flattens them into scalar code.
 5. **Hand-written code holds only inner pipelines plus hook slots.** Norm variants, RoPE style, activations, biases and casts come from the graph and are compiled into hooks.
 6. **Evidence decides.** A claim names the workload, shapes, precision, GPU, baseline and method. The baseline is the strongest equivalent one, including CUDA graphs.
@@ -162,13 +162,11 @@ Under these sits a **device-keyed cost model**: `TargetFacts` gains L2 size, ban
 
 | System | Take | Leave |
 | --- | --- | --- |
-| Mirage MPK (`agent_space/mirage`) | Event counters and gcd/lcm grouping, acquire polling, swapAB, epilogue tasks (`linear_with_residual`), cross-task preload, `primitives.py` helpers | Per-model builders, hard-coded task counts, the superoptimizer, the scheduler/worker split |
-| HazyResearch Megakernels (`agent_space/Megakernels`; `mk-v2*` branches) | Persistent loader/consumer/storer roles, shared-memory pages handed from op to op, per-head/per-chunk/last-KV-block counters, mk-v2's typed 256-byte instruction struct and host-derived RAW/WAR barriers, constexpr-gated timing slots | The generic opcode interpreter (deleted from ThunderKittens main in TK 2.0), hand-written `release_lid` tables and literal barrier counts, per-token host counter resets, exact-equality waits, the DAG scheduler with ready times commented out |
-| ThunderKittens 2.0 (`agent_space/ThunderKittens`) | Elected single-thread issuers, packed phase-bit fields, mbarrier waits with memory clobbers (fixed 2026-09) | Sixteen thin consumer warps (2026 kernels use fewer, fatter consumers); LCF/LCSF callback templates |
+| Mirage MPK | Event counters and gcd/lcm grouping, acquire polling, swapAB, epilogue tasks (`linear_with_residual`), cross-task preload, `primitives.py` helpers | Per-model builders, hard-coded task counts, the superoptimizer, the scheduler/worker split |
+| HazyResearch Megakernels (`mk-v2*` branches) | Persistent loader/consumer/storer roles, shared-memory pages handed from op to op, per-head/per-chunk/last-KV-block counters, mk-v2's typed 256-byte instruction struct and host-derived RAW/WAR barriers, constexpr-gated timing slots | The generic opcode interpreter (deleted from ThunderKittens main in TK 2.0), hand-written `release_lid` tables and literal barrier counts, per-token host counter resets, exact-equality waits, the DAG scheduler with ready times commented out |
+| ThunderKittens 2.0 | Elected single-thread issuers, packed phase-bit fields, mbarrier waits with memory clobbers (fixed 2026-09) | Sixteen thin consumer warps (2026 kernels use fewer, fatter consumers); LCF/LCSF callback templates |
 | CUDA graphs + PDL Llama-1B baseline ([megakernels-vs-cuda-graphs](https://github.com/msaroufim/megakernels-vs-cuda-graphs) `llama/kernels/`) | One CTA per two output rows for batch-1 projections; weights loaded before the dependency wait (PDL); weights repacked once for wide loads; norm, RoPE and the KV write in the QKV epilogue; decode attention that never splits short contexts; the whole decode loop in one graph | Hand-written per-layer fusion modes, Llama-1B constants, Triton attention recompiled per position |
-| Inferact TPU megakernels (`agent_space/tpu-megakernels`) | One continuous weight stream across op and layer boundaries (bank ring) | Per-architecture decode functions, TPU layouts |
-| vLLM (`agent_space/vllm`) | Declared custom ops for stateful mixers; the structure of its fused DeepSeek kernels | eps and hidden-size gates in fusion patterns |
-| Inductor (`agent_space/pytorch`) | Primitive-family coverage, decompositions, device-keyed autotune tables | — |
+| Inferact TPU megakernels | One continuous weight stream across op and layer boundaries (bank ring) | Per-architecture decode functions, TPU layouts |
+| vLLM | Declared custom ops for stateful mixers; the structure of its fused DeepSeek kernels | eps and hidden-size gates in fusion patterns |
+| Inductor | Primitive-family coverage, decompositions, device-keyed autotune tables | — |
 | CUTLASS CuTe, DeepGEMM, FBGEMM | GEMM mechanics; targeted references for a measured gap | Host APIs; they add launches |
-
-The [gap report](docs/research/2026-10-18-megakernel-gap/report.md) and its `results/*.json` files have the source citations; the [HazyResearch comparison](docs/research/2026-10-22-hazy-megakernels/report.md) cites the Hazy repos and blogs. Earlier design documents are in [docs/history/](docs/history/).

@@ -1,6 +1,6 @@
 # MegaBake roadmap
 
-**Updated 2026-10-27 (flash-decoding attention, part of step 11); steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the [2026-10-18 megakernel gap report](docs/research/2026-10-18-megakernel-gap/report.md); the 2026-10-20/21 measurements below supersede the report's estimates where they disagree. Steps R0–R3 come from the [2026-10-22 HazyResearch comparison](docs/research/2026-10-22-hazy-megakernels/report.md) (updated 2026-10-22). The external Llama-3.2-1B comparison (2026-10-23) follows step 3.**
+**Updated 2026-10-27 (flash-decoding attention, part of step 11); steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the 2026-10-18 megakernel gap analysis; the 2026-10-20/21 measurements below supersede its estimates where they disagree. Steps R0–R3 come from the 2026-10-22 HazyResearch comparison. The external Llama-3.2-1B comparison (2026-10-23) follows step 3.**
 
 Where we are, in three lines:
 
@@ -150,7 +150,7 @@ Their protocol uses a 32-token prompt, 127 decode steps captured in one CUDA gra
 
 ## Next: runtime structure (R0–R3, from the 2026-10-22 HazyResearch comparison)
 
-The [report](docs/research/2026-10-22-hazy-megakernels/report.md) has the evidence. Gains are qualitative, not measured. The only measured bounds are: barrier release ~11% of the 135M span; four GEMM intervals per layer at ~3–4 µs, mostly pipeline fill; and Hazy's 10.2 → 3.4 µs inter-instruction gap from cross-op pipelining. Every A/B runs against the inert-code control.
+Gains are qualitative, not measured. The only measured bounds are: barrier release ~11% of the 135M span; four GEMM intervals per layer at ~3–4 µs, mostly pipeline fill; and Hazy's 10.2 → 3.4 µs inter-instruction gap from cross-op pipelining. Every A/B runs against the inert-code control.
 
 | # | Step | Addresses | Effort | Done when |
 |---:|---|---|---|---|
