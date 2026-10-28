@@ -16,7 +16,7 @@ from megabake.bodies import (
     validate_body_config,
 )
 from megabake.bodies.catalog import get_candidates
-from megabake.bodies.gemm import gemm_candidates
+from megabake.bodies.cuda.sm90.gemm import gemm_candidates
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.graph import Region
@@ -490,7 +490,7 @@ def test_emit_map_body_binds_each_load_once():
 def test_swap_ab_serves_small_m_launches_with_transposed_tiles():
     from types import SimpleNamespace
 
-    from megabake.bodies.gemm import is_swap_ab, kernel_tile, wants_swap_ab
+    from megabake.bodies.cuda.sm90.gemm import is_swap_ab, kernel_tile, wants_swap_ab
 
     assert wants_swap_ab([(4, 2048), (4, 8192), (4, 49152)])
     assert wants_swap_ab([(16, 576)])

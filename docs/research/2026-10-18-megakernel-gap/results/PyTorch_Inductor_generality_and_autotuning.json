@@ -1,0 +1,277 @@
+{
+  "name": "PyTorch Inductor generality and autotuning",
+  "scope": "Static read of agent_space/pytorch/torch/_inductor at commit e188cec4 (2026-10-03): IR kinds (ir.py), lowering and decomposition tables (lowering.py, decomposition.py), scheduler fusion (scheduler.py fuse_nodes / get_possible_fusions / score_fusion / speedup_by_fusion), the overridable policy object InductorChoices (choices.py), template autotuning (select_algorithm.py AlgorithmSelectorCache, kernel/mm.py tuned_mm, heuristics/template/triton.py per-device config heuristics and the heuristics/registry.py device-keyed lookup), runtime pointwise/reduction config generation and coordinate descent (runtime/triton_heuristics.py, runtime/coordinate_descent_tuner.py), combo kernels (scheduler.create_combo_kernel_nodes, codegen/triton_combo_kernel.py), CUDA graph trees (cudagraph_trees.py), learned heuristics (autoheuristic/) and offline lookup tables (lookup_table/). Contrasted with MegaBake src/megabake/{lowering.py, regions.py, planner.py, plan.py, compiler.py, schedule.py, bodies/gemm.py, bodies/attention.py, bodies/interface.py, buckets.py} plus ROADMAP.md, PERFORMANCE_REPORT.md and artifacts/full_model_2026-10-18/*/report.json. Question answered: what does a 'generic compiler for generic hardware' look like in practice (Inductor as the yardstick), where are MegaBake's choices fixed constants or named-pattern matchers where Inductor uses device queries, cost scoring, enumeration plus benchmarking and caches, and which of Inductor's mechanisms translate (or translate better) to a single persistent megakernel.",
+  "key_sources": [
+    "agent_space/pytorch/torch/_inductor/ir.py:1090 (Loops), 1252 (Pointwise), 1293 (Scatter), 1431 (Reduction), 3023 (Scan), 3242 (Sort), 5641 (ComputedBuffer), 6111 (TemplateBuffer), 6519 (MultiTemplateBuffer), 7307 (ExternKernel), 9686 (FallbackKernel), 11299 (InvokeSubgraph), 11724 (WhileLoop), 4907/4915 (FixedLayout/FlexibleLayout)",
+    "agent_space/pytorch/torch/_inductor/lowering.py:538 (register_lowering), 734 (make_pointwise), 2807 (fallback_handler), 2956 (make_fallback)",
+    "agent_space/pytorch/torch/_inductor/decomposition.py:68 (inductor_decompositions), 117 (decompositions = core_aten_decompositions + inductor), 1196 (select_decomp_table)",
+    "agent_space/pytorch/torch/_inductor/scheduler.py:7048-7080 (fuse_nodes: up to 10 rounds), 7360 (speedup_by_fusion, benchmark_fusion), 8273 (fuse_nodes_once), 8484 (create_combo_kernel_nodes), 8913-8970 (get_possible_fusions grouped by shared buffer, sorted by score), 9050 (can_fusion_increase_peak_memory), 11278 (score_fusion_memory), 12806 (speedup_by_combo_kernel)",
+    "agent_space/pytorch/torch/_inductor/choices.py:120 (InductorChoices overridable policy), 460 (should_use_cooperative_reduction), 482 (should_use_persistent_reduction), 549 (_inner_reduction_no_split_threshold, GB200-tuned 32768/40960), 572-665 (reduction_split_factor from SM count, max_threads_per_SM, warp_size), 668-735 (can_fuse), 748 (can_fuse_horizontal), 770-833 (score_fusion: template/node-type/memory/proximity)",
+    "agent_space/pytorch/torch/_inductor/select_algorithm.py:4105 (AlgorithmSelectorCache(PersistentCache)), 4177-4400 (__call__: precompile, cache key = inputs+device, MultiTemplateBuffer deferral for benchmark fusion), 4562 (do_autotuning), 5449 (benchmark_choices)",
+    "agent_space/pytorch/torch/_inductor/kernel/mm.py:591-816 (tuned_mm: aten, triton mm, decompose_k, persistent TMA, Blackwell WS TMA, CUTLASS, CK, FlyDSL, NV universal GEMM, CPP all appended as choices)",
+    "agent_space/pytorch/torch/_inductor/heuristics/registry.py:46-57 (cascading (name, device, op) lookup)",
+    "agent_space/pytorch/torch/_inductor/heuristics/template/triton.py:419-462 (base mm_configs and exhaustive product space), 1033-1106 (_scale_mm_configs: clamp tiles to next_pow2 of M/N/K hints), 1145-1203 (shared-memory pruning via get_device_properties.shared_memory_per_block_optin), 1205-1232 (register-spill pruning via warp_size), 1456-1520 (CUDAConfigHeuristic: per-arch flex tables sm_120/sm_100/h100/a100), 2440-2560 (config generator, ROCm origami C++ perf model), 2978 (BlackwellTMATemplateConfigMixin), 3400-3583 (register_template_heuristic per template x device)",
+    "agent_space/pytorch/torch/_inductor/utils.py:3187-3206 (use_decompose_k_choice: K >= 32*M and K >= 32*N), 3234-3239 (get_k_splits 'Hand-tuned' [16,32,64,128,256])",
+    "agent_space/pytorch/torch/_inductor/runtime/hints.py:217-265 (DeviceProperties: SM count, cc, regs/SM, threads/SM, warp size)",
+    "agent_space/pytorch/torch/_inductor/runtime/triton_heuristics.py:3949-4030 (triton_config block growth from size hints), 4614 (pointwise), 4747 (_reduction_configs), 2332-2360 (coordinate_descent_tuning)",
+    "agent_space/pytorch/torch/_inductor/runtime/coordinate_descent_tuner.py:1-60 (CoordescTuner: tune one field at a time)",
+    "agent_space/pytorch/torch/_inductor/codegen/triton_combo_kernel.py:412 (horizontal_partition), 447-470 (sequential pid_offset dispatch), 584-591 (round-robin dispatch), 876 (select_dispatch_strategy)",
+    "agent_space/pytorch/torch/_inductor/cudagraph_trees.py:1-30 (design: shared memory pool, tree of graphs, liveness checks), 2405 (CUDAGraphTreeManager)",
+    "agent_space/pytorch/torch/_inductor/config.py:570-576 (max_autotune flags default off), 695 (max_autotune_gemm_backends), 772 (search space DEFAULT/EXHAUSTIVE), 833-838 (autotune cache, subproc), 862 (coordinate_descent_tuning), 1034 (benchmark_fusion), 1066 (score_fusion_memory_threshold=10), 1109 (max_fusion_size=64), 1203-1248 (combo_kernels default False, max 8 nodes, 250 args, 5% peak-memory gate), 2148 (cudagraph_trees=True), 2492-2502 (decompose_k splits/threshold)",
+    "agent_space/pytorch/torch/_inductor/lookup_table/README.md (offline per-shape/per-device template table bypassing autotune)",
+    "agent_space/pytorch/torch/_inductor/autoheuristic/artifacts/_MMRankingH100.py, _MMRankingA100.py, _PadMMH200.py (learned, device-named decision trees)",
+    "src/megabake/compiler.py:205-223 (_TABLE_LAUNCH_OPS=1000, _TABLE_LAUNCH_PARAMETER_BYTES=24000), 236-248 (L2 error limits citing SmolLM), 412-431 (policy derivation; table launch forces SearchBudget(max_plans=1, max_compilations=1)), 1174 (_make_plan_evaluator: compiles and times whole megakernel per plan), 1506-1517 (_target_facts; max_registers_per_thread=255 hard-coded)",
+    "src/megabake/bodies/interface.py:13-23 (TargetFacts: no L2 size, bandwidth, clock, regs/SM), 26-50 (SelectionPolicy table_gemm_* knobs)",
+    "src/megabake/bodies/gemm.py:1711 (TABLE_GEMM_SHARED_BYTES fixed 64x64x64 x8 stages), 1829-1832 (N,K multiples of 64), 1847-1850 (sm90a only), 1852-1882 (one candidate per GEMM in table launch; non-table only 64x64/13 stages and 64x128/8 stages with literal 230_400/214_016 smem bytes), 1893-1905 (SWAP_AB_MAX_ROWS=64, SWAP_AB_ROW_TILES, SPLIT_K_MAX=16, comment cites 60 SMs), 1908-1919 (split_k_count)",
+    "src/megabake/bodies/attention.py:260-267 (ATTENTION_SCRATCH_ROWS=16, 32 KiB, _VALUE_BLOCK/_VALUE_UNROLL=8), 422-423 (DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64)",
+    "src/megabake/schedule.py:1383-1386 (_FOLD_* limits), 1378 (workers = min(work, SMs*active_blocks))",
+    "src/megabake/regions.py:147-191 (_fusion_candidates: scalar chain + named matchers), 501 (_rms_norm_candidates), 822-1010 (RoPE matchers), 1292 (attention matcher), 2159 (_gated_mlp_candidate, SiLU only, returns first match), 2294 (_decomposed_silu_operations)",
+    "src/megabake/lowering.py:2093-2490 (LOWERERS: hand-written per-ATen-op table), 2497 (CANONICAL_TARGETS)",
+    "src/megabake/planner.py:500-510 (_body_cost static resource cost), src/megabake/plan.py:286-291 (SearchBudget max_plans=8), 423-512 (search_plans; worker variants full, /2, /4), 698-708 (_TIE_TOLERANCE, ranking by isolated launch time)",
+    "src/megabake/buckets.py:38 (DEFAULT_BUCKETS 16..512)",
+    "artifacts/full_model_2026-10-18/{HuggingFaceTB--SmolLM-135M,HuggingFaceTB--SmolLM-1.7B,Qwen--Qwen2-0.5B,Qwen--Qwen3.5-0.8B}/report.json; benchmarks/full_model.py:148 (Inductor baseline uses mode='reduce-overhead', not max-autotune)",
+    "ROADMAP.md:33,49-51 (Inductor coverage contrast), 126 (split-K target), 182 (decode GPU time), 219 (prefill 3-21x slower); PERFORMANCE_REPORT.md:41-89, 278-288 (GEMM scratch summing, one CTA per SM)",
+    "https://pytorch.org/blog/pytorch-2-paper-tutorial/ (PyTorch 2 ASPLOS 2024: 2.27x inference / 1.41x training geomean on A100)",
+    "https://pytorch.org/assets/pytorch2-2.pdf (PyTorch 2 paper)",
+    "https://pytorch.org/?p=61766 (PyTorch blog on Inductor GEMM autotuning backends: Triton, CUTLASS, cuBLAS, CuteDSL)",
+    "https://docs.pytorch.org/docs/main/user_guide/torch_compiler/torch.compiler_inductor_profiling.html (max-autotune benchmarks more triton.Configs)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "Small closed IR: about six node kinds cover all of core ATen",
+      "how_it_works": "Every lowering produces Pointwise/Reduction/Scan/Sort/Scatter (Loops subclasses holding an inner_fn closure over symbolic indices, ranges and dtype), a TemplateBuffer (GEMM/conv/attention templates with epilogue/prologue hooks), or an ExternKernel/FallbackKernel (call into ATen or a library). Layouts start Flexible and get frozen (FixedLayout) only when a consumer needs strides, so layout is a decision made late, not by the frontend. Control flow is InvokeSubgraph/Conditional/WhileLoop. Anything without a lowering falls back to make_fallback, so coverage never fails; it just loses fusion.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/ir.py:1090-3242, 4907-4915, 6111, 7307, 9686, 11299, 11724; lowering.py:538, 734, 2807, 2956"
+    },
+    {
+      "idea": "Decompositions shrink the op set before lowering",
+      "how_it_works": "decomposition.py merges core_aten_decompositions() with Inductor-specific ones (e.g. softmax, layer/rms norm, addmm variants, silu) into one table. AOTAutograd applies it during tracing, so the lowering layer only sees primitives that map onto the six IR kinds. select_decomp_table can swap tables per config.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/decomposition.py:68, 117, 1196"
+    },
+    {
+      "idea": "Generic fusion by shared-buffer scoring, with no named patterns",
+      "how_it_works": "The scheduler groups nodes by the buffers they use, tries all pairs inside each group (bounded by max_fusion_buffer_group_pairwise_attempts) and checks legality with can_fuse: same iteration group or a compatible tiling, no cycle, no peak-memory increase, at most 64 nodes, unique I/O limits. It then sorts candidates by FusionScore (template epilogue first, then same node type, then bytes saved, then graph proximity) and applies them greedily, up to 10 rounds until nothing changes. RMSNorm, RoPE and SwiGLU emerge from this generic process and need no matcher. Policy lives in an overridable InductorChoices object, so users can change it without forking.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/scheduler.py:7048-7080, 8913-8970, 9050, 11278; choices.py:668-833; config.py:1066, 1109"
+    },
+    {
+      "idea": "Benchmark-verified fusion (benchmark_fusion / benchmark_epilogue_fusion)",
+      "how_it_works": "When enabled, speedup_by_fusion compiles the fused kernel and the unfused pair, times both, and keeps the fusion only if it is faster. For templates, autotuning returns a MultiTemplateBuffer with all choices still open, so the GEMM config is chosen jointly with its epilogue. A config that wins alone can lose once the epilogue is fused.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/scheduler.py:7360-7700, 7096; select_algorithm.py:4330-4380; config.py:1034, 1092"
+    },
+    {
+      "idea": "Template autotuning: enumerate choices across backends, prune by device limits, benchmark, cache",
+      "how_it_works": "tuned_mm gathers choices from aten/cuBLAS, Triton mm, persistent TMA (Hopper), warp-specialized TMA (Blackwell), decompose-K, CUTLASS, CK, CuteDSL/NV universal GEMM and CPP. Each template asks a device-keyed heuristic, looked up as (template, device, op) with cascading fallback, for configs. The base list is about 21 (BM,BN,BK,stages,warps) tuples, or a 5^3x5x3 product in EXHAUSTIVE mode. _scale_mm_configs clamps each tile to next_pow2(M/N/K hint). Configs that exceed shared_memory_per_block_optin or must spill registers (BM*BN/(warps*warp_size) > 255) are pruned using get_device_properties. AlgorithmSelectorCache precompiles in parallel, benchmarks with random inputs (optionally in a subprocess or under CUDA graphs) and stores the winner in a local and remote cache keyed by input sizes, strides, dtype and device. With default flags, Inductor uses aten/cuBLAS.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/kernel/mm.py:591-816; heuristics/registry.py:46-57; heuristics/template/triton.py:419-462, 1033-1106, 1145-1232; select_algorithm.py:4105-4400, 4562, 5449; config.py:570-576, 695, 772, 833-838"
+    },
+    {
+      "idea": "Config derived from device properties rather than model identity",
+      "how_it_works": "DeviceProperties.create records SM count, compute capability, regs/SM, threads/SM and warp size. reduction_split_factor computes RSPLIT from num_sm*max_threads_per_sm and the number of outputs ('don't split if numel >= 2*num_sm'). The cooperative/persistent reduction choice uses numel thresholds. triton_config grows XBLOCK/YBLOCK from size hints to a target element count. Shared-memory and register pruning use the device's opt-in limits. Inductor still carries hand-tuned per-arch tables (h100/a100/sm_100/sm_120 flex configs, a GB200-tuned split threshold, 'hand-tuned' decompose-K splits, H100/A100/H200 learned AutoHeuristic trees). These are starting points that autotuning then corrects; they are not the final answer.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/runtime/hints.py:217-265; choices.py:460-665; runtime/triton_heuristics.py:3949-4030, 4747; heuristics/template/triton.py:1456-1520; utils.py:3234-3239; autoheuristic/artifacts/"
+    },
+    {
+      "idea": "Runtime autotuning of generated pointwise/reduction kernels plus coordinate descent",
+      "how_it_works": "Each generated Triton kernel carries a small list of candidate configs (block sizes, warps, stages) built from size hints. CachingAutotuner benchmarks them on first call and caches the winner. With coordinate_descent_tuning it then walks one field at a time (XBLOCK, RBLOCK, num_warps, num_stages), doubling or halving while the time improves. max_autotune_pointwise widens the list. Optional multi_kernel compiles persistent and non-persistent reduction variants and picks one at runtime.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/runtime/triton_heuristics.py:2332-2360, 4614, 4747, 5256; runtime/coordinate_descent_tuner.py:1-60; choices.py:482-547"
+    },
+    {
+      "idea": "Split-K as an autotune choice (decompose_k), gated by shape",
+      "how_it_works": "When K >= 32*M and K >= 32*N, tuned_mm adds a decompose_k subgraph choice: a bmm over K splits from [16,32,64,128,256] followed by a sum reduction. It competes in benchmarking, and the regular mm template is still added unless K >= 64*M,N. This never fires for decode projections where N >= K/32, so Inductor relies on cuBLAS's internal split-K/stream-K heuristics for skinny-M GEMMs.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/utils.py:3187-3239; kernel/mm.py:723-756; config.py:2492-2502"
+    },
+    {
+      "idea": "Combo kernels (horizontal fusion of independent nodes)",
+      "how_it_works": "After vertical fusion, create_combo_kernel_nodes groups independent same-stream nodes with no data dependence, up to 8 nodes, 250 args and 64 nodes apart in schedule order, and optionally gated on a peak-memory increase of at most 5%. It then emits one Triton kernel whose program-id space is partitioned. Sequential dispatch gives subkernel i pids [offset_i, offset_{i+1}); round-robin dispatch uses pid % num_kernels. speedup_by_combo_kernel can benchmark the combo against the separate kernels. The feature is off by default and only covers Triton-generated kernels, not templates or extern GEMMs.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/scheduler.py:8484-8560, 12806; codegen/triton_combo_kernel.py:412-591, 876; config.py:1203-1248"
+    },
+    {
+      "idea": "CUDA graph trees: removing launch overhead in a multi-kernel world",
+      "how_it_works": "Each compiled graph is recorded as a CUDA graph in one memory pool shared across a tree of graphs, so that A->B and A->B' can both replay using max(mem) rather than the sum. The manager checkpoints allocator state so it can switch from replay to record. It tracks whether outputs of earlier graphs are still alive and re-records when they are, and copies non-static inputs into static buffers. Mutated inputs (e.g. KV caches) and CPU sync disable it. This is why the MegaBake benchmark's 'reduce-overhead' Inductor decode baseline runs without graphs.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/cudagraph_trees.py:1-30, 2405; config.py:2148; PERFORMANCE_REPORT.md:26"
+    },
+    {
+      "idea": "Offline knowledge: lookup tables, learned heuristics, remote autotune cache",
+      "how_it_works": "lookup_table lets a deployment ship per-(op, shapes, device) template choices that bypass enumeration, with device-agnostic keys optional. AutoHeuristic collects autotune results and trains decision trees (shipped for A100/H100/H200) that predict the best choice without benchmarking. The remote autotune cache shares benchmark winners across machines. All three are keyed by device and shape, never by model name.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/lookup_table/README.md; autoheuristic/autoheuristic.py; autoheuristic/artifacts/_MMRankingH100.py; config.py:154-166"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "Small closed IR: about six node kinds cover all of core ATen",
+      "status": "partial",
+      "evidence": "src/megabake/lowering.py:2093-2490 (LOWERERS, hand-written per ATen op); ROADMAP.md:33 ('covers 67 ops'); TensorProgram families elementwise/copy/reduction/gather/concat/contraction/attention",
+      "notes": "MegaBake's TensorProgram families are close to Inductor's IR kinds (affine loads plus a scalar combine expression), but entries are added one ATen op at a time, and there is no per-op extern fallback inside the kernel, only a whole-invocation fallback='inductor'. Inductor's layouts are flexible until frozen; MegaBake's GEMM provider requires a fixed K-major BF16 layout (bodies/gemm.py:1834-1845)."
+    },
+    {
+      "idea": "Decompositions shrink the op set before lowering",
+      "status": "partial",
+      "evidence": "Capture goes through AOT/Inductor post-grad FX (ROADMAP.md:11), so Inductor's decompositions already ran; ROADMAP.md:72 'Use Inductor's decomposition table to reach these families' is still a plan",
+      "notes": "MegaBake inherits decomposed graphs (e.g. decomposed SiLU is handled by regions.py:2294) but does not control the decomposition table to target its own family set."
+    },
+    {
+      "idea": "Generic fusion by shared-buffer scoring, with no named patterns",
+      "status": "partial",
+      "evidence": "src/megabake/regions.py:147-191: generic scalar_chain vector fusion plus named matchers _rms_norm_candidates (501), _rope_candidates (822-1010), _attention_candidates (1292), _gated_mlp_candidate (2159, SiLU only, returns the first match); schedule.py:1383-1386 interval folding",
+      "notes": "Elementwise chains fuse generically. Norm, RoPE, gated MLP and attention fuse only through structural pattern matchers. PERFORMANCE_REPORT.md:54 records the RMSNorm matcher silently not firing on the real HF op order until it was patched. Inductor's score-based scheduler would have fused it without a matcher. MegaBake has no cost-scored fusion of reductions with their producers or consumers, and no epilogue fusion of arbitrary pointwise into the GEMM beyond bias (ROADMAP item 3 / PERFORMANCE_REPORT.md:87)."
+    },
+    {
+      "idea": "Benchmark-verified fusion (benchmark_fusion / benchmark_epilogue_fusion)",
+      "status": "missing",
+      "evidence": "regions.py selects candidates; planner.py:500-510 _body_cost is a static threads*regs+scratch-fusion_saved_bytes heuristic; plan.py search measures whole kernels only, and that is disabled for table launch (compiler.py:429-431)",
+      "notes": "No per-fusion A/B timing. Barrier-interval folding (schedule.py:1386-) is also unmeasured; its thresholds are fixed constants."
+    },
+    {
+      "idea": "Template autotuning: enumerate choices across backends, prune by device limits, benchmark, cache",
+      "status": "partial",
+      "evidence": "plan.py:286-291, 423-512 (search_plans with SearchBudget max_plans=8, measured via compiler.py:1174); but compiler.py:429-431 sets SearchBudget(max_plans=1, max_compilations=1) for every table-launched graph (all real models), and bodies/gemm.py:1852-1882 returns exactly ONE GEMM candidate per region under table launch: (64,64) tile, 8 stages, or swapAB (16|32|64, 64)",
+      "notes": "The machinery exists (candidate enumeration, legality, resource projection, measured ranking, a plan cache), but on the real models it never runs, so every projection of every model gets the same tile. The granularity is also wrong for scaling: each candidate is a full megakernel compile (tens of seconds; summary.json shows 68 s compile+first call), where Inductor benchmarks each op in isolation. Shared-memory sizing is a literal constant (TABLE_GEMM_SHARED_BYTES, 230_400, 214_016) rather than derived from target.max_shared_memory_per_cta. PERFORMANCE_REPORT.md:278 notes that GEMM scratch is summed across variants, which blocks per-GEMM tiles."
+    },
+    {
+      "idea": "Config derived from device properties rather than model identity",
+      "status": "partial",
+      "evidence": "compiler.py:1506-1517 queries SM count, warp size, max threads, opt-in smem; schedule.py:1378 and plan.py:497-512 size workers from SM count; runtime.py:265 checks SM count on load. Hard-coded: max_registers_per_thread=255, supports_tma=True, sm90a-only GEMM (gemm.py:1847), SWAP_AB_MAX_ROWS=64 whose comment cites '60 SMs' (gemm.py:1888-1893), DECODE_MAX_CHUNKS=16/DECODE_MIN_CHUNK_KEYS=64 (attention.py:422-423), _FOLD_* (schedule.py:1383-1386)",
+      "notes": "Worker count is generic. Tile, stage, chunk and fold choices are constants, justified by measurements on the H200 MIG 60-SM slice and SmolLM/Qwen2 shapes. TargetFacts has no L2 size, DRAM bandwidth, regs/SM or clock, so no cost model could use them even if one existed."
+    },
+    {
+      "idea": "Runtime autotuning of generated pointwise/reduction kernels plus coordinate descent",
+      "status": "missing",
+      "evidence": "bodies/generic.py:441 MAP_ELEMENTS_PER_THREAD=4, 478 _UNROLL_ITERATIONS=16; attention.py:260-267 fixed scratch rows and unroll",
+      "notes": "Generated norm/pointwise/attention bodies have one fixed config. Inside a megakernel, block size equals the CTA size shared with the GEMM, so the tunables are per-thread work, unroll and the work-item split rather than XBLOCK/num_warps."
+    },
+    {
+      "idea": "Split-K as an autotune choice (decompose_k), gated by shape",
+      "status": "partial",
+      "evidence": "bodies/gemm.py:1900-1919 split_k_count (largest divisor with tiles*splits <= SMs and >= 2 K tiles each); compiler.py:422 enabled only by MEGABAKE_SPLIT_K=1; ROADMAP.md:126 'split-K built, off'",
+      "notes": "MegaBake's split-K targets exactly the decode case Inductor's decompose_k ignores (small N tiles vs SM count). It is chosen analytically, not measured, and is off by default, so whether it helps is unknown."
+    },
+    {
+      "idea": "Combo kernels (horizontal fusion of independent nodes)",
+      "status": "implemented",
+      "evidence": "schedule.py dependency-level phase schedule (PERFORMANCE_REPORT.md:57: one barrier per dependency level) and CTA rotation (PERFORMANCE_REPORT.md:58); independent regions share a barrier interval",
+      "notes": "This is native to the megakernel and more general than Inductor's: GEMMs, attention and norms can share an interval, not just Triton pointwise kernels. What is missing is the cost side: no measured or modelled decision on how to split SMs between concurrent phases, and every body runs at the GEMM's occupancy (one CTA per SM, PERFORMANCE_REPORT.md:288)."
+    },
+    {
+      "idea": "CUDA graph trees: removing launch overhead in a multi-kernel world",
+      "status": "not_applicable",
+      "evidence": "Single cooperative launch with a device address table (runtime.py DYNAMIC_ADDRESS_RING=64, compiler.py:213-223); ROADMAP.md:182 'MegaBake wins end to end because Inductor makes 450-630 launches on a slow host'",
+      "notes": "A one-launch design makes this unnecessary. MegaBake also handles mutated KV-cache inputs, which made Inductor's CUDA graphs skip in decode. The remaining fair comparison is against kernel GPU time, which Inductor still wins."
+    },
+    {
+      "idea": "Offline knowledge: lookup tables, learned heuristics, remote autotune cache",
+      "status": "partial",
+      "evidence": "src/megabake/cache.py (PlanCache keyed by plan/body revisions; compiler.py:433-460 make_plan_key)",
+      "notes": "MegaBake caches whole plans keyed by graph and context. It has no per-(op shape, device) result cache that would carry tuning results across models. That kind of cache is what makes Inductor's tuning reusable for unseen models."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Joint tuning of concurrent phases and SM partitioning inside one barrier interval",
+      "why_multi_kernel_cannot": "Inductor autotunes each kernel in isolation on an otherwise idle GPU. Kernels in a stream serialize, so it never picks a GEMM tile because another op will share the SMs. In a megakernel, independent regions (q/k/v projections, gate/up, norm recompute) run in the same interval on disjoint or rotated worker sets. The best configuration is a joint (tile, worker share) assignment that minimizes the interval's makespan, e.g. give K/V projections 6 CTAs and Q 54 instead of each grabbing the whole grid.",
+      "nearest_multi_kernel_substitute": "Multiple streams or green contexts with CUDA-graph capture, or Inductor combo kernels (Triton pointwise only, at most 8 nodes, off by default). Streams cannot pin an SM share. Combo kernels cannot include cuBLAS/template GEMMs. Typically 0 to 30% of the idle-SM loss is recovered [uncertain]."
+    },
+    {
+      "opportunity": "In-situ autotuning with on-device phase timers instead of isolated micro-benchmarks",
+      "why_multi_kernel_cannot": "MegaBake already has PHASE_TIMER slots (runtime.py:28) and tools/phase_profile.py. A candidate body config can be measured in its real context, with warm or cold L2 depending on its predecessors, a prefetch overlapping it, and the actual barrier cost, all inside the production kernel. Isolated benchmarking misses the cache state left by the previous phase. Persistent kernels can also carry a variant index in the phase table, so alternatives can be switched without recompiling, by editing the table between calls.",
+      "nearest_multi_kernel_substitute": "Inductor benchmark_fusion / benchmark_epilogue_fusion benchmark fused vs unfused kernels with random inputs and flushed or unflushed L2. They are context-free by construction."
+    },
+    {
+      "opportunity": "Tuning cross-phase overlap knobs that do not exist across kernel boundaries",
+      "why_multi_kernel_cannot": "There are parameters with no meaning in a multi-kernel graph: how many K tiles of the next GEMM's weights to TMA-prefetch into L2 or shared memory during the current phase (ROADMAP step 9), whether a small producer is recomputed per worker (interval folding, schedule.py:1383) or synchronized by a barrier, and event-counter vs grid-barrier granularity (ROADMAP step 10). These can be searched per graph with the same autotuning machinery.",
+      "nearest_multi_kernel_substitute": "PDL (programmatic dependent launch) overlaps the next kernel's prologue with the current kernel's tail, and cudaStreamAttr L2 persistence windows exist. Neither can stream the next layer's weights while the current GEMM is still running on other SMs."
+    },
+    {
+      "opportunity": "One-launch elimination of CUDA-graph constraints (mutated inputs, dynamic addresses)",
+      "why_multi_kernel_cannot": "Inductor's CUDA graph trees must copy non-static inputs, re-record when addresses or liveness change, and give up on mutated inputs such as KV caches. A megakernel reads addresses from a device table every call, so decode with in-place cache updates gets zero host launch overhead.",
+      "nearest_multi_kernel_substitute": "Static KV buffers plus manual torch.cuda.graph capture (vLLM-style). This works but needs model-specific cache plumbing; Inductor's generic path does not do it (PERFORMANCE_REPORT.md:26)."
+    }
+  ],
+  "measured_or_reported_gains": "Inductor (paper): 2.27x inference and 1.41x training geomean speedup over eager on A100 across 180+ models (PyTorch 2, ASPLOS 2024; one later paper says float32 [uncertain]). Local measurements on H200 MIG 3g.71gb, from artifacts/full_model_2026-10-18 (Inductor baseline = default mode / 'reduce-overhead', NOT max-autotune, so its GEMMs are cuBLAS):\n- SmolLM-135M decode: kernel time Inductor 1.382 ms vs MegaBake 1.502 ms; complete call 11.92 vs 2.14 ms.\n- SmolLM-1.7B decode: 2.425 vs 2.974 ms kernel time; complete call 10.32 vs 3.31 ms.\n- Qwen2-0.5B decode: 1.636 vs 1.584 ms kernel time, the one model where MegaBake kernel time is lower.\n- Prefill kernel time (Inductor+CUDA graphs vs MegaBake): 135M 1.137 vs 1.381 ms; 1.7B 2.374 vs 2.639 ms; Qwen2-0.5B 1.464 vs 1.605 ms.\n- Qwen3.5-0.8B: no MegaBake decode entry, since the gated delta rule is unimplemented.\n\nDerived: the 1.7B decode weight-streaming floor is about 3.4 GB / 2.2 TB/s = 1.55 ms. Inductor reaches about 64% of that bandwidth and MegaBake about 52% [estimate]. Earlier PERFORMANCE_REPORT numbers (an older kernel, 135M): 211 GEMM phases took 0.77 ms (3.6-4.6 us each), and swapAB doubled decode GEMM bandwidth from 0.84-1.04 to 1.78-2.07 TB/s on 60 SMs. No local measurement of Inductor max-autotune on these models exists; benchmarks/run.py and benchmarks/isolated.py use max-autotune-no-cudagraphs only for isolated MLP experiments.",
+  "expected_impact_on_megabake": "Ranked, for H200 MIG 3g.71gb (all numbers are estimates derived from the measured gaps above):\n1. Per-GEMM tile/split autotuning with per-shape cached results (instead of one forced (64,64)/swapAB tile per launch). The decode GPU-time gap to Inductor is 0.55 ms on 1.7B and 0.12 ms on 135M. Most of the 1.7B gap is GEMM bandwidth, since 1.7B decode is weight-bound and ~52% of peak bandwidth vs Inductor/cuBLAS ~64%. Per-shape choice of split-K for small-N K/V and o-projections, stage count and 64x128 vs 64x64 should recover 0.2-0.45 ms on 1.7B decode (to roughly 2.5-2.75 ms) and 0.03-0.08 ms on 135M [uncertain]. Prefill above 64 tokens gains more from tile choice (128x128/128x256 tiles instead of 64x64), perhaps 20-40% of prefill GEMM time, but prefill at 128-300 tokens is dominated by the first-generation attention body (ROADMAP.md:219), so attention comes first.\n2. Joint SM partitioning of concurrent phases inside an interval: K/V projections fill 3 of 60 CTAs (PERFORMANCE_REPORT.md:79). Co-scheduling Q/K/V and gate/up with measured worker shares could save about one GEMM start-up (~2-3 us) per interval pair, i.e. 2-3 us x 2 per layer, giving ~0.1-0.15 ms on 24-30-layer models [uncertain].\n3. Score-based generic fusion replacing the named matchers. It brings no direct speedup on the tested models, which already match, but avoids silent 9-phase fallbacks on unseen models: each missed norm costs about 8 extra barriers x 0.7 us, ~5.6 us per norm, ~0.3 ms per model with 61 norms.\n4. Autotuned generated bodies (norm/attention chunking, per-thread work): roughly 0.02-0.05 ms in decode, given that the 61 fused RMSNorms took 0.21 ms in the older profile. Larger for long-context decode attention, where DECODE_MAX_CHUNKS=16 is fixed.\n5. Benchmark-verified epilogue fusion (SiLU*mul or residual into the GEMM epilogue): removes one phase and barrier per fused op, about 0.7 us plus the pass time each, ~2-4 us per layer, i.e. 0.05-0.1 ms per model [uncertain].\nThe compile-time cost must be bounded: whole-kernel measurement is 10-70 s per candidate, so tuning has to be per body, in isolation or via phase timers, with results cached by (op family, shape, dtype, target).",
+  "generality_and_overfitting_risk": "Inductor's pattern: fixed tables exist (base mm_configs; h100/a100/sm_100/sm_120 flex configs; the GB200-derived split threshold at choices.py:549-570; 'hand-tuned' decompose-K splits at utils.py:3238; learned trees named for A100/H100/H200), but every such table is (a) keyed by device or capability, never by model; (b) a candidate generator whose output is clamped to the problem shape (_scale_mm_configs) and pruned by queried device limits (smem opt-in, warp size, register estimate); and (c) when max-autotune is on, corrected by benchmarking and cached per (shape, stride, dtype, device). Policy is overridable through InductorChoices. The residual risk in Inductor is that the default (non-autotune) path trusts these tables.\n\nMegaBake items that look tuned to the tested models or to the 60-SM slice:\n1. compiler.py:429-431: table launch (every real model) forces SearchBudget(max_plans=1, max_compilations=1), so the search never runs where it matters. Every GEMM takes the provider's first candidate.\n2. bodies/gemm.py:1852-1882: under table launch, one candidate per GEMM, either a (64,64) tile with 8 stages or swapAB with (16|32|64, 64). The non-table path offers only 64x64x13 stages and 64x128x8 stages, with literal smem sizes 230_400 and 214_016 that assume H100's 227 KB opt-in rather than reading target.max_shared_memory_per_cta. TABLE_GEMM_SHARED_BYTES (gemm.py:1711) is also a literal.\n3. bodies/gemm.py:1888-1896: SWAP_AB_MAX_ROWS=64 and the row tiles are justified by a measurement 'On 60 SMs'. The swapAB-or-not decision is all-or-nothing per launch (wants_swap_ab requires every GEMM <= 64 rows, compiler.py:416), so mixed-M graphs get no swapAB.\n4. bodies/gemm.py:1829-1832, 1818: N and K must be multiples of 64 and operands BF16 K-major. Hidden sizes such as 576 (SmolLM-135M) and 896 (Qwen2-0.5B) happen to be multiples of 64; a model with K=1000 or FP16 falls back to the generic contraction body, which is 3-10 ms per the report.\n5. bodies/attention.py:260-267, 422-423: ATTENTION_SCRATCH_ROWS=16, 32 KiB scratch, DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64, _VALUE_BLOCK/_VALUE_UNROLL=8. These are fixed regardless of head_dim, GQA group, context length or SM count. With 60 SMs and few KV heads, 16 chunks may under- or over-split at other SM counts.\n6. schedule.py:1383-1386: _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6 are tuned on decode's norm/RoPE pattern, with no cost model behind them.\n7. regions.py:501-1010, 1292, 2159: RMSNorm, rotate-half RoPE, attention and SiLU gated-MLP matchers mirror the HF Llama/Qwen2 graph shape. _gated_mlp_candidate accepts SiLU only (Gemma's GELU-tanh misses) and returns only the first match in the graph. PERFORMANCE_REPORT.md:54 records the norm matcher missing the HF op order. Inductor has no such matchers; these ops fuse through the generic score.\n8. compiler.py:236-248: accuracy limits (1%/2%) are chosen by citing SmolLM depth. buckets.py:38 DEFAULT_BUCKETS=(16..512) is a sequence-length grid, not hardware-derived.\n9. compiler.py:1515: max_registers_per_thread=255 is hard-coded, and supports_tma=True is set for all accepted archs.\n10. compiler.py:205-210: _TABLE_LAUNCH_OPS=1000 is a heuristic. The parameter-byte criterion is principled (CUDA's 32 KiB parameter limit), but the op-count criterion changes the GEMM path (table launch means a single tile), so a model just under 1,000 ops gets different tiling than one just above. That is a performance cliff unrelated to hardware.\n\nRemedy, in Inductor's style: turn every constant above into a candidate generator parameterized by TargetFacts and shapes, prune by queried limits, measure per body (isolated or with phase timers), cache by (family, shape, dtype, arch, SM count), and keep the constants only as the default when no measurement exists.",
+  "hardware_portability": "Inductor is portable because the IR and scheduler are device-agnostic and each backend registers template heuristics per device type (cuda/hip/xpu/cpu/mtia) through heuristics/registry.py, with device-specific templates gated by capability (persistent TMA for sm90, warp-specialized TMA for Blackwell, TDM/origami for ROCm).\n\nMegaBake's SM90 dependencies: the tuned GEMM (TMA, WGMMA, setmaxregister in bodies/gemm.py:823/893, rejected unless sm90a at gemm.py:1847); TABLE_GEMM_SHARED_BYTES sized for 227 KB smem; one CTA per SM fixed by GEMM smem (PERFORMANCE_REPORT.md:288). _target_facts accepts sm100/103/120/121, but they get no tuned GEMM: supports_wgmma is False, so GEMMs fall to the generic contraction path. SM80 is rejected outright (compiler.py:1508-1511).\n\nWhat carries over: the phase table, the grid barrier/event counters, the address table, worker sizing by SM count, and the generated norm/pointwise/attention bodies (plain CuTe, no WGMMA). What needs a new body: on SM100, tcgen05 MMA with TMEM accumulators, 2-CTA clusters, and CLC-based tile scheduling; on SM120, no tcgen05/TMEM (mma.sync-class, smaller ~100 KB smem); on SM80, cp.async plus mma.sync with ~164 KB smem. To stay target-generic: (1) make GEMM bodies providers registered per arch, the same pattern as Inductor's (template, device) registry; (2) derive smem budgets, stage counts and tile lists from TargetFacts (add L2 size, regs/SM, DRAM bandwidth, cluster support); (3) let measurement pick among providers. Split-K, swapAB, split-context attention and interval folding are hardware-agnostic ideas whose thresholds must be re-measured per target.",
+  "recommended_actions": [
+    {
+      "action": "Turn on per-GEMM candidate enumeration under table launch. Make the table GEMM shared-memory region the max over chosen variants rather than a fixed 64x64x8, fix the summed-scratch bug (PERFORMANCE_REPORT.md:278), and offer {64x64, 64x128, 128x128} x stages x {swapAB 16/32/64} x split-K per GEMM. Derive stages from target.max_shared_memory_per_cta instead of the literals 230_400/214_016.",
+      "expected_gain": "0.2-0.45 ms of 1.7B decode GPU time (closing most of the 0.55 ms gap to Inductor), plus 20-40% of prefill GEMM time above 64 tokens [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py (1711, 1852-1882), src/megabake/codegen.py, src/megabake/plan.py (_projected_shared_memory), src/megabake/compiler.py (412-431)",
+      "prerequisite": "Per-body measurement (next action), so the larger space does not multiply whole-kernel compiles"
+    },
+    {
+      "action": "Add Inductor-style per-body autotuning. For each distinct (family, shape, dtype, layout) region, compile each candidate body as a standalone persistent kernel on the same worker count (or time it in situ with PHASE_TIMER slots), keep the winner in a persistent cache keyed by (body family, shape, dtype, arch, SM count, smem opt-in), and only then assemble the megakernel. Reuse entries across models.",
+      "expected_gain": "Enables actions 1, 4 and 5 at bounded compile time (seconds per new shape instead of 10-70 s per whole-kernel candidate); removes model-tuned constants as the deciding factor",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/plan.py (search_plans, SearchBudget), src/megabake/cache.py, src/megabake/compiler.py (_make_plan_evaluator 1174), src/megabake/runtime.py (PHASE_TIMER), tools/phase_profile.py",
+      "prerequisite": "None; the body interface already isolates bodies (bodies/interface.py DeviceBody)"
+    },
+    {
+      "action": "Add a measured split-K / SM-share decision per small-N GEMM (replacing the env flag MEGABAKE_SPLIT_K), with candidates {1, split_k_count(...)} measured per shape, and co-schedule independent GEMMs in an interval by assigning worker shares proportional to weight bytes",
+      "expected_gain": "0.1-0.2 ms on 1.7B decode; K/V projections currently use 3 of 60 CTAs [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py (1900-1919), src/megabake/compiler.py:422, src/megabake/schedule.py (worker assignment, CTA rotation)",
+      "prerequisite": "Per-body autotuning cache"
+    },
+    {
+      "action": "Replace the named region matchers with a generic, Inductor-style score-based region fusion. Group candidate pairs by shared value, keep a fusion if it is legal (same iteration space or a reduction-then-broadcast pattern, no cycle, fits the scratch budget) and scored by saved bytes and barriers removed. Keep the RMSNorm/RoPE/attention matchers only as fast-path labels for tuned bodies, not as the only way to fuse.",
+      "expected_gain": "No change on tested models; avoids ~5-6 us per missed norm and per missed gated activation on unseen models (e.g. GELU-gated Gemma MLPs), ~0.3 ms per model when a matcher misses",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/regions.py (147-191, 501-1010, 2159-2330), src/megabake/planner.py (_body_cost 500), src/megabake/bodies/generic.py",
+      "prerequisite": "A generic reduction+pointwise body that accepts an arbitrary fused TensorProgram chain"
+    },
+    {
+      "action": "Extend TargetFacts with L2 bytes, DRAM bandwidth (measured once with a copy kernel), regs per SM, cluster/TMA/WGMMA/tcgen05 flags and max smem per SM. Replace max_registers_per_thread=255 and supports_tma=True with queries, and register GEMM providers per arch (sm90 WGMMA, sm100 tcgen05, sm80 mma.sync) the way Inductor's heuristics registry keys (template, device, op).",
+      "expected_gain": "Correctness and portability rather than speed on the H200 slice; a prerequisite for L2 prefetch sizing (ROADMAP step 9) and any analytic cost model",
+      "effort": "S",
+      "generality": "hw-specific",
+      "files_to_touch": "src/megabake/bodies/interface.py:13-23, src/megabake/compiler.py:1499-1517, src/megabake/bodies/catalog.py",
+      "prerequisite": "None"
+    },
+    {
+      "action": "Make decode-attention chunking, scratch rows and the interval-fold limits candidate sets measured per (head_dim, GQA group, KV capacity, SM count) instead of constants",
+      "expected_gain": "0.02-0.05 ms decode at short context; more at long context and on other SM counts [uncertain]",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py (260-267, 422-423), src/megabake/schedule.py (1383-1386)",
+      "prerequisite": "Per-body autotuning cache"
+    },
+    {
+      "action": "Remove the op-count cliff. Choose table launch only by the parameter-byte limit, and make the GEMM path independent of launch kind, so tiling does not change when a model crosses 1,000 ops.",
+      "expected_gain": "Predictability across model sizes; no direct gain on tested models",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py:205-223, 412-431",
+      "prerequisite": "Action 1 (per-GEMM variants under table launch)"
+    },
+    {
+      "action": "Benchmark against Inductor max-autotune (mode='max-autotune' with cudagraphs where legal, and max-autotune-no-cudagraphs for decode) in benchmarks/full_model.py, so the 'kernel GPU time' yardstick is the tuned generic compiler, not the default cuBLAS path",
+      "expected_gain": "Measurement fidelity; may move the target for decode kernel time below 2.42 ms on 1.7B",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "benchmarks/full_model.py:148, 201, 265",
+      "prerequisite": "GPU time once current benchmarks finish"
+    },
+    {
+      "action": "Add benchmark-verified epilogue fusion of the elementwise consumers of a GEMM (SiLU*mul, residual add, cast) through a MultiTemplateBuffer-like deferral. Keep the fused variant only if the measured phase time beats GEMM plus a separate phase.",
+      "expected_gain": "0.05-0.1 ms per model in decode (one barrier plus one pass per fused op per layer) [uncertain]",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py (epilogue), src/megabake/regions.py, src/megabake/planner.py",
+      "prerequisite": "Per-body autotuning; generic fusion scoring"
+    }
+  ],
+  "open_questions": [
+    "How much of the 1.7B decode GPU-time gap (2.97 vs 2.42 ms) comes from GEMM tile/stage choice and how much from barriers and attention? Experiment: tools/phase_profile.py on the current kernel, grouped by family, compared with the Inductor nsys per-kernel breakdown.",
+    "Does Inductor max-autotune beat its default cuBLAS path on these decode shapes (M=1, N in 64..8192)? Experiment: rerun benchmarks/full_model.py with mode='max-autotune-no-cudagraphs' and record kernel_duration_us.",
+    "Is split-K (already built) a win per projection on 60 SMs, and does the answer change at 132 SMs? Experiment: MEGABAKE_SPLIT_K=1 vs 0 phase timings per GEMM shape on the MIG slice and on a full H100/H200 when available.",
+    "Can isolated per-body timing predict in-megakernel phase time well enough, given warm L2 and concurrent phases? Experiment: time each GEMM body as a standalone persistent kernel and compare with its PHASE_TIMER duration inside the full model; acceptable if the ranking agrees.",
+    "What does the GEMM shared-memory union cost when variants differ (one CTA per SM is already forced)? Experiment: compile a table launch with mixed 64x64 and 64x128 variants after fixing the scratch-summing bug and check active_blocks_per_sm and registers.",
+    "Do the RMSNorm/RoPE/gated-MLP matchers fire on Gemma (GELU-tanh, (1+w) norm) and on Qwen3.5? Experiment: run regions.form_regions on captured graphs from those models and count regions per family vs expected.",
+    "Are DECODE_MAX_CHUNKS=16 and DECODE_MIN_CHUNK_KEYS=64 near-optimal across context lengths 64-8k? Experiment: sweep both in an isolated decode-attention body at several KV lengths."
+  ],
+  "uncertain": [
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake"
+  ]
+}

@@ -1,8 +1,10 @@
 # MegaBake design research
 
+> **Historical document.** This is the 2026-10-08 design research, written before the compiler existed. The GEMM experiments remain valid evidence; the decisions are superseded. It is kept for its evidence and history and is not maintained. The current design is [ARCHITECTURE.md](../../ARCHITECTURE.md) and the current plan is [ROADMAP.md](../../ROADMAP.md).
+
 **Date: 2026-10-08. Target: the existing `v4-impl` checkout and H200 MIG device.**
 
-The result of this work is a revised [architecture](ARCHITECTURE.md) and [implementation plan](IMPLEMENTATION_PLAN.md). The scope in [north-star.md](north-star.md) is unchanged.
+The result of this work is a revised [architecture](../../ARCHITECTURE.md) and [implementation plan](IMPLEMENTATION_PLAN.md). The scope in [north-star.md](../../north-star.md) is unchanged.
 
 **Follow-up, 2026-10-09:** [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) extends the source review across Mirage's compiler and runtime paths. It defines reuse boundaries, generic operation coverage, generated variants, and explicit external fallback. It also records a passing host allocation check and an attempted GPU check that could not run because no CUDA device was available that day. The GPU results below remain the measurements from 2026-10-08.
 
@@ -139,9 +141,9 @@ All times are microseconds. Dimensions are listed as `M, K, N`.
 | 256, 4096, 11008 | 61.671 | 71.856 | 70.799 | 73.795 |
 | 1024, 4096, 11008 | 232.826 | 241.817 | 232.012 | 239.861 |
 
-Sources: [initial sweep](experiments/design_2026_10_08/hot.json), [larger tiles](experiments/design_2026_10_08/large_tiles.json).
+Sources: [initial sweep](../../experiments/design_2026_10_08/hot.json), [larger tiles](../../experiments/design_2026_10_08/large_tiles.json).
 
-The larger tile changed the conclusion. On the last shape, the best persistent result from the initial three choices was 249.499 µs. The `128×256` configuration reduced it to 232.012 µs. A separate repeat measured 231.380 µs. This supports approximate standalone parity for this shape. It does not prove full-model parity. [Repeat and resources](experiments/design_2026_10_08/large_repeat.json)
+The larger tile changed the conclusion. On the last shape, the best persistent result from the initial three choices was 249.499 µs. The `128×256` configuration reduced it to 232.012 µs. A separate repeat measured 231.380 µs. This supports approximate standalone parity for this shape. It does not prove full-model parity. [Repeat and resources](../../experiments/design_2026_10_08/large_repeat.json)
 
 At M=1 with the larger weight, `64×256` also reached approximate parity. Thus padding a WGMMA tile is not enough evidence to reject it. Its actual throughput and memory behavior determine the result.
 
@@ -149,17 +151,17 @@ Some gaps remain: the M=256 large projection is about 15% slower, and the M=1024
 
 The restart cost depends on the configuration. At `128×128` on the last shape, dense took 272.222 µs and its resident adapter took 302.307 µs. At `128×256`, the adapter was close to the original dense kernel. The dedicated persistent example uses different warp roles and pipeline organization. Barrier restart alone therefore cannot explain its timing difference from the adapter. Measure the complete schedule; this experiment does not establish a universal restart penalty.
 
-The weight-streaming sweep covered the initial three tile shapes. For the small M=4 projection, library GEMM changed from 3.348 to 3.645 µs. Persistent CuTe changed from 2.971 to 3.348 µs. Cache behavior matters at this scale. The extra large tiles were not repeated in this streaming sweep. [Rotating-weight results](experiments/design_2026_10_08/rotating_weights.json)
+The weight-streaming sweep covered the initial three tile shapes. For the small M=4 projection, library GEMM changed from 3.348 to 3.645 µs. Persistent CuTe changed from 2.971 to 3.348 µs. Cache behavior matters at this scale. The extra large tiles were not repeated in this streaming sweep. [Rotating-weight results](../../experiments/design_2026_10_08/rotating_weights.json)
 
 ### Resource and correctness checks
 
 All retained GEMM timing candidates passed the fixed diagnostic relative-L2 threshold of 0.005 and a finite-output check. Observed errors were much smaller; exact maxima are in each artifact. This random-input diagnostic is not a model numerical contract. It does not cover every tail, mask, stride, or extreme value.
 
-At M=256, the tested `64×64` and `128×128` dense bodies reserved 230,400 bytes of shared storage. The persistent `128×128` body used 214,016 bytes. The driver occupancy query admitted one block per SM for the tested configurations. No local-memory allocation was reported. [Resource records](experiments/design_2026_10_08/resources.json)
+At M=256, the tested `64×64` and `128×128` dense bodies reserved 230,400 bytes of shared storage. The persistent `128×128` body used 214,016 bytes. The driver occupancy query admitted one block per SM for the tested configurations. No local-memory allocation was reported. [Resource records](../../experiments/design_2026_10_08/resources.json)
 
 The larger `128×256` persistent configuration used 384 threads, 230,400 bytes of shared storage, and 168 driver-reported registers per thread. It also admitted one block per SM and reported zero local bytes. This is the concrete cost of the near-parity result. A mixed kernel must fit that envelope and preserve its warp roles. The data does not show what happens after adding norm and attention bodies.
 
-Compute Sanitizer memcheck reported zero memory errors for the M=256 validation fixture, including repeated calls with changed input contents and resident scratch reuse. API-error reporting was disabled because the installed tool reported optional `cuGetProcAddress_v2` lookups as errors in the CUDA Python binding. All explicit CUDA API results used by the harness were checked. This was a memory check, not a race or synchronization proof. [Validation log](experiments/design_2026_10_08/memcheck.log)
+Compute Sanitizer memcheck reported zero memory errors for the M=256 validation fixture, including repeated calls with changed input contents and resident scratch reuse. API-error reporting was disabled because the installed tool reported optional `cuGetProcAddress_v2` lookups as errors in the CUDA Python binding. All explicit CUDA API results used by the harness were checked. This was a memory check, not a race or synchronization proof. [Validation log](../../experiments/design_2026_10_08/memcheck.log)
 
 ### Actual Inductor MLP baseline
 
@@ -176,7 +178,7 @@ The MLP computes gate and up projections, SiLU, their product, and the down proj
 | 256, 4096, 11008 | 200.032 | 196.478 | 185.095 | 4 |
 | 1024, 4096, 11008 | 746.797 | 735.849 | 696.373 | 4 |
 
-Source: [MLP results and kernel names](experiments/design_2026_10_08/mlp.json).
+Source: [MLP results and kernel names](../../experiments/design_2026_10_08/mlp.json).
 
 At M=1, Inductor selected two fused Triton reduction kernels. At the larger M values, the trace shows three library GEMMs and a fused pointwise kernel. The compiled small MLP is faster than the sum of three separate GEMMs, so that sum is not a physical lower bound. On the larger M=1 MLP, eager graph execution is stronger than the measured compiled path. A fair MegaBake report must show both.
 

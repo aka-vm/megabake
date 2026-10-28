@@ -1,0 +1,360 @@
+{
+  "name": "Quantized activation contracts and producer-consumer format negotiation",
+  "scope": "Read the DeepSeek V4.1 hand-fused vLLM stack (agent_space/vllm/vllm/models/deepseek_v41: attention.py, nvidia/flash_mla_mega_attn.py, nvidia/ops/o_proj.py, amd/rocm.py, common/ops/query_quant.py, common/ops/fused_compress_quant_cache.py, common/ops/indexer_k_store.py, common/ops/fused_layout.py, nvidia/model.py, quant_config.py), vLLM's generic QuantizedActivation contract (model_executor/layers/fusion/quant_activation.py) and QuantKey vocabulary (quant_utils.py), Mirage MPK's FP8 tasks (python/mirage/mpk/persistent_kernel.py quantize_fp8_layer/linear_fp8_layer, tasks/blackwell/linear_fp8_*), and MegaBake's body interface (src/megabake/bodies/interface.py), layout-conversion planner (planner.py _insert_layout_conversions, _body_cost), codegen dtype tables, and every BF16-only gate in bodies/gemm.py, bodies/attention.py, lowering.py. Question answered: how neighbouring hand-written kernels in vLLM agree on which side does which work (norm, RoPE, inverse RoPE, FP8 cast) and in which edge format (dtype + scale granularity + scale layout + data permutation), and how MegaBake should turn that ad-hoc negotiation into a typed, compiler-solved edge-format problem in its body interface, plus what is missing for FP8/NVFP4 in MegaBake (BF16-only today). Static analysis plus web docs only; no GPU runs.",
+  "key_sources": [
+    "agent_space/vllm/vllm/model_executor/layers/fusion/quant_activation.py:3-30 QuantizedActivation(data, scale, orig_dtype, orig_shape, quant_key); docstring+TODO admits blockscale layout and padding are NOT in the contract and follow consumer convention",
+    "agent_space/vllm/vllm/model_executor/layers/fusion/quant_activation.py:49-69 expose_input_quant_key / get_input_quant_key (consumer advertises the key; requires_unquantized_input hides it when another consumer needs the raw activation)",
+    "agent_space/vllm/vllm/model_executor/layers/fusion/quant_activation.py:72-88 as_quantized_activation: plain tensor -> consumer quantizes itself; key mismatch -> assert (fail loudly, never silently re-quantize)",
+    "agent_space/vllm/vllm/model_executor/layers/quantization/utils/quant_utils.py:171 QuantKey(dtype, ScaleDesc(scale dtype, static, GroupShape), scale2, symmetric); :212-218 kNvfp4Dynamic (fp4 + e4m3 per 1x16 + per-tensor scale2); :239-252 kMxfp8Dynamic (fp8 + ue8m0 per 1x32)",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:142-189 _resolve_dsv4_kv_cache_dtype: unspecific --kv-cache-dtype (auto/fp8) resolves to the layer's packed_kv_cache_dtype and is written back to cache_config",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:212-229 accepts_unnormed_unroped_query and packed_kv_cache_dtype declared as properties of the attention interface contract",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:255-269 abstract _o_proj takes whatever _alloc_attn_out produced (Tensor | QuantizedActivation)",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:680-705 forward(): attn_out = self._alloc_attn_out(...); ...; return self._o_proj(attn_out, positions) - the consumer allocates the producer's output buffer",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:753-776 _wo_b_proj single contract for GEMM-RS; _alloc_attn_out default is bf16 [N, padded_heads, head_dim]",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:778-815 _split_qkv_and_norm: fuses RMSNorm + MXFP8 quant of Q only when q_lora_rank % 32 == 0 and _can_fuse_query_quant",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:1058-1145 _fused_qnorm_rope_kv_insert: apply_q_rope = not accepts_unnormed_unroped_query; is_q_interleaved flag; pad_to=0 skips Q pad when shard already padded",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:1-16 module doc: one kernel does Q RoPE, sparse attention, inverse RoPE of output and FP8 cast, writes straight into the buffer wo_a consumes",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:54-88 fixed kernel conventions (_QUANT_GROUP=32, GPT-J RoPE, TMA-aligned col-major packed ue8m0 scales) and GB300 measurement table (mega vs split-KV, up to 1.45x at TP1, ~2us penalty small s_q)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:105-136 alloc_mega_attn_output: fp8 data [T, n_wv_group, 8*512] + int32 packed-ue8m0 scale MN-major, stride 1 along tokens, TMA-aligned - chosen to be what DeepGEMM fp8_einsum reads",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:150-172 is_available_for: SM100 + build has ops + TP divides heads/groups + exactly WV_GROUP_SIZE heads per wo_a group",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:174-193 permute_on_load of wq_b rows, wo_a columns and their scales so GEMMs speak the kernel's chunk-interleaved layout",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:196-236 contract overrides: accepts_unnormed_unroped_query=True, packed_kv_cache_dtype='nvfp4_ds_mla', _alloc_attn_out->QuantizedActivation, _o_proj = fp8_einsum with no repacking",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/model.py:240-253 default backend selection: mega attention if is_available_for else FlashMLA (capability/topology gating at layer-selection time)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/ops/o_proj.py:20-45 _can_fuse_wo_a: SM100, einsum recipe (1,1,32), wo_b consumer key == kMxfp8Dynamic AND kernel type is FlashInferCutedslMxfp8LinearKernel, <=8 heads per group, (448,64) nope/rope; :20-27 token limit 96 vs 32 by CTA count",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/ops/o_proj.py:63-81 fused WO-A emits (q, scales) wrapped as QuantizedActivation for wo_b (epilogue quantization)",
+    "agent_space/vllm/vllm/models/deepseek_v41/amd/rocm.py:913-947 gfx950 _alloc_attn_out returns MXFP8 QuantizedActivation with plain [T, width/32] uint8 scales (a different scale layout under the same kMxfp8Dynamic key)",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/query_quant.py:24-33 F8_128x4 swizzled scale layout; :37-87 fused RMSNorm+MXFP8 quant Triton kernel keeping the bf16 rounding boundary (y.to(bf16).to(f32)) and FlashInfer-identical UE8M0 rounding",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/query_quant.py:135-151 can_fuse_query_quant: 'QuantKey does not encode scale layout; restrict this producer to the consumers that accept F8_128x4 swizzled scales' - checks consumer kernel class",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py:295-370 rope_quant_insert: cache record chosen by byte width 584 (V4 fp8), 528 (V4.1 MXFP8 512B+16 ue8m0), 288 (NVFP4 256B e2m1 + 32 e4m3 scales/16) or plain bf16/fp8-per-tensor rows",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py:481-531 NVFP4 insert kernel: scale = clamp(amax/6, 2^-9, 448) as e4m3, div_rn, no per-tensor second-level scale",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/indexer_k_store.py:1-120 k_norm->RoPE->MXFP4 or per-token FP8 quant->paged store; ROCm SHUFFLE 16x16 tiled layout chosen to match the reader (deepgemm paged mqa logits Preshuffle)",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_layout.py:20 WV_GROUP_SIZE = 8; :33-50 o_fused_permutation / o_fused_chunk_permutation",
+    "agent_space/vllm/vllm/compilation/passes/fusion/ (act_quant_fusion.py, rms_quant_fusion.py, attn_quant_fusion.py, mla_attn_quant_fusion.py) - graph-level pattern fusions keyed by QuantKey",
+    "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:2162-2235 quantize_fp8_layer (standalone task, scale_ue8m0 flag picked by model author) + linear_fp8_layer/linear_fp8_with_residual_layer (SM100)",
+    "agent_space/mirage/include/mirage/persistent_kernel/tasks/blackwell/linear_fp8_1d2d_sm100.cuh:45-60 UTCCP scale copy with required smem warp transpose (scale layout dictated by tcgen05)",
+    "src/megabake/bodies/interface.py:94-107 TensorLayout(dtype, axes, strides, alignment, shape, tail_policy) / LayoutContract - no scale tensor, no quant key, no permutation",
+    "src/megabake/bodies/interface.py:83-91 SemanticContract (operation_family, numerical_policy, expression_hooks) - no absorbed-work declaration",
+    "src/megabake/bodies/interface.py:12-21 TargetFacts lacks supported MMA input formats",
+    "src/megabake/planner.py:523-558 _insert_layout_conversions: producer output layout vs consumer input layout -> ConversionBody (stride/swizzle only)",
+    "src/megabake/planner.py:500-510 _body_cost = threads*regs + smem - fusion_saved_bytes (not a time/bytes model)",
+    "src/megabake/planner.py:594-597 tile map rejects any dtype mismatch between contract and load",
+    "src/megabake/planner.py:792-806, codegen.py:150-180, bodies/catalog.py:30-41, bodies/generic.py:1350, regions.py:41 - five copies of _DTYPE_BYTES / dtype maps, none with float8/float4",
+    "src/megabake/plan.py:97-104 needs_conversion_to raises if dtype differs",
+    "src/megabake/codegen.py:1768 'layout conversion cannot change dtype'",
+    "src/megabake/bodies/gemm.py:1708-1711 TABLE_GEMM_SHARED_BYTES hard-coded for BF16 64x64x64 stages; :1818-1821 'provider supports BF16 only'; :1826-1831 N/K multiples of 64; :1846-1849 sm90a only",
+    "src/megabake/bodies/gemm.py:1927-1940 bias epilogue BF16 only (existing epilogue hook point)",
+    "src/megabake/bodies/attention.py:108-140 attention provider BF16 Q/K/V/output only; lowering.py:1860-1869 KV attention requires contiguous BF16 caches; lowering.py:2068-2071 attention BF16 only",
+    "src/megabake/regions.py:2200-2275 gated-MLP paired GEMM epilogue candidate exists but always rejected ('paired GEMM provider is not implemented')",
+    "src/megabake/main.py:273 --dtype choices bfloat16/float16/float32 only",
+    "ROADMAP.md section 4.2 item 3 (fuse residual add/SiLU-mul into GEMM epilogues, RMSNorm into following GEMM prologue) and section 6 measured state (1.7B GEMMs ~1.8 TB/s, weight floor ~1.5 ms; decode kernel 2.98 vs Inductor 2.42 ms)",
+    "https://docs.vllm.ai/en/latest/api/vllm/model_executor/layers/fusion/quant_activation/ (official API docs for the QuantizedActivation contract)",
+    "https://github.com/deepseek-ai/DeepGEMM (SM90 FP8 GEMM with fine-grained scaling and CUDA-core promotion; consumer whose scale layout the mega-attention output adopts)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "Consumer-advertised quantized input key (QuantizedActivation contract)",
+      "how_it_works": "A linear's kernel exposes input_quant_key() (e.g. kMxfp8Dynamic = fp8 e4m3 data + ue8m0 scale per 1x32 group); expose_input_quant_key stores it on the layer; producers call get_input_quant_key(consumer) and, if it matches what they can emit, fuse the quantization into their own epilogue and hand over QuantizedActivation(data, scale, orig_dtype, orig_shape, quant_key). The consumer calls as_quantized_activation: a plain tensor means 'quantize yourself', a matching key is consumed directly, a mismatched key asserts. requires_unquantized_input (LoRA) vetoes the fusion when another branch needs the raw bf16 activation. This is a consumer-driven, pairwise format negotiation done at Python dispatch time.",
+      "where_in_source": "agent_space/vllm/vllm/model_executor/layers/fusion/quant_activation.py:19-88; agent_space/vllm/vllm/model_executor/layers/quantization/utils/quant_utils.py:171-255; agent_space/vllm/vllm/lora/layers/base_linear.py:73"
+    },
+    {
+      "idea": "Scale layout is outside the key, so producers sniff the consumer kernel class",
+      "how_it_works": "The same kMxfp8Dynamic key is emitted with three different scale layouts: F8_128x4 swizzled uint8 ([row/128, group/4, row%32, row%128/32, group%4]) for FlashInfer CUTLASS/CuTe-DSL MXFP8 GEMMs (query_quant.py), MN-major TMA-aligned packed-ue8m0 int32 with stride 1 along tokens for DeepGEMM fp8_einsum (mega attention output), and plain row-major [T, width/32] uint8 for ROCm gfx950. Because QuantKey lacks layout, can_fuse_query_quant and _can_fuse_wo_a check isinstance of the consumer's kernel class (FlashInferCutedslMxfp8LinearKernel etc.). The code's own TODO(mgoin) asks to encode layout and padding in the contract.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/common/ops/query_quant.py:24-33,135-151; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:105-136; agent_space/vllm/vllm/models/deepseek_v41/amd/rocm.py:913-933; agent_space/vllm/vllm/models/deepseek_v41/nvidia/ops/o_proj.py:30-45; agent_space/vllm/vllm/model_executor/layers/fusion/quant_activation.py:23-30"
+    },
+    {
+      "idea": "Consumer allocates the producer's output buffer (_alloc_attn_out / _o_proj pair)",
+      "how_it_works": "DeepseekV4Attention.forward calls self._alloc_attn_out(N, hidden) and later self._o_proj(attn_out, positions). The subclass that owns both the attention kernel and the o-projection decides the edge format: bf16 [N, padded_heads, head_dim] by default; for mega attention, fp8 data [T, n_wv_group, 8*512] plus MN-major packed ue8m0 scales sized with get_tma_aligned_size, which is simultaneously what the attention kernel requires of a caller buffer and what DeepGEMM's einsum consumes, so _o_proj does no repack, no inverse RoPE and no cast. Prefill and decode segments write disjoint token ranges of one buffer pair so a single wo_a einsum covers the whole step.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/attention.py:255-269,680-705,768-776; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:105-142,207-236"
+    },
+    {
+      "idea": "Absorbed-work flags (accepts_unnormed_unroped_query)",
+      "how_it_works": "A boolean property on the attention interface says the consumer kernel performs Q RoPE (and reads Q in its own chunk-interleaved layout). The upstream fused KV-insert kernel then flips apply_q_rope=False and is_q_interleaved=True and reduces its Q work to a zero-pad to padded_heads, or nothing (pad_to=0) when the TP shard is already that wide; the profile-run path also changes. Symmetrically the mega kernel absorbs the inverse RoPE and FP8 cast of its output, so o_proj drops them. Work moves across the edge, and the flag prevents doing it twice or zero times.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/attention.py:212-221,1058-1145; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:1-16,196-200"
+    },
+    {
+      "idea": "Load-time weight permutation so neighbouring GEMMs speak the kernel's internal layout",
+      "how_it_works": "Because the mega kernel reads Q with 16-element head-dim chunks interleaved across heads and writes O with 32-element chunks interleaved across the 8 heads of a wo_a group, __init__ permutes wq_b rows (and their block scales) and wo_a columns (and a per-32-chunk permutation of their scales) once at load. The edge layout between GEMM and attention is thus non-canonical in both directions at zero runtime cost; the cost is paid on constants.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:186-193; agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_layout.py:1-50"
+    },
+    {
+      "idea": "Packed KV-cache record chosen by the reading kernel (packed_kv_cache_dtype)",
+      "how_it_works": "The KV cache is an edge between the writer (fused insert / compressor) and the reader (attention). The reader's layer class declares its preferred packed record; _resolve_dsv4_kv_cache_dtype maps unspecific --kv-cache-dtype auto/fp8 to it and writes it back into cache_config so page sizing follows. Records: 584 B V4 (448 fp8 NoPE + 64 bf16 RoPE + 7 ue8m0/64 + pad), 528 B V4.1 MXFP8 (512 fp8 + 16 ue8m0/32, scales adjacent to values), 288 B NVFP4 (256 B e2m1 pairs + 32 e4m3 scales/16, amax/6 scale, no global scale) used only for the compressed cache and only readable by the SM100 mega kernel. The writer dispatches on the record's byte width.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/attention.py:142-189,222-229; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:201-205; agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py:295-370,481-531"
+    },
+    {
+      "idea": "Capability/topology gating at selection time (is_available_for)",
+      "how_it_works": "A classmethod checks device capability family 100, that the compiled extension has the needed ops, and that TP leaves exactly WV_GROUP_SIZE=8 heads per wo_a group; the backend selector tries it and falls through to the next attention class, so an unsupported topology is a rejection rather than a startup crash. _can_fuse_wo_a similarly gates the fused WO-A epilogue on SM100, einsum recipe (1,1,32), consumer key and kernel class, <=8 heads/group (portable cluster), (448,64) head dims, o_lora_rank%128, with a token cap of 96 or 32 by CTA count.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:91-102,150-172; agent_space/vllm/vllm/models/deepseek_v41/nvidia/model.py:240-253; agent_space/vllm/vllm/models/deepseek_v41/nvidia/ops/o_proj.py:20-45"
+    },
+    {
+      "idea": "Epilogue quantization in the producer (norm+quant, attention+quant, GEMM+quant)",
+      "how_it_works": "Quantization is never its own pass: fused_q_kv_rmsnorm_quant computes RMSNorm, rounds to bf16 first to keep the eager rounding boundary, takes amax per 32-group, encodes UE8M0 exactly like FlashInfer (round-up exponent, subnormal/zero handling), stores fp8 and swizzled scales; the mega-attention kernel casts its output; fused WO-A emits MXFP8 for wo_b; insert kernels quantize into the cache record; indexer_k_store does k_norm->RoPE->MXFP4/FP8->store. Per-group (1x32 / 1x16) dynamic scales need only a row-local amax, so the producer tile that owns the row can compute them without any global reduction.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/common/ops/query_quant.py:37-132; agent_space/vllm/vllm/models/deepseek_v41/nvidia/ops/o_proj.py:63-81; agent_space/vllm/vllm/models/deepseek_v41/common/ops/indexer_k_store.py:31-120,196-266; agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_compress_quant_cache.py:376-531"
+    },
+    {
+      "idea": "Mirage MPK: quantization as an explicit task with author-chosen scale format",
+      "how_it_works": "Mirage's persistent kernel inserts quantize_fp8_layer as a separate task before linear_fp8_layer on SM100; the model builder picks scale_ue8m0 (packed UE8M0 uint32 for the FP8 linear) vs float32 (for the MoE group GEMM). The consumer's scale layout (col-major, aligned M) is encoded in the task's partition specs; UTCCP requires a warp transpose of scale chunks in smem. There is no automatic negotiation, but the quant task is a schedulable unit with event dependencies.",
+      "where_in_source": "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:2162-2235; agent_space/mirage/include/mirage/persistent_kernel/tasks/blackwell/linear_fp8_1d2d_sm100.cuh:45-60"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "Consumer-advertised quantized input key",
+      "status": "missing",
+      "evidence": "src/megabake/bodies/interface.py:94-107 TensorLayout has only dtype/axes/strides/alignment; src/megabake/planner.py:594-597 rejects any dtype mismatch; no QuantKey/scale concept anywhere in src/megabake",
+      "notes": "MegaBake already has the right skeleton (each BodyConfig declares input/output LayoutContracts, the planner compares producer output to consumer input). It needs the contract extended from 'layout' to 'edge format' = (element dtype, scale spec, data layout, scale layout, padding, rounding). Unlike vLLM, MegaBake sees the whole graph so it can solve formats globally instead of a producer peeking at one consumer."
+    },
+    {
+      "idea": "Scale layout in the contract",
+      "status": "missing",
+      "evidence": "No scale tensors exist; src/megabake/plan.py:97-104 compares only strides+swizzle; codegen.py:1768 conversions cannot change dtype",
+      "notes": "MegaBake can do better than vLLM's TODO from day one: express the scale tensor as a second TensorLayout (CuTeLayout with swizzle) bound to the data tensor, so F8_128x4, MN-major TMA-aligned and row-major variants are distinct, comparable layouts and ConversionBody can repack scales when needed."
+    },
+    {
+      "idea": "Consumer allocates producer output / edge buffer owned by the pair",
+      "status": "partial",
+      "evidence": "src/megabake/planner.py:523-558 _insert_layout_conversions picks the producer's declared output layout and inserts a ConversionBody if the consumer wants another; memory.py arena owns all buffers",
+      "notes": "Buffers are compiler-owned (better than vLLM), but the output layout is fixed by the producer body; there is no step where the producer is asked to emit the consumer's preferred layout instead of paying a conversion. Conversion cost (planner.py:792-793 = 2*elements*bytes) is not compared against 'producer emits target layout in its epilogue'."
+    },
+    {
+      "idea": "Absorbed-work flags",
+      "status": "partial",
+      "evidence": "Region formation fuses ops into bodies (regions.py RMSNorm candidates at :181,501-520; gated-MLP paired epilogue candidate at :2200-2275 always rejected 'paired GEMM provider is not implemented'); ROADMAP.md 4.2 item 3 lists RMSNorm-into-GEMM-prologue and residual/SiLU-mul epilogues as not done",
+      "notes": "In a compiler the analogue of accepts_unnormed_unroped_query is a consumer body that matches a larger source subgraph (e.g. rope+attention, rmsnorm+linear) so the producer region shrinks. SemanticContract.source_op_ids already records which FX ops a body covers; what is missing is declaring optional prologue/epilogue 'absorbable' patterns so the region former can move ops across an edge to whichever side is cheaper."
+    },
+    {
+      "idea": "Load-time weight permutation",
+      "status": "missing",
+      "evidence": "src/megabake/bodies/gemm.py:1838-1849 requires K-major weights exactly as captured; no weight-transform pass in compiler.py/memory.py",
+      "notes": "MegaBake captures weights as graph inputs/constants; it could own a compile-time 'constant relayout' pass (permute, quantize, swizzle, pack scales) keyed by the selected body's weight contract. Needed both for interleaved layouts and for offline FP8/NVFP4 weight quantization."
+    },
+    {
+      "idea": "Packed KV-cache record chosen by the reader",
+      "status": "missing",
+      "evidence": "src/megabake/lowering.py:1860-1869 KV attention requires two contiguous BF16 caches; src/megabake/fx_handler/transformers.py:35 key/value cache dtype checks; fx_handler/hf_attention.py:174 state_shapes default bf16",
+      "notes": "Caches are user-visible state in MegaBake (HF cache objects), so changing their format changes the external ABI; this needs an opt-in policy and a cache-state descriptor (record width, value dtype, scale placement) that both the cache-update body and the attention body read."
+    },
+    {
+      "idea": "Capability/topology gating",
+      "status": "implemented",
+      "evidence": "src/megabake/bodies/interface.py:181-198 ProviderRejection/CandidateSet/BodyProvider.get_candidates(region, target, policy); gemm.py:1846-1849 'provider targets sm90a only'; blackwell.py:44-47",
+      "notes": "MegaBake's provider-rejection model is the generic form of is_available_for and is already better: rejection reasons are recorded and selection falls through. Missing: TargetFacts (interface.py:12-21) does not list supported MMA operand formats (fp8 e4m3/e5m2, block-scaled mxf8f6f4/mxf4nvf4), so format choice cannot be gated on hardware facts."
+    },
+    {
+      "idea": "Epilogue quantization in the producer",
+      "status": "missing",
+      "evidence": "Only epilogue today is the BF16 bias add (gemm.py:1927-1940, 231-232); reduction bodies (generic.py) store in the captured dtype; no fp8 entry in dtype maps (codegen.py:150-180)",
+      "notes": "Natural hook points exist: the RMSNorm reduction body's store, the GEMM epilogue after bias, the attention body's output store. Each needs a 'store as edge format' variant that computes per-group amax over the tile it owns and writes data+scale."
+    },
+    {
+      "idea": "Quantization as an explicit task (Mirage)",
+      "status": "missing",
+      "evidence": "No quantize op family in lowering.py/regions.py",
+      "notes": "Fallback when producer cannot fuse: a standalone 'quantize' map/reduction body generated by the generic provider. In MegaBake that costs one extra phase and barrier interval (~0.7 us + body time) per edge, so it should only be chosen when no producer epilogue variant exists."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Whole-program format assignment instead of pairwise sniffing",
+      "why_multi_kernel_cannot": "Strictly speaking it can: vLLM proves edge formats can be negotiated across separate kernels. But in vLLM the decision is local (producer checks one consumer's kernel class), done in Python per layer class, and every new pairing needs hand code. A megakernel compiler that owns all bodies, all buffers and the schedule can solve formats for every edge jointly (fan-out edges, residual edges, KV caches) and verify each region against the source program. This is a compiler advantage more than a megakernel advantage.",
+      "nearest_multi_kernel_substitute": "vLLM's QuantizedActivation + torch.compile fusion passes (act_quant_fusion, rms_quant_fusion, attn_quant_fusion) - achieves the same bytes for the patterns that were hand-registered."
+    },
+    {
+      "opportunity": "Quantization points cost no launch and no extra barrier when fused into an existing phase",
+      "why_multi_kernel_cannot": "In a multi-kernel graph an unfused quant op is a whole kernel (~2-5 us launch+tail at decode even with CUDA graphs and PDL); in MegaBake a fused epilogue quant adds only ALU work inside a phase that already exists. If not fused, MegaBake pays a phase+barrier (~0.7 us + body time) which is still cheaper than a launch.",
+      "nearest_multi_kernel_substitute": "Epilogue fusion in the producer kernel (vLLM does exactly this) - equivalent when the fusion exists; PDL hides part of the launch when it does not."
+    },
+    {
+      "opportunity": "Per-tensor dynamic scales via in-kernel grid reduction",
+      "why_multi_kernel_cannot": "A dynamic per-tensor FP8 scale needs a global amax before any element is quantized: multi-kernel graphs need an extra kernel (or atomics + second pass). In the persistent kernel the amax can be reduced with the same counting mechanism as the grid barrier/event counters and consumed in the next phase. Note block-scaled formats (MXFP8 1x32, NVFP4 1x16) avoid the global reduction entirely, so this matters only for per-tensor/per-channel schemes.",
+      "nearest_multi_kernel_substitute": "Static calibrated scales, or per-token/per-group dynamic scales computed inside the producer."
+    },
+    {
+      "opportunity": "Tile-granular consumption of quantized data and scales (after event counters land)",
+      "why_multi_kernel_cannot": "With ROADMAP step 10 event counters, a consumer GEMM tile can start once the producer tiles covering its K-range (data and matching scale blocks) are published, overlapping quant epilogue with the next GEMM's weight streaming. Separate kernels serialize at kernel granularity; PDL only overlaps the dependent kernel's prologue.",
+      "nearest_multi_kernel_substitute": "PDL (griddepcontrol) - overlaps launch/prologue, not data-dependent tiles."
+    },
+    {
+      "opportunity": "Arena-resident scale buffers with lifetime reuse",
+      "why_multi_kernel_cannot": "Scale tensors are small, padded, oddly-strided buffers; in MegaBake they can live in the static arena with liveness-based reuse, and even in shared memory when producer and consumer run in the same CTA. Multi-kernel graphs must allocate them in global memory between kernels.",
+      "nearest_multi_kernel_substitute": "Workspace managers (vLLM current_workspace_manager) - same memory reuse, no smem residency."
+    }
+  ],
+  "measured_or_reported_gains": [
+    "vLLM mega attention vs split-KV on one GB300 (64-head DSV4.1, topk_swa=128, topk_extra=512, NVFP4 compressed cache, CUDA graphs): TP1 s_q=128: 31 vs 40 us, s_q=256: 53 vs 72 us, s_q=512: 96 vs 140 us (up to 1.45x); TP2-TP8 within a few percent, with a fixed ~2 us penalty at small s_q because the kernel always pays for 64 padded heads (flash_mla_mega_attn.py:64-88). The gain comes from absorbing inverse RoPE + FP8 cast whose cost scales with live heads.",
+    "The authors warn that eager-mode measurements overstate the fused path several-fold because launch overhead swamps both paths (flash_mla_mega_attn.py:86-88) - relevant to how MegaBake attributes wins.",
+    "Record sizes per token for the DSV4.1 compressed cache: bf16 1024 B, V4 fp8 584 B, V4.1 MXFP8 528 B, NVFP4 288 B (3.6x smaller than bf16) (fused_compress_quant_cache.py:306-316).",
+    "DeepGEMM reports up to ~1550 TFLOPS FP8 on H800 [uncertain - third-party article number, not reproduced].",
+    "No end-to-end numbers for QuantizedActivation fusion alone were found; the fusion removes one quant kernel launch and one bf16 write+read of the activation per edge [uncertain magnitude]."
+  ],
+  "expected_impact_on_megabake": [
+    {
+      "rank": 1,
+      "item": "FP8 weights (W8A8 block-scaled or W8A16 weight-only) for decode GEMMs, under an explicit opt-in numerical policy",
+      "estimate": "SmolLM-1.7B: weights ~3.4 GB bf16, GEMMs stream at ~1.8 TB/s => ~1.9 ms of the 2.98 ms decode kernel. FP8 halves weight bytes => ~0.9-1.0 ms saved, kernel ~2.0 ms, below Inductor-bf16's 2.42 ms [uncertain: assumes the FP8 GEMM keeps ~80% of bandwidth and scale handling is hidden]. Qwen2-0.5B: ~1 GB weights => ~0.45 ms floor, save ~0.2-0.25 ms of 1.58 ms. SmolLM-135M: ~0.27 GB => <0.07 ms of 1.50 ms (latency-bound; negligible). Prefill above 64 tokens: no gain until the >64-row path is fixed.",
+      "caveat": "This changes numerics relative to the captured bf16 program, so it is not 'source_semantics'; it is only legitimate when the user's model is already an FP8 checkpoint (then the captured graph contains dequant/scaled-mm ops MegaBake must lower) or the user opts in. The format-negotiation machinery is what makes it cheap; the bandwidth win comes from the weights."
+    },
+    {
+      "rank": 2,
+      "item": "Epilogue quantization of activations (norm->QKV, attn->o_proj, norm->gate/up, silu*mul->down) once GEMMs consume FP8 activations",
+      "estimate": "Without fusion each of 4 quant points per layer becomes its own phase: ~4 x (0.7 us barrier + ~1-2 us body) x 24 layers (1.7B) = ~0.25-0.3 ms extra, eating ~25-30% of the FP8 weight win; with producer-epilogue quantization the extra cost is ~0 phases. Activation bytes themselves are tiny at decode (2048 x 2 B per token), so the win is entirely avoided phases, not bandwidth."
+    },
+    {
+      "rank": 3,
+      "item": "Absorbed-work moves (RoPE into attention body, RMSNorm into GEMM prologue, residual add into GEMM epilogue) expressed as absorbable patterns",
+      "estimate": "Each removed standalone phase saves ~0.7 us barrier + 1-3 us body. RMSNorm prologue (2 per layer) + RoPE absorption (1) on 1.7B: ~3 x 24 x ~2-3 us = ~0.15-0.2 ms of 2.98 ms (5-7%) [uncertain: depends on how many of these are already folded into intervals by step 8 interval folding]. 135M (30 layers, more latency-bound): proportionally larger, ~8-10% [uncertain]."
+    },
+    {
+      "rank": 4,
+      "item": "FP8 / NVFP4 KV cache",
+      "estimate": "Small today. 1.7B KV is ~196 KB/token (24 layers x 2 x 2048 x 2 B), so 2,000 cached tokens = ~0.39 GB => ~0.18 ms at 2.2 TB/s, while measured decode grows from 2.66 to 5.51 ms over that range: attention is latency/efficiency-bound, not KV-bandwidth-bound. FP8 KV would save <=0.09 ms, NVFP4 <=0.13 ms, and SM90 has no FP4 MMA so NVFP4 must be dequantized in the attention body. Revisit only after the attention body approaches bandwidth."
+    },
+    {
+      "rank": 5,
+      "item": "Typed edge formats as infrastructure (no direct speedup)",
+      "estimate": "Zero runtime change by itself, but it removes the need for model-specific pairings and is a prerequisite for ranks 1, 2 and 4."
+    }
+  ],
+  "generality_and_overfitting_risk": {
+    "vllm_reference_risks": [
+      "The DSV4.1 stack is the opposite of generic: WV_GROUP_SIZE=8 (fused_layout.py:20), nope/rope (448,64) and head_dim 512 (flash_mla_mega_attn.py:54-57, o_proj.py:43), FlashMLA h_q in {64,128}, wo_a token limits 96/32 chosen by CTA count (o_proj.py:20-27), GB300-measured break-even table, consumer detected by kernel class name (query_quant.py:144-151, o_proj.py:38-40), cache record dispatched by magic byte widths 584/528/288 (fused_compress_quant_cache.py:326-331). MegaBake should copy the contract shape, not these constants.",
+      "vLLM itself admits the generic contract is incomplete (quant_activation.py:28-30, 56-58 TODOs: layout, padding and consumer static/global scales are not in the contract)."
+    ],
+    "megabake_code_flags": [
+      "src/megabake/bodies/gemm.py:1708-1711 TABLE_GEMM_SHARED_BYTES hard-codes eight BF16 64x64x64 stages + four 64x32 BF16 epilogue stages for the whole table launch; an FP8 GEMM (K-tile 128 for the same bytes) or a scale-carrying epilogue breaks the 'one shared-memory layout' assumption (interface.py:30-33).",
+      "src/megabake/bodies/gemm.py:1818-1821 BF16-only and :1826-1831 N/K multiple of 64: tuned to the tested models' hidden sizes (576, 896, 2048, 8192 all multiples of 64); a model with N%64!=0 falls to the generic contraction body.",
+      "src/megabake/bodies/interface.py:37-42 table_gemm_swap_ab_rows in {16,32,64} and split-K 'off by default' were tuned on the 60-SM MIG slice (ROADMAP section 6: 'Split-K: no gain on the 60-SM slice'); FP8 halves bytes per tile so the best swapAB tile and split-K decision will shift and must be re-searched, not inherited.",
+      "src/megabake/planner.py:500-510 _body_cost = threads*regs + smem - fusion_saved_bytes is a resource heuristic, not a time model; it cannot price 'quantize in producer epilogue' vs 'conversion body' vs 'consumer quantizes itself'. A bytes+phases cost model (or measured evidence via ResourceEvidence.measured) is needed before adding format choices, otherwise the choice will be whatever matched the tested models.",
+      "Five duplicated dtype byte/type tables (planner.py:796-806, codegen.py:150-180, bodies/catalog.py:30-41, bodies/generic.py:1350, regions.py:41) - adding fp8/fp4 must be done once in a shared dtype registry including sub-byte packing (fp4 = 0.5 B), or sizes will silently be 0 (planner.py:793 uses .get(dtype, 0)).",
+      "src/megabake/compiler.py:237-243 acceptance tolerances justified by SmolLM-135M/1.7B rounding behaviour; quantized edges need per-format tolerances derived from the format (e.g. 2^-3 relative for e4m3, larger for e2m1), not from the tested models.",
+      "src/megabake/bodies/attention.py:108-140 and lowering.py:1860-1869: attention and KV caches are BF16-only with 'two contiguous caches' - HF-cache-shaped, so any packed record would need the declared-op ABI to change."
+    ],
+    "how_to_stay_generic": "Model the edge format as data (dtype, ScaleSpec{dtype, group shape, static/dynamic, second level}, data CuTeLayout incl. permutation/swizzle, scale CuTeLayout, padding, rounding mode) and let bodies declare ranked sets of acceptable input formats and producible output formats with costs; derive availability from TargetFacts (supported MMA operand kinds) rather than architecture strings; choose formats with a whole-graph solver over the planner's existing per-edge conversion costs; derive accuracy tolerances from the format; keep every tile/stage constant derived from dtype width and smem capacity rather than literal BF16 numbers. Inductor and Mirage both fall back to autotuning/measured selection for such choices; MegaBake's ResourceEvidence.measured hook is the place to plug it in."
+  },
+  "hardware_portability": {
+    "sm90": "FP8 e4m3/e5m2 WGMMA exists (K=32 per instruction, both operands must be 8-bit, K-major only - see gemm.py:100-110 docstring of the vendored CUTLASS kernel). There is NO block-scaled MMA: MXFP8/blockwise scales must be applied in software, DeepGEMM-style, by promoting the FP32 partial sums into CUDA-core registers every scale block (e.g. 128 K). No FP4 tensor-core path: NVFP4/MXFP4 can only be storage formats dequantized to bf16/fp8 in registers before WGMMA. TMA can load scale tensors but they need their own descriptors (the table launch writes 3 descriptors per GEMM today, gemm.py:1718-1740; scales would add 1-2).",
+    "sm100": "tcgen05.mma kind::mxf8f6f4 and kind::mxf4nvf4 take block scales from TMEM (copied via tcgen05.cp/UTCCP, which dictates the 128x4 swizzled scale layout and a warp transpose - Mirage linear_fp8_1d2d_sm100.cuh:45-60). This is why vLLM's producers emit F8_128x4 scales for FlashInfer and why NVFP4 caches are SM100-only. CLC and TMEM change epilogue structure (accumulator read from TMEM), so epilogue-quant code must be a per-target body variant.",
+    "sm80_and_others": "SM80 has no FP8 MMA: only int8 W8A8 or weight-only dequant (W8A16, W4A16) fit; SM120 has block-scaled mma.sync; AMD gfx950 has native MXFP8/MXFP4 (vLLM rocm.py:913-933 picks a plain-row scale layout there). TPU has its own fp8 support with different layouts.",
+    "design_rule": "Keep the edge-format vocabulary and solver target-independent; put 'which formats an MMA can consume, which scale layouts it requires, and whether scales are hardware- or software-applied' into TargetFacts and the per-target body providers. The planner then only sees formats + costs."
+  },
+  "recommended_actions": [
+    {
+      "action": "Introduce a shared dtype/format registry: add float8_e4m3fn, float8_e5m2, float8_e8m0fnu, float4_e2m1 (packed, 0.5 B) and replace the five _DTYPE_BYTES/type-map copies with it",
+      "expected_gain": "0 runtime; removes silent size-0 bugs and is a prerequisite for everything below",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/planner.py, codegen.py, regions.py, bodies/catalog.py, bodies/generic.py, plan.py",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Extend the body interface with typed edge formats: EdgeFormat{element dtype, ScaleSpec(dtype, group shape, static|dynamic, optional second-level scale), data TensorLayout (incl. permutation/swizzle), scale TensorLayout, padding, rounding}; LayoutContract.inputs/outputs map value_id -> EdgeFormat; bodies may offer several (ranked) alternatives",
+      "expected_gain": "0 runtime by itself; makes format choice a compiler decision instead of per-model code (avoids vLLM's kernel-class sniffing)",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/interface.py (TensorLayout/LayoutContract/validate_body_config), plan.py (CuTeLayout, needs_conversion_to), planner.py",
+      "prerequisite": "dtype registry"
+    },
+    {
+      "action": "Replace _insert_layout_conversions with a whole-graph format assignment: for each value pick one producer output format and per-consumer conversions minimizing (bytes moved + phases added x ~0.7 us + epilogue ALU cost); handle fan-out like vLLM's requires_unquantized_input (one consumer needs bf16 => producer emits both or a conversion is inserted)",
+      "expected_gain": "Avoids ~0.25-0.3 ms of extra quant phases on 1.7B once FP8 GEMMs exist [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/planner.py (_insert_layout_conversions, _body_cost, _conversion_cost), plan.py ConversionBody (allow dtype-changing conversions = quantize/dequantize bodies), codegen.py:1768",
+      "prerequisite": "typed edge formats; a bytes/phase cost model instead of threads*regs"
+    },
+    {
+      "action": "Add 'absorbable prologue/epilogue' declarations to SemanticContract (e.g. absorbs=('rmsnorm_rows','rope_q','residual_add','quantize:<format>')) and teach region formation to move those ops into whichever neighbouring body declares them - the compiler analogue of accepts_unnormed_unroped_query",
+      "expected_gain": "~5-7% of 1.7B decode from removed phases (RMSNorm prologue, RoPE into attention, residual epilogue) [uncertain]",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/interface.py (SemanticContract), regions.py (candidate formation, gated-MLP paired epilogue), bodies/gemm.py (prologue/epilogue hooks), bodies/attention.py",
+      "prerequisite": "ROADMAP 4.2 item 3"
+    },
+    {
+      "action": "Implement epilogue quantization variants for the reduction (RMSNorm), GEMM and attention bodies: per-group amax over the tile row, UE8M0/e4m3 scale encode with explicit rounding mode, write data + scale in the consumer-requested scale layout; keep the bf16 rounding boundary before quantizing (as query_quant.py:63-64 does) so results stay comparable to an eager reference that materializes bf16",
+      "expected_gain": "Enables FP8 GEMMs without extra phases",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/generic.py (reduction store), bodies/gemm.py (epilogue next to bias at :231-232, 1927-1940), bodies/attention.py (output store)",
+      "prerequisite": "typed edge formats"
+    },
+    {
+      "action": "SM90 FP8 GEMM body: e4m3 WGMMA with block scales applied by CUDA-core promotion per scale block, scale TMA descriptors in the table launch, swapAB variant for <=64 rows; derive TABLE_GEMM_SHARED_BYTES and stage counts from operand width instead of the BF16 literal",
+      "expected_gain": "~0.9-1.0 ms on SmolLM-1.7B decode (2.98 -> ~2.0 ms), ~0.2 ms on Qwen2-0.5B, ~0 on 135M [uncertain]; only applies to FP8 checkpoints or opted-in quantization",
+      "effort": "L",
+      "generality": "hw-specific",
+      "files_to_touch": "src/megabake/bodies/gemm.py (provider gate :1818-1849, table descriptors :1718-1740, TABLE_GEMM_SHARED_BYTES :1708-1711), interface.py SelectionPolicy",
+      "prerequisite": "typed edge formats, epilogue quant, constant relayout pass"
+    },
+    {
+      "action": "Add a compile-time constant relayout/quantize pass for weights (permute rows/cols, quantize to FP8/NVFP4, pack/swizzle scales) driven by the selected body's weight contract, mirroring vLLM's permute_on_load",
+      "expected_gain": "Enables interleaved layouts and FP8 weights at zero runtime cost",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py, memory.py (constant arena), bodies/gemm.py",
+      "prerequisite": "typed edge formats"
+    },
+    {
+      "action": "Frontend: recognise already-quantized HF checkpoints (FP8 block-quant linears, torch._scaled_mm, dequant patterns) and lower them to a 'scaled contraction' family instead of falling back",
+      "expected_gain": "Coverage for FP8 checkpoints; keeps numerics faithful to the source (source_semantics stays valid)",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/lowering.py, regions.py, fx_handler/",
+      "prerequisite": "dtype registry"
+    },
+    {
+      "action": "Add supported MMA operand kinds and scale mechanics to TargetFacts (e.g. mma_formats={'bf16','fp16','e4m3','e5m2'}, block_scaled_mma=False on sm90a; mxf8f6f4/mxf4nvf4 on sm100) and gate providers on facts rather than architecture strings",
+      "expected_gain": "Portability (SM100/SM80) without per-model gates",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/interface.py:12-21, bodies/gemm.py:1846-1849, bodies/blackwell.py",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Defer packed FP8/NVFP4 KV caches until attention is bandwidth-bound; when done, model the cache record as an EdgeFormat between the cache-update body and the attention body and expose it in the declared kv_attention op ABI",
+      "expected_gain": "<=0.1 ms at 2,000 tokens on 1.7B today [uncertain]; larger once attention is efficient",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/lowering.py:1860-1869, fx_handler/transformers.py, fx_handler/hf_attention.py, bodies/attention.py",
+      "prerequisite": "efficient attention body, typed edge formats"
+    },
+    {
+      "action": "Make accuracy tolerances format-derived (per edge format) instead of model-derived constants",
+      "expected_gain": "Avoids overfitting acceptance thresholds to SmolLM rounding",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py:237-243 and the region verification path",
+      "prerequisite": "typed edge formats"
+    }
+  ],
+  "open_questions": [
+    {
+      "question": "How much of the per-layer RMSNorm/RoPE/residual phases is already hidden by interval folding (ROADMAP step 8), i.e. the real gain from absorbed-work moves",
+      "experiment": "tools/phase_profile.py on 1.7B and 135M decode: attribute per-phase time to norm/rope/residual phases and count barriers that would disappear"
+    },
+    {
+      "question": "Achievable bandwidth of an SM90 FP8 block-scaled swapAB GEMM at M<=64 on the 60-SM slice (does software scale promotion keep ~80% of 2.2 TB/s?)",
+      "experiment": "Standalone CuTe-DSL FP8 WGMMA kernel with 1x128/128x128 scales on the tested projection shapes (576..8192), measured back-to-back after a clock ramp once the GPU is free"
+    },
+    {
+      "question": "How HF FP8 checkpoints appear in the AOT post-grad FX graph (custom triton ops, torch._scaled_mm, or dequant + mm)",
+      "experiment": "Capture an FP8 HF model (e.g. a Qwen FP8 checkpoint) with the existing frontend and dump the op histogram"
+    },
+    {
+      "question": "Whether a whole-graph format solver stays tractable with fan-out edges and multiple alternatives per body, given planner compile times (1.7B 512 bucket 41 min)",
+      "experiment": "Prototype the solver on the existing region graph with 2-3 formats per edge and measure planning time per bucket"
+    },
+    {
+      "question": "Numerical acceptance for opted-in quantization (what logits error is acceptable vs eager bf16)",
+      "experiment": "Run eager PyTorch with simulated FP8 weight/activation quantization and compare perplexity/logit drift to bf16 on the tested models"
+    },
+    {
+      "question": "Whether vLLM's DSV4.1 NVFP4 compressed cache accuracy and the GB300 speedups transfer to other models",
+      "experiment": "Not checkable statically; would require running benchmarks/kernels/benchmark_dsv41_mega_attn.py on SM100 hardware"
+    }
+  ],
+  "uncertain": [
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake"
+  ]
+}

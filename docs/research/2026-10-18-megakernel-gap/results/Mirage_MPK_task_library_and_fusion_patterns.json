@@ -1,0 +1,384 @@
+{
+ "name": "Mirage MPK task library and fusion patterns",
+ "scope": "Read Mirage MPK at commit f9eb70c (2026-10-05): the model builder python/mirage/mpk/models/qwen3/builder.py, the grid helpers in models/utils.py, the layer APIs in persistent_kernel.py, the task-name-to-template dispatch in src/kernel/graph.cc and task_register.cc, the Hopper task bodies (linear_swapAB_hopper.cuh, norm_linear_hopper.cuh, rmsnorm_hopper.cuh, multitoken_paged_attention_hopper.cuh), the list of SM100 tasks, and the superoptimizer commits 9135e9fb and e67c7eea. Compared them with MegaBake's bodies (bodies/gemm.py, attention.py, catalog.py, blackwell.py), region matchers (regions.py), interval folding (schedule.py), policy setup (compiler.py:415-423), ROADMAP.md, PERFORMANCE_REPORT.md and artifacts/full_model_2026-10-18/*/report.json. Question: which of Mirage's per-task fusions, split strategies and tile choices MegaBake lacks, which of them matter on a 60-SM H200 MIG slice, and which are generic rather than tuned to Qwen3.",
+ "key_sources": [
+  "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:291-293 (split-K only when target_cc==100: 'A current workaround to use splitk for only B200 GPUs')",
+  "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:354-367 (on the current path, an unfused rmsnorm_layer (grid = max_num_batched_tokens) followed by linear_layer for QKV)",
+  "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:300-353 (Q/K/V weights interleaved per KV head with shuffle_tensors into one fused QKV weight)",
+  "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:399-410 (paged_attention_layer grid=(max_requests, num_kv_heads); fuses q/k-norm, RoPE, KV append and attention)",
+  "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:414-432,539-547 (o_proj/down_proj: splitk_linear_layer that reduce-adds into the residual x on SM100, else linear_with_residual_layer grid=hidden//64)",
+  "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:450-525 (gate/up interleaved into num_tasks//2 groups, one gate+up linear, silu_mul with grid num_tasks//2)",
+  "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:625-680 (lm_head padded to 153600, argmax_partial grid=num_workers, argmax_reduce grid=1; sampling_partial/reduce for top-k/top-p)",
+  "agent_space/mirage/python/mirage/mpk/models/utils.py:3-15 (grid_for_rmsnorm_linear_layer: 96 or 64 tasks, size//256 if size/96>400; comment says '96 and 64 are enough to cover all Qwen3 model?')",
+  "agent_space/mirage/python/mirage/mpk/models/utils.py:17-34 (grid_for_splitk_linear_layer: x=N/128, splits=largest s<=16384/N with K%s==0 and (K/s)%64==0)",
+  "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:865-902 (rmsnorm_layer, rmsnorm_linear_layer)",
+  "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:1303-1433 (paged_attention_layer params and dispatch to paged_attention_hopper/sm100)",
+  "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:2365-2487 (splitk_linear_layer, linear_layer, linear_with_residual_layer; SM90 always routes to linear_swapAB_hopper)",
+  "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:2513-2590 (silu_mul_layer, silu_mul_linear_with_residual_layer)",
+  "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:2603-2657 (argmax_partial/argmax_reduce)",
+  "agent_space/mirage/src/kernel/graph.cc:440-640 (task name -> TaskRegister variant: rmsnorm_linear, linear_swapAB_hopper, splitk_linear_swapAB_hopper, paged_attention_split_kv_hopper, moe_w13/w2_linear_sm90, ...)",
+  "agent_space/mirage/src/kernel/task_register.cc:489-530 (rmsnorm_linear -> norm_linear_task_impl, templated on batch/output/reduction/stride)",
+  "agent_space/mirage/src/kernel/task_register.cc:1588-1760 (linear_swapAB_hopper registration: Kstages=5, TILE_SIZE(K)=128, TMA box 64, assert batch_size<=16, SMEM_M 8 or 16, residual TMA)",
+  "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/linear_swapAB_hopper.cuh:31-386 (1 producer WG + 1 consumer WG, wgmma m64nNk16 with N=8/16, residual added in the epilogue from smem, SplitK flag -> tma_reduce_add_async at :368)",
+  "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/norm_linear_hopper.cuh (fused RMSNorm+linear Hopper body; not used by the current Qwen3 builder)",
+  "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/rmsnorm_hopper.cuh:1-60 (one token per task, 16B cp.async vectorization)",
+  "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/multitoken_paged_attention_hopper.cuh:34-340 (KV_TILE 64, m64n64k16, page_indices staged in smem, qk-norm+RoPE+cache append fused, PARTITION_KV split)",
+  "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/moe_linear_swapAB_hopper.cuh (grouped swapAB MoE linear for SM90)",
+  "agent_space/mirage/include/mirage/persistent_kernel/tasks/blackwell/ (linear_sm100_mpk, splitk, fp8 group GEMM, MLA decode/prefill, topk_softmax/sigmoid routing, sampling_sm100, argmax_sm100)",
+  "agent_space/mirage/git commit 9135e9fb 'Let the superoptimizer choose an MPK task' (per-task speed is not end-to-end speed; K tile 64->128 +10.5%, stages 2->4 +6.1%, MMA shape neutral)",
+  "agent_space/mirage/git commit e67c7eea 'Cut the graph path to its minimum' (fully generated Qwen3 at 0.16x hand-written MPK; search picks a 2400-block lm_head; the residual-fused split-K partition is worth ~2.5x)",
+  "src/megabake/bodies/gemm.py:1788-1885 (G0RangeBodyProvider: BF16 only, N,K%64, sm90a only; table launch gives one swapAB tile per launch)",
+  "src/megabake/bodies/gemm.py:1888-1920 (SWAP_AB_MAX_ROWS=64, SWAP_AB_ROW_TILES=(16,32,64), SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2, split_k_count)",
+  "src/megabake/bodies/gemm.py:1076-1131 (_reduce_splits: deterministic FP32 partials + atomic counter, the last split sums in order)",
+  "src/megabake/bodies/gemm.py:1708-1711 (TABLE_GEMM_SHARED_BYTES: 8 stages of 64x64x64 plus 4 epilogue stages, shared by every GEMM in the launch)",
+  "src/megabake/bodies/gemm.py:1986-1994 (swap_ab_rows/wants_swap_ab: all-or-nothing per launch)",
+  "src/megabake/compiler.py:415-423 (policy: swapAB if every GEMM <=64 rows; split-K only with MEGABAKE_SPLIT_K=1)",
+  "src/megabake/regions.py:501-690 (fused RMSNorm region with optional pre-add residual)",
+  "src/megabake/regions.py:2159-2280 (gated_mlp paired-GEMM candidate is always rejected with 'paired GEMM provider is not implemented' at :2240)",
+  "src/megabake/schedule.py:1381-1499 (_fold_small_intervals: small map/reduction producers are recomputed on every worker inside the consumer's interval; limits 2/6/6)",
+  "src/megabake/bodies/attention.py:422-423,738-750 (split-context decode: DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64, cost passes/chunks*(1+0.15*(passes-1)))",
+  "src/megabake/bodies/blackwell.py:1-30 (SM10x/12x provider using synchronous warp MMA, no tcgen05/TMEM)",
+  "ROADMAP.md:46,77-79,118-129,140-150 (Mirage comparison, planned epilogue/prologue fusion, step status, 1.7B breakdown, split-K gives no gain on 60 SMs)",
+  "PERFORMANCE_REPORT.md:70-89,261-282 (135M phase attribution; paired gate/up rejected; one GEMM tile per launch because of shared smem)",
+  "artifacts/full_model_2026-10-18/*/report.json (decode kernel us: 1.7B MegaBake 2974 vs Inductor 2425; 135M 1502 vs 1382; Qwen2-0.5B 1584 vs 1636)",
+  "https://arxiv.org/abs/2512.22219 (MPK paper, OSDI'26: up to 1.7x lower end-to-end latency than kernel-per-operator systems)",
+  "https://www.usenix.org/conference/osdi26/presentation/cheng"
+ ],
+ "core_ideas": [
+  {
+   "idea": "swapAB small-batch linear (linear_swapAB_hopper)",
+   "how_it_works": "For decode with at most 16 tokens, the weight (N rows) is the WGMMA A operand on M=64 and the tokens are B with N=8 or 16 (MMA_ATOM_N). One producer warpgroup issues TMA for 64x128 weight tiles and 16x128 activation tiles into a 5-stage ring. One consumer warpgroup runs wgmma m64nNk16, waits on it each stage (mma_async_wait), and loops sequentially over the 64-column output atoms of its task slice. The epilogue converts to bf16 in smem and does a TMA store. Each task owns OUTPUT_SIZE/grid columns. The body is a template instantiated per (batch, N, K, stride).",
+   "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/linear_swapAB_hopper.cuh:31-386; agent_space/mirage/src/kernel/task_register.cc:1588-1760"
+  },
+  {
+   "idea": "linear_with_residual: residual add in the GEMM epilogue",
+   "how_it_works": "A third TMA (TMA_RESIDUAL) loads the 16x64 residual slice per output atom into a separate smem ring while the K loop runs. The epilogue computes bf16(acc) + residual in smem before the TMA store, which removes a separate add pass and its round trip. Under TP, only rank 0 adds the residual (params[0]), so an all-reduce does not double-count it.",
+   "where_in_source": "agent_space/mirage/linear_swapAB_hopper.cuh:235-250,330-345; agent_space/mirage/persistent_kernel.py:2449-2486; builder.py:426-433"
+  },
+  {
+   "idea": "Split-K that reduce-adds straight into the residual stream (SM100 default, SM90 available)",
+   "how_it_works": "grid=(N/128, s), where s is the largest split <= 16384/N with K%s==0 and (K/s)%64==0. Each split's partial is written with a TMA bulk reduce-add (cp.reduce.async.bulk .add) into the output. The builder sets the output tensor to the residual x itself (attn_proj_out = self.x), so the reduce-add also performs the residual add. There is no partial buffer, no counter and no fixup task. Summation order is nondeterministic.",
+   "where_in_source": "agent_space/mirage/builder.py:291-293,415-424; utils.py:17-34; linear_swapAB_hopper.cuh:366-372; persistent_kernel.py:2365-2388"
+  },
+  {
+   "idea": "rmsnorm_linear fusion: norm recomputed in every linear task",
+   "how_it_works": "norm_linear_task_impl and norm_linear_kernel_hopper load the full input row and compute sum of squares, rsqrt and the weight multiply in smem, then run the GEMM on the normalized tile. Each of the 64-96 linear tasks recomputes the norm redundantly, which removes the dependency on a separate norm task. On the current Qwen3 builder path, Mirage instead runs rmsnorm_hopper (one task per token) and then linear_swapAB_hopper, with fine-grained event dependencies. With events, an extra small task costs about one event wait, not a grid barrier.",
+   "where_in_source": "agent_space/mirage/persistent_kernel.py:883-902; task_register.cc:489-530; tasks/hopper/norm_linear_hopper.cuh; builder.py:354-367 (unfused current use)"
+  },
+  {
+   "idea": "Fused QKV weight interleaved per KV head",
+   "how_it_works": "At build time, shuffle_tensors([Wq,Wk,Wv], num_groups=num_kv_heads, dim=0) lays out the weight as [Q_h0..,K_h0,V_h0,Q_h1,...]. One linear produces attn_in, and the attention task for KV head h reads one contiguous (q_per_kv+2)*head_dim slice. One phase replaces three GEMMs, and the attention dependency per head is local (the imap slices attn_in by kv head). Commit 9135e9fb notes that a plain concat silently produces fluent nonsense, because the attention kernel assumes the per-group interleave.",
+   "where_in_source": "agent_space/mirage/builder.py:300-353; utils.py:50-90; multitoken_paged_attention_hopper.cuh (num_head_group = qkv_stride/head_dim/(q_per_kv+2))"
+  },
+  {
+   "idea": "Fused gate/up weight interleaved by task group + separate silu_mul task",
+   "how_it_works": "gate_proj and up_proj are interleaved into num_tasks/2 groups, so each pair of linear tasks writes adjacent gate and up chunks. silu_mul then runs with grid num_tasks/2, and each silu_mul task depends only on its own two linear tasks through events. The silu_mul_linear_with_residual task (silu in the down-proj prologue) exists but the Qwen3 builder does not use it.",
+   "where_in_source": "agent_space/mirage/builder.py:450-525; persistent_kernel.py:2513-2590"
+  },
+  {
+   "idea": "Monolithic paged decode attention task (qk-norm + RoPE + KV-cache append + attention)",
+   "how_it_works": "One task per (request, kv_head). It stages the page table in smem, loads the Q group and the new K/V rows, applies the per-head RMS qk-norm and NeoX RoPE (partial rotary_dim supported), appends K/V to the paged cache, and runs online softmax over 64-key tiles with wgmma m64n64k16. The split-KV variant partitions the sequence (PARTITION_KV) and adds a merge_splitkv task. Sliding window and sinks exist only on SM100.",
+   "where_in_source": "agent_space/mirage/tasks/hopper/multitoken_paged_attention_hopper.cuh:34-340; persistent_kernel.py:1303-1566"
+  },
+  {
+   "idea": "In-kernel argmax/sampling (two-level partial + reduce)",
+   "how_it_works": "lm_head is padded to 153600 rows (hard-coded) and split into size//256 = 600 tasks. argmax_partial runs one task per worker over a vocab slice and writes (value, index), masking padded ids past the real vocab. argmax_reduce runs as a single task. The sampling variant keeps the per-worker top-k (sampling_topk_max=32) plus a max and sum, then the reduce applies temperature, top-k and top-p with Gumbel sampling. The token id is written to a device buffer that also feeds the next step's embedding.",
+   "where_in_source": "agent_space/mirage/builder.py:625-680; persistent_kernel.py:2603-2760"
+  },
+  {
+   "idea": "Task count per linear (spatial split) chosen by a fixed rule",
+   "how_it_works": "Linear grids are 96 or 64 tasks (whichever divides N), size//256 for huge N (lm_head), and hidden//64 for the residual linears (o_proj, down). On SM90 each task loops over N/grid/64 output atoms. The count is fixed per shape, with no autotuning. The grid helper's own comment says 96 and 64 'are enough to cover all Qwen3 model'.",
+   "where_in_source": "agent_space/mirage/python/mirage/mpk/models/utils.py:3-15; builder.py:365,431,517"
+  },
+  {
+   "idea": "MoE task family",
+   "how_it_works": "Top-k softmax or sigmoid routing tasks, moe_w13_linear_sm90 and moe_w2_linear_sm90 (grouped swapAB over the selected experts), moe_silu_mul or clamped_swiglu, and moe_mul_sum_add, which combines the expert outputs with the router weights and the residual. SM100 adds an FP8 group GEMM and per-token-group quantization.",
+   "where_in_source": "agent_space/mirage/persistent_kernel.py:1972-2365; tasks/hopper/moe_linear_swapAB_hopper.cuh; tasks/blackwell/{fp8_group_gemm_sm100,topk_softmax_sm100,mul_sum_add_sm100}.cuh"
+  },
+  {
+   "idea": "Per-target task variants selected at build time",
+   "how_it_works": "Every layer API branches on target_cc: SM80 uses mma.sync tasks (linear.cuh, norm_linear.cuh), SM90 uses TMA+WGMMA swapAB, and SM100 uses tcgen05/TMEM linear_sm100 (each task's column slice must be a multiple of 8 for TMA alignment) plus FP8 and MLA kernels. Several features (bias, window, sinks, splitk by default) exist only on SM100 and are refused on other targets.",
+   "where_in_source": "agent_space/mirage/persistent_kernel.py:2390-2447,1424-1433; src/kernel/graph.cc:560-640"
+  },
+  {
+   "idea": "Superoptimizer-generated tasks and whole-model ranking (research branch)",
+   "how_it_works": "The lowering IR (python/mirage/mpk/lowering) makes task boundaries a decision: convex contiguous partitions of an SSA graph, each group searched into a threadblock graph and ranked by building and measuring the whole model. Findings: a 1.2x faster silu_mul task left the model 2.5% slower. For generated matmuls, K tile 64->128 gave +10.5%, stages 2->4 +6.1%, and MMA M/N changes were neutral or worse. The fully generated Qwen3 reached 0.16-0.275x of hand-written MPK, mainly because search picked bad grids (2400-block lm_head versus 148). The residual-fused split-K partition was worth about 2.5x.",
+   "where_in_source": "agent_space/mirage/git show 9135e9fb, e67c7eea; python/mirage/mpk/lowering/"
+  }
+ ],
+ "megabake_status": [
+  {
+   "idea": "swapAB small-batch linear",
+   "status": "implemented",
+   "evidence": "src/megabake/bodies/gemm.py:1855-1872,1888-1896; ROADMAP.md:83-95,118 (1.7B decode GEMMs 3.66->1.92 ms, 1.78 TB/s)",
+   "notes": "MegaBake uses the CUTLASS persistent WGMMA kernel with a 64-row weight tile and a 16/32/64-token N tile (up to 64 rows, Mirage only 16), 8 stages of K=64. That is 64 KB of weight in flight per CTA, against Mirage's 5 stages x K=128 = 80 KB. Differences: the token tile is one per launch (swap_ab_rows takes the max over all GEMMs), the smem layout is fixed for every GEMM in the launch (TABLE_GEMM_SHARED_BYTES), and N and K must be multiples of 64."
+  },
+  {
+   "idea": "linear_with_residual epilogue",
+   "status": "missing",
+   "evidence": "_store_tile (gemm.py:1133-1215) has only a bias epilogue; ROADMAP.md:79 lists the residual epilogue as planned",
+   "notes": "Residual adds are separate elementwise regions (or the pre-add of the fused RMSNorm region, regions.py:563-575,770-790), and interval folding may recompute them on every worker. The bias path (bias_features) is the natural hook for adding a second TMA- or ld.global-loaded addend before the single bf16 rounding."
+  },
+  {
+   "idea": "Split-K with reduce-add into the residual",
+   "status": "partial",
+   "evidence": "gemm.py:1076-1131,1899-1920; compiler.py:422 (off unless MEGABAKE_SPLIT_K=1); ROADMAP.md:126,150 ('No gain on the 60-SM slice')",
+   "notes": "MegaBake's split-K is deterministic: FP32 partials go to scratch, then an atomic counter lets the last split sum in order. That costs an extra partials write+read plus a counter round trip per tile, and the tile limit is tiles*splits <= SMs. Mirage's SM100 path uses TMA bulk reduce-add straight into the residual stream, with no fixup and the residual add for free, at the cost of nondeterminism. Mirage does not enable split-K on SM90 either, so the 'no gain on 60 SMs' result agrees with Mirage's own default."
+  },
+  {
+   "idea": "rmsnorm_linear fusion",
+   "status": "partial",
+   "evidence": "schedule.py:1381-1499 (_fold_small_intervals recomputes small reductions on every worker in the consumer's interval); regions.py:501-690 (fused norm region)",
+   "notes": "Folding is a schedule-level version of Mirage's redundant per-task norm: the norm runs on every CTA before the GEMM in the same interval. It is not in the GEMM prologue, though. The normalized row still goes through a workspace store and the GEMM's TMA load, and the fold runs as a separate phase inside the interval. A true prologue fusion would apply the rsqrt scale to the B (token) tile in smem; with swapAB that is just 16-64 rows."
+  },
+  {
+   "idea": "Fused QKV weight",
+   "status": "missing",
+   "evidence": "No horizontal GEMM merging in regions.py or lowering.py; Q/K/V are separate contraction regions scheduled in one interval with CTA rotation (PERFORMANCE_REPORT.md:57-58,79 'K and V fill 3 of 60 CTAs')",
+   "notes": "MegaBake already runs Q/K/V concurrently in one barrier interval, so the barrier saving is zero. The gain is better tile packing (one tile list instead of three skewed ones), one pipeline start-up instead of three, and fewer phases/descriptors. Weights are graph constants, so the compiler could concatenate them at compile time (memory cost: a copy, or rebinding if HF stores them adjacently). Interleaving per KV head only matters if attention consumes the slice directly."
+  },
+  {
+   "idea": "Fused gate/up + SiLU-mul",
+   "status": "missing",
+   "evidence": "regions.py:2240 always rejects with 'paired GEMM provider is not implemented'; PERFORMANCE_REPORT.md:261-262,282",
+   "notes": "gate and up are separate GEMM phases in one interval, and SiLU-mul is a separate elementwise region (folded or not). Mirage itself does not fuse SiLU into the GEMM epilogue on SM90; it fuses the weights and relies on per-task events. For MegaBake, with barriers, a paired epilogue that computes silu(g)*u from two accumulators in the same CTA (interleaved weight tiles) removes one region and the mlp_mid round trip."
+  },
+  {
+   "idea": "Monolithic paged attention with qk-norm/RoPE/append",
+   "status": "partial",
+   "evidence": "bodies/attention.py:529-600 (KV append inside the attention body), 738-800 (split-context decode); regions.py:822-1240 (RoPE as its own region)",
+   "notes": "MegaBake appends KV inside attention and has split-context decoding with an in-order merge (Mirage's split_kv plus merge_splitkv). RoPE and qk-norm (Qwen3) remain separate regions that may fold, and the attention body uses warp-per-row CUDA-core math, not WGMMA. Paged KV (page tables) is not supported; the cache is a contiguous HF static cache."
+  },
+  {
+   "idea": "In-kernel argmax/sampling",
+   "status": "not_applicable",
+   "evidence": "MegaBake compiles the HF forward, which returns logits; argmax is only used in main.py:204 for checking",
+   "notes": "It becomes applicable only if MegaBake captures a generation step (logits processors). It would remove a separate argmax/sampling launch and a D2H of logits, worth about 5-15 us per token of host and launch time, and enable on-device multi-step decode."
+  },
+  {
+   "idea": "Task count per linear",
+   "status": "implemented",
+   "evidence": "CUTLASS persistent tile scheduler over 64-row weight tiles with CTA rotation (codegen.py, gemm.py run_table rotated_block); split_k_count uses target.multiprocessor_count",
+   "notes": "MegaBake derives work from tiles and the SM count rather than from Mirage's 96/64 constants, which is more generic. It cannot choose a different tile per GEMM in one launch (PERFORMANCE_REPORT.md:278)."
+  },
+  {
+   "idea": "MoE task family",
+   "status": "missing",
+   "evidence": "No MoE/grouped-GEMM provider in bodies/; catalog.py PROVIDERS = generic, g0_range, attention, blackwell",
+   "notes": "An MoE model would lower its expert matmuls through gather + generic contraction, or not fit the GEMM provider at all (data-dependent row selection). A declared op (like megabake::attention) for grouped top-k experts is the generic path."
+  },
+  {
+   "idea": "Per-target task variants",
+   "status": "partial",
+   "evidence": "bodies/gemm.py:1849 'provider targets sm90a only'; bodies/blackwell.py:1-30 (sync warp MMA, no tcgen05)",
+   "notes": "MegaBake has a provider interface with TargetFacts, which is cleaner than Mirage's per-call target_cc branches. It has no SM80 tuned GEMM and no tcgen05/TMEM GEMM."
+  },
+  {
+   "idea": "Superoptimizer-generated tasks and whole-model ranking",
+   "status": "partial",
+   "evidence": "plan.py search budget and whole-plan measurement; PERFORMANCE_REPORT.md:280,342",
+   "notes": "MegaBake already generates its non-GEMM bodies and measures plans end to end, which is the regime Mirage's research branch found necessary. Mirage's finding that per-task speed misleads applies directly to MegaBake's ranking."
+  }
+ ],
+ "megakernel_exclusive_opportunities": [
+  {
+   "opportunity": "Norm recomputed by each consumer CTA in the same barrier interval / event window (rmsnorm_linear, MegaBake fold)",
+   "why_multi_kernel_cannot": "In a multi-kernel graph, fusing the norm into the GEMM prologue is possible (cuBLASLt cannot, but Triton or Inductor templates can). What a persistent kernel adds is control over WHICH CTAs recompute and when: the norm's outputs never round-trip, and the redundant work overlaps with the previous phase's tail. A separate kernel must either recompute per CTA too (the same idea, feasible in Triton) or pay a launch or PDL boundary.",
+   "nearest_substitute": "An Inductor/Triton GEMM template with a fused prologue; with PDL the boundary is about 1-2 us. So the exclusivity is weak: this fusion is mostly available to multi-kernel compilers too."
+  },
+  {
+   "opportunity": "Split-K reduce-add directly into the live residual stream, consumed by the next layer's norm without a barrier",
+   "why_multi_kernel_cannot": "A split-K kernel can reduce-add into the residual too, but the next kernel (the norm) cannot start until the whole GEMM grid retires. Inside MPK, the next task waits only on an event counter for the residual rows it needs, and with one decode token every task needs all of it, so the gain is the absence of a launch/drain boundary, not finer granularity.",
+   "nearest_substitute": "cuBLAS split-K with beta=1 into the residual, plus PDL. That gets the arithmetic, but launch tails remain (about 2-4 us per boundary on Hopper)."
+  },
+  {
+   "opportunity": "Overlapping a starved GEMM (o_proj/down at N=hidden fills only hidden/64 CTAs) with independent work",
+   "why_multi_kernel_cannot": "Mirage's hidden//64-task o_proj uses only 32 of 132 SMs for a 2048-wide model. That is affordable only because idle workers pick up other ready tasks (the KV of the next layer is not ready, but weight prefetch or the attention of other requests is). Separate kernels on one stream cannot share SMs that way. Multi-stream concurrency can, but the scheduler does not pin it.",
+   "nearest_substitute": "Split-K or stream-K inside the GEMM kernel, which fills SMs but adds a reduction."
+  },
+  {
+   "opportunity": "Cross-op weight prefetch into L2/smem while a narrow phase (norm, attention) runs",
+   "why_multi_kernel_cannot": "The next GEMM's weights are known statically. A persistent CTA that is idle during attention can issue cp.async.bulk.prefetch.L2 for the next layer's QKV. A separate kernel cannot issue loads before it launches. PDL lets the dependent kernel start its prologue early, but only after the primary signals.",
+   "nearest_substitute": "PDL with a prefetch in the prologue of the dependent kernel (cudaGridDependencySynchronize after the prefetch). That gets part of the benefit."
+  },
+  {
+   "opportunity": "On-device decode loop: the argmax/sampling output feeds the next step's embedding without a host round trip",
+   "why_multi_kernel_cannot": "A CUDA graph can contain argmax plus embedding, but each token needs a graph replay launch (about 5-10 us host) unless conditional graph nodes are used. A megakernel can loop over tokens internally.",
+   "nearest_substitute": "CUDA graph conditional while-nodes (CUDA 12.4+), which handle an EOS check but need static shapes."
+  }
+ ],
+ "measured_or_reported_gains": [
+  "MPK paper (arXiv 2512.22219, OSDI'26): up to 1.7x lower end-to-end latency than kernel-per-operator serving systems on A100/H100/B200 with Qwen3-0.6B/1.7B/8B, Llama-3.2-1B and Qwen3-30B-A3B. The per-model breakdown was not read here [uncertain].",
+  "Mirage commit e67c7eea (on B200, Qwen3-0.6B): hand-written MPK 6276.6 tok/s, fully generated tasks 997.9 tok/s, torch.compile 880.5, eager 585.2. So the hand-written fusions and grids are worth about 6x over generated tasks and about 7x over torch.compile in that setting.",
+  "Mirage commit 9135e9fb/e67c7eea: the projection+residual partition routed to the hand-written split-K was about 2.5x faster than the codegen version of that group; the best ranked partition was 16.7% over the hand-written best, with a 208% spread across partitions (B200, Qwen3-0.6B).",
+  "Mirage commit 9135e9fb: for generated matmul tasks, K tile 64->128 gave +10.5% and stages 2->4 gave +6.1%; mma_m 64->128 cost 4-5% and mma_n 8->16 was neutral (memory/latency bound).",
+  "Mirage commit 9135e9fb: a silu_mul task 1.20x faster in isolation made the whole model 2.5% slower.",
+  "MegaBake (ROADMAP.md:118): swapAB took SmolLM-1.7B decode GEMMs from 3.66 to 1.92 ms (0.93 to 1.78 TB/s on the 60-SM slice), matching cuBLAS.",
+  "MegaBake (ROADMAP.md:144-150): counting barrier 1.08->0.70 us; RMSNorm 5.0->2.8 us on 1.7B; interval folding 333->183 decode barriers on 135M (-5-7%) and -1-2% on 1.7B; split-K gave no gain on 60 SMs.",
+  "MegaBake fresh decode kernel times (artifacts/full_model_2026-10-18): SmolLM-1.7B 2974 us vs Inductor 2425 us; SmolLM-135M 1502 vs 1382; Qwen2-0.5B 1584 vs 1636."
+ ],
+ "expected_impact_on_megabake": [
+  {
+   "rank": 1,
+   "item": "Residual-add epilogue in the GEMM (o_proj and down) plus RMSNorm-in-prologue for the following GEMM",
+   "decode_estimate": "Each layer has 2 residual adds and 2 norms. Folding removes most barriers, but the folded recompute is a dependent phase inside the GEMM's interval, so it serializes before the GEMM start-up. The measured RMSNorm costs 2.8 us on 1.7B, and a residual add is roughly 1-2 us of latency. Moving both into the epilogue and prologue saves an estimated 2-4 us per norm+add pair, i.e. 4-8 us per layer: 1.7B (24 layers) 100-190 us of 2974 (3-6%); 135M (30 layers) 120-240 us of 1502 (8-15%) [uncertain].",
+   "prefill_estimate": "Smaller relative gain (GEMMs dominate above 64 tokens), and it requires the non-swapAB tile to support the epilogue too."
+  },
+  {
+   "rank": 2,
+   "item": "Paired gate/up GEMM with a SiLU-mul epilogue (unblocks regions.py:2240)",
+   "decode_estimate": "Removes the SiLU-mul region and the intermediate round trip, and merges two phases into one tile list. With swapAB, a gate/up tile pair shares the same B tile, saving one activation TMA per K step. Estimate 2-4 us per layer: 1.7B 50-100 us (2-3%); 135M 60-120 us (4-8%). Weights must be interleaved per 64-row tile at compile time [uncertain].",
+   "prefill_estimate": "PERFORMANCE_REPORT.md:262 estimated a 2-4 us saving per MLP; it helps more at larger M, where the intermediate is bigger."
+  },
+  {
+   "rank": 3,
+   "item": "Horizontal fusion of Q/K/V (and of any GEMMs sharing an input)",
+   "decode_estimate": "No barrier saving, since they already share an interval. The gain is tile balance: on 135M, K and V are 3 tiles each next to Q's 9 (on a 60-SM slice the interval is bounded by start-up latency, not tiles), and the start-up is paid once instead of three times. Estimate 1-2 us per layer (135M 30-60 us, ~2-4%; 1.7B ~1%) [uncertain].",
+   "prefill_estimate": "Larger: at 128-300 tokens the non-swapAB path runs three under-filled GEMMs; merging gives N=Q+2KV in one launch-wide tile list."
+  },
+  {
+   "rank": 4,
+   "item": "Split-K reduce-add into the residual (non-deterministic mode)",
+   "decode_estimate": "On 60 SMs, o_proj/down for 1.7B (N=2048, 32 tiles) underfill 60 SMs by about 2x. The current deterministic split-K measured no gain because of its fixup cost. TMA reduce-add (cp.reduce.async.bulk.add.bf16 into the residual) would remove the partials buffer, the counter and the separate residual add. Estimate 10-30 us total on 1.7B (<1%), more on models whose hidden size is under 64*60=3840 [uncertain]. The determinism contract would need an opt-in flag.",
+   "prefill_estimate": "Negligible above 64 tokens."
+  },
+  {
+   "rank": 5,
+   "item": "Fuse qk-norm/RoPE into the attention body (Qwen3/Gemma3)",
+   "decode_estimate": "Removes one region per layer that folding cannot always hide. Estimate 1-3 us per layer for models with qk-norm, ~0 for SmolLM/Qwen2 [uncertain].",
+   "prefill_estimate": "Small."
+  },
+  {
+   "rank": 6,
+   "item": "In-kernel argmax/sampling",
+   "decode_estimate": "Kernel time is unchanged (the lm_head GEMM dominates). It only saves host/launch time for an extra argmax (about 5-15 us per token), and only if generation is captured.",
+   "prefill_estimate": "None."
+  },
+  {
+   "rank": 7,
+   "item": "MoE task family",
+   "decode_estimate": "Zero on the tested models; required for any MoE model (DeepSeek-V3-DRAFT 0.6B and Beam 501B-A23B appear in artifacts/full_model).",
+   "prefill_estimate": "Zero on tested models."
+  },
+  {
+   "note": "Overall: fusions 1-3 together plausibly save 8-14 us per layer of serial latency. That is roughly 0.2-0.35 ms on 1.7B decode (2.97 ms -> ~2.65 ms, still above Inductor's 2.42 ms) and 0.25-0.4 ms on 135M (1.50 -> ~1.15 ms, below Inductor's 1.38 ms). Closing the rest of the 1.7B gap needs GEMM bandwidth (1.78 -> ~2.0 TB/s via cross-phase prefetch, ROADMAP step 9) and event counters (step 10). Mirage gets its fusion benefit together with event-driven scheduling; without events, fusion is MegaBake's main lever for cutting serial steps."
+  }
+ ],
+ "generality_and_overfitting_risk": [
+  {
+   "item": "Mirage grid rule (96/64 tasks, size//256 when size/96 > 400, hidden//64 for residual linears)",
+   "assessment": "Model-specific to Qwen3 per its own comment (utils.py:4-5). Mirage's padded_vocab_size=153600 is hard-coded for the Qwen vocab (builder.py:45,82), and so is eos_token_id=151645. MegaBake should NOT copy these constants."
+  },
+  {
+   "item": "Mirage split-K only on cc==100",
+   "assessment": "Hardware-specific workaround (builder.py:291-293). It shows the split-K benefit depends on the SM count versus tiles, which MegaBake's split_k_count already parameterizes on target.multiprocessor_count."
+  },
+  {
+   "item": "MegaBake SWAP_AB_MAX_ROWS=64 and SWAP_AB_ROW_TILES=(16,32,64) (gemm.py:1893-1896)",
+   "assessment": "Hardware-specific to Hopper's WGMMA N granularity. It is reasonable, but the crossover where non-swapped becomes better was measured only on 60 SMs and small models. It should come from a cost model using M, N, K, SMs and bandwidth."
+  },
+  {
+   "item": "MegaBake one GEMM tile and smem layout per launch (TABLE_GEMM_SHARED_BYTES, gemm.py:1708-1711; swap_ab_rows takes the max rows)",
+   "assessment": "Generic in form, but it forces one tile on lm_head, QKV and the MLP alike. Mirage templates every task separately. It is an overfitting risk because the 64x64x8-stage choice was tuned on the 1.7B/135M shapes."
+  },
+  {
+   "item": "MegaBake SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2 and split-K off by default (gemm.py:1903-1905, compiler.py:422)",
+   "assessment": "Disabled because of a 60-SM measurement. On a full H100/H200 (132 SMs) with the same models, underfill doubles, and the decision should be revisited per target, not hard-wired off."
+  },
+  {
+   "item": "MegaBake decode attention DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64 and cost factor 0.15 (attention.py:422-423,748)",
+   "assessment": "Hand-fitted constants. The 0.15 per-pass penalty is an empirical constant from this slice."
+  },
+  {
+   "item": "MegaBake fold limits _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6 (schedule.py:1383-1386)",
+   "assessment": "Tuned on 135M/1.7B decode. Larger hidden sizes (for example 8192) make recomputing on every worker expensive; the fold decision should use bytes and SM-bandwidth cost, not round counts."
+  },
+  {
+   "item": "MegaBake pattern matchers (RMSNorm HF order, rotate_half RoPE, decomposed SiLU exact 6-op chain at regions.py:2290-2305)",
+   "assessment": "Fragile to dtype-cast placement and to other activations (GELU-tanh for Gemma, clamped SwiGLU for gpt-oss). A paired-GEMM epilogue should accept any elementwise expression tree from the tensor program (vector_chain), not a SiLU-only matcher."
+  },
+  {
+   "item": "How references avoid overfitting",
+   "assessment": "Mirage hand-writes per model (builders), so it does not avoid it. Its research branch moves to search over partitions and tiles with whole-model measurement, and it reports that per-task benchmarks mislead. MegaBake already measures whole plans; it should widen the plan space to per-GEMM tiles, split, and fusion on/off, and rank by measured end-to-end kernel time, ideally with a cost model to prune."
+  }
+ ],
+ "hardware_portability": "swapAB depends on SM90 WGMMA operand constraints (M fixed at 64 per warpgroup, N a multiple of 8). On SM100, tcgen05 MMA has M=64/128 and N 8-256 with TMEM accumulators; Mirage's linear_sm100 drops swapAB in favour of an MMA_M=128 tile over N, using 148 tasks. On SM80 there is no TMA or WGMMA, and mma.sync m16n8k16 makes small M natural, so swapAB is unnecessary. The residual and SiLU epilogues and the norm prologue are target-independent ideas; only the operand staging (TMA vs cp.async) changes. Split-K via cp.reduce.async.bulk.add needs SM90+ (bulk async reductions); on SM80 use atomicAdd on bf16x2 or a fixup pass. Paged attention with WGMMA is SM90-specific, and SM100 MLA uses 2-SM (cluster) tcgen05. Event counters and recompute folding are portable. To stay target-generic, MegaBake should express fusions as contracts on the GEMM body (prologue transform on B, epilogue expression tree, optional reduce-add store) in bodies/interface.py, and let each target provider (sm90a WGMMA, blackwell.py, a future SM80 mma.sync) implement them. The smem budget, SM count and split decisions should come from TargetFacts and not from constants.",
+ "recommended_actions": [
+  {
+   "action": "Add an epilogue expression hook to the table GEMM: generalize the bias path to load N extra addends (residual) and apply a captured elementwise expression before the bf16 rounding; let regions.py emit GEMM+add(+cast) regions.",
+   "expected_gain": "1.7B decode ~50-100 us (2-3%); 135M ~60-120 us (4-8%), estimate",
+   "effort": "M",
+   "generality": "generic",
+   "files_to_touch": "src/megabake/bodies/gemm.py (_store_tile, run_table), src/megabake/regions.py, src/megabake/bodies/interface.py",
+   "prerequisite": "None; reuses the bias epilogue plumbing (ROADMAP step 7)"
+  },
+  {
+   "action": "Implement the paired gate/up provider: interleave gate/up weight tiles at compile time (or bind two A descriptors) so one CTA holds both accumulators; apply the region's elementwise expression (SiLU, GELU, clamped SwiGLU) in the epilogue; remove the hard rejection at regions.py:2240.",
+   "expected_gain": "1.7B decode ~50-100 us; 135M ~60-120 us; prefill MLP 2-4 us per layer (estimates)",
+   "effort": "M-L",
+   "generality": "generic",
+   "files_to_touch": "src/megabake/regions.py:2159-2280, src/megabake/bodies/gemm.py, src/megabake/memory.py (weight packing), src/megabake/compiler.py",
+   "prerequisite": "Epilogue expression hook (action 1)"
+  },
+  {
+   "action": "RMSNorm-in-prologue: for swapAB, compute per-row rsqrt(mean(x^2)) in the consumer warpgroup (or recompute it in the producer from the 16-64 token rows) and scale the B tile in smem before the WGMMA, or scale the accumulator by the row factor in the epilogue (valid because the norm scale is per token row, applied after a K-sum when the weight multiply is folded into W).",
+   "expected_gain": "Removes the folded norm phase from the GEMM's critical path: ~2-3 us per norm, 1.7B ~100 us, 135M ~150 us (estimates)",
+   "effort": "M",
+   "generality": "generic (folding the gamma into the weight needs constant weights, which holds in inference)",
+   "files_to_touch": "src/megabake/bodies/gemm.py, src/megabake/regions.py (norm->GEMM candidate), src/megabake/schedule.py",
+   "prerequisite": "Epilogue hook; a per-row scale factor computed by a cheap pre-pass or inside the GEMM"
+  },
+  {
+   "action": "Horizontal GEMM merging: regions sharing an input operand and K (Q/K/V, gate/up) become one contraction over concatenated weights, with outputs as views.",
+   "expected_gain": "~1-2 us per layer decode; larger in prefill (estimate)",
+   "effort": "M",
+   "generality": "generic",
+   "files_to_touch": "src/megabake/regions.py, src/megabake/memory.py (constant weight concat at compile time), src/megabake/lowering.py",
+   "prerequisite": "Weight constant-folding or rebinding support"
+  },
+  {
+   "action": "Optional nondeterministic split-K via cp.reduce.async.bulk.add into the residual (opt-in), with the split count from a cost model over (tiles, SMs, K) rather than SPLIT_K_MAX constants.",
+   "expected_gain": "<1% on 60 SMs; likely more on 132-SM H100/H200 and on small-hidden models (uncertain)",
+   "effort": "M",
+   "generality": "hw-specific (SM90+ bulk reductions)",
+   "files_to_touch": "src/megabake/bodies/gemm.py:1076-1131,1899-1920, src/megabake/compiler.py:422",
+   "prerequisite": "Residual epilogue (so the add is not double-counted); determinism flag in policy"
+  },
+  {
+   "action": "Per-GEMM tile selection inside one table launch: take the max smem over the variants instead of the sum (PERFORMANCE_REPORT.md:278), then let the plan search pick swapAB token tile, stages and N tile per GEMM.",
+   "expected_gain": "Unknown; it enables the lm_head and MLP to use different tiles (Mirage: K tile and stages were worth 6-10%)",
+   "effort": "M",
+   "generality": "generic",
+   "files_to_touch": "src/megabake/codegen.py, src/megabake/plan.py, src/megabake/bodies/gemm.py:1708-1711",
+   "prerequisite": "None"
+  },
+  {
+   "action": "Fuse qk-norm and RoPE into the attention body prologue for declared attention ops.",
+   "expected_gain": "1-3 us per layer on qk-norm models (Qwen3, Gemma3); ~0 on SmolLM/Qwen2",
+   "effort": "M",
+   "generality": "model-specific features but a generic mechanism (attention prologue expression)",
+   "files_to_touch": "src/megabake/bodies/attention.py, src/megabake/regions.py",
+   "prerequisite": "None"
+  },
+  {
+   "action": "Declared MoE op (megabake::moe or grouped top-k experts) with a grouped swapAB GEMM body.",
+   "expected_gain": "Required for MoE coverage; no effect on tested dense models",
+   "effort": "L",
+   "generality": "generic",
+   "files_to_touch": "src/megabake/frontend.py, src/megabake/bodies/ (new provider), src/megabake/regions.py",
+   "prerequisite": "Event counters (step 10) to avoid barrier-per-expert"
+  }
+ ],
+ "open_questions": [
+  "How much of each folded RMSNorm or residual phase is actually on the critical path inside its interval? Settle with tools/phase_profile.py on 1.7B and 135M decode, stamping the fold phase start and end versus the GEMM start.",
+  "Does scaling the swapAB accumulator by the per-token rsqrt (with gamma folded into W) match the PyTorch bit-exactness MegaBake promises? HF rounds the normalized hidden to bf16 before the matmul, so the epilogue-scale form will differ by rounding. Settle by testing against tools/diff_intermediates.py tolerance; expect it to need a 'source rounding' relaxation or the in-smem B-tile scaling form instead.",
+  "Is MegaBake's deterministic split-K slow because of the fixup or because the 60-SM slice is already bandwidth-saturated at 32 tiles? Settle with a standalone o_proj/down micro-benchmark sweeping splits on 60 SMs, comparing the fixup and TMA reduce-add variants.",
+  "Mirage's current SM90 Qwen3 path does not use rmsnorm_linear or the SiLU-in-prologue tasks. Is that because events made them unnecessary, or because they were slower on Hopper? Settle by checking the Mirage git history and blame for builder.py around the switch from rmsnorm_linear_layer, or by running Mirage's demo_hopper both ways on a free GPU.",
+  "MPK paper per-model H100 numbers (decode latency for Qwen3-1.7B) were not extracted here. Read the arXiv 2512.22219 evaluation section.",
+  "Can MegaBake rewrite weight layouts (interleaving gate/up per tile, concatenating QKV) without doubling weight memory, given the HF parameters stay alive? Settle by checking memory.py and compiler.py rebinding to see whether a parameter can be replaced by a compiler-owned packed copy and the original freed."
+ ],
+ "uncertain": [
+  "measured_or_reported_gains",
+  "expected_impact_on_megabake"
+ ]
+}

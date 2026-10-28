@@ -10,16 +10,22 @@ import textwrap
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from .bodies.gemm import (
+from .bodies.cuda.sm90.gemm import (
     HopperWgmmaGemmPersistentKernel,
+    epilogue_loads,
+    epilogue_source,
     has_bias,
+    has_fused_epilogue,
+    is_paired,
     is_swap_ab,
     kernel_tile,
     split_k,
+    table_gemm_shared_bytes,
 )
-from .bodies.attention import emit_attention_body
-from .bodies.blackwell import emit_blackwell_gemm
-from .bodies.generic import (
+from .bodies.cuda.sm90.cutlass_gemm import STREAM_TAG_SLOT
+from .bodies.cuda.sm90.attention import emit_attention_body
+from .bodies.cuda.sm100.gemm import emit_blackwell_gemm
+from .bodies.cuda.generic import (
     emit_contraction_body,
     emit_map_body,
     emit_reduction_body,
@@ -37,7 +43,8 @@ from .lowering import (
     TensorProgram,
     TensorStore,
 )
-from .memory import verify_plan
+from .graph import DTYPE_BYTES
+from .memory import _round_up, verify_plan
 from .plan import ConversionBody, CuTeLayout, KernelPlan, SelectedBody
 from .runtime import (
     CTA_TIMER,
@@ -46,8 +53,8 @@ from .runtime import (
     CTA_TIMER_WORKERS,
     DYNAMIC_ADDRESS_RING,
     GRID_TIMER_SLOTS,
-    L2_PREFETCH_BYTES,
     PHASE_TIMER_SLOTS,
+    WEIGHT_STREAM_STAGES,
     call_counter_offset,
 )
 from .schedule import EventSchedule
@@ -124,6 +131,11 @@ class LaunchMetadata:
     # descriptor templates on the host.
     gemm_table: tuple[tuple[int, ...], ...] = ()
     gemm_template_phases: tuple[int, ...] = ()
+    # Weight streaming: per barrier that streams, three columns per CTA (the
+    # GEMM row + 1 whose stages it loads, 0 for none; that row's variant;
+    # the CTA's rotated block index in its phase). Row 0 is all zero; empty
+    # without streaming.
+    stream_table: tuple[tuple[int, ...], ...] = ()
     # K splits per GEMM variant (split-K).
     gemm_splits: tuple[int, ...] = ()
     # Phase scratch: FP32 and Int32 global buffers for bodies whose CTAs
@@ -170,19 +182,6 @@ _CUTLASS_TYPES = {
     "torch.bfloat16": "cutlass.BFloat16",
     "torch.float32": "cutlass.Float32",
     "torch.float64": "cutlass.Float64",
-}
-
-_DTYPE_BYTES = {
-    "torch.bool": 1,
-    "torch.uint8": 1,
-    "torch.int8": 1,
-    "torch.int16": 2,
-    "torch.int32": 4,
-    "torch.int64": 8,
-    "torch.float16": 2,
-    "torch.bfloat16": 2,
-    "torch.float32": 4,
-    "torch.float64": 8,
 }
 
 
@@ -627,9 +626,9 @@ def _emit_generic_module(
     )
     launch_smem = "" if has_g0 else f"        smem={shared_memory_bytes},\n"
     runtime_import = (
-        "from megabake.runtime import cooperative_event_worker_loop, publish_event, wait_for_event"
+        "from megabake.runtime import cooperative_event_worker_loop, publish_event, trap_if, wait_for_event"
         if event_schedule is not None
-        else "from megabake.runtime import cooperative_worker_loop, grid_barrier"
+        else "from megabake.runtime import cooperative_worker_loop, grid_barrier, trap_if"
     )
     kernel_arguments = [
         "ready: cute.Tensor",
@@ -656,7 +655,7 @@ from cuda.bindings import driver as cuda
 from cutlass._mlir.dialects import llvm
 
 {runtime_import}
-from megabake.bodies.gemm import HopperWgmmaGemmPersistentKernel
+from megabake.bodies.cuda.sm90.gemm import HopperWgmmaGemmPersistentKernel
 
 {"\n\n".join(g0_definitions)}
 
@@ -772,13 +771,26 @@ def _emit_table_module(
         for index, binding in enumerate(plan.storage.bindings)
     )
     gemm_variants: dict[tuple[Any, ...], int] = {}
+    epilogue_definitions: list[str] = []
     gemm_definitions: list[str] = []
+    # Variants that are paired GEMMs, and each GEMM row's trailing columns:
+    # its second A slot + 1 (0 when unpaired), then its epilogue tensor slots.
+    paired_variants: set[int] = set()
+    gemm_extra_columns: list[tuple[int, ...]] = []
+    gemm_kernel_tiles: dict[int, tuple[int, int]] = {}
+    # Each GEMM variant's fused epilogues as (source, slot layouts); a phase
+    # picks epilogue kind index + 1 at run time (0: plain store), so phases of
+    # one shape share one kernel body whatever they fuse.
+    variant_epilogues: dict[int, list[tuple[str, tuple[Any, ...]]]] = {}
+    # Per variant: what its definition and runner need once all phases are seen.
+    gemm_variant_specs: dict[int, dict[str, Any]] = {}
     gemm_shapes: list[tuple[int, int, int, bool]] = []
     gemm_template_phases: list[int] = []
     gemm_rows: list[tuple[int, ...]] = []
-    # GEMM phase -> its GEMM row, and each row's weight operand for prefetch.
+    # GEMM phase -> its GEMM row.
     gemm_of_phase: dict[int, int] = {}
-    gemm_weights: list[tuple[int, int, int, int] | None] = []
+    # GEMM rows whose weight operand can be streamed into shared memory.
+    streamable_gemms: set[int] = set()
     gemm_splits: list[int] = []
     # Phase index -> (FP32 elements, Int32 counters) of phase scratch.
     phase_scratch: dict[int, tuple[int, int]] = {}
@@ -868,13 +880,29 @@ def _emit_table_module(
             tile = kernel_tile(phase.body)
             splits = split_k(phase.body)
             bias = has_bias(phase.body)
+            fused = has_fused_epilogue(phase.body)
+            paired = is_paired(phase.body)
+            fused_loads = epilogue_loads(program) if fused else ()
+            fused_layouts = tuple(
+                tensor_arguments[
+                    _tensor_argument_index(
+                        tensor_arguments,
+                        _tensor_name(tensor_arguments, load.value_id, phase.region_id, "input"),
+                    )
+                ].layout
+                for load in fused_loads
+            )
             gemm_scratch_bytes.add(phase.body.scratch.size_bytes)
             gemm_key = (
-                tile, phase.body.scratch.size_bytes, rows, columns, reduction, splits, bias
+                tile, phase.body.scratch.size_bytes, rows, columns, reduction, splits, bias, paired
             )
             if gemm_key not in gemm_variants:
                 gemm_variant = len(gemm_variants)
                 gemm_variants[gemm_key] = gemm_variant
+                # A paired tile stacks 64 rows of each A on CUTLASS M.
+                gemm_kernel_tiles[gemm_variant] = (2 * tile[0], tile[1]) if paired else tile
+                if paired:
+                    paired_variants.add(gemm_variant)
                 # CUTLASS problem shape; swapAB computes the transposed product.
                 gemm_shapes.append(
                     (columns, rows, reduction, True)
@@ -885,22 +913,31 @@ def _emit_table_module(
                 gemm_template_phases.append(phase.index)
                 symbol = f"_gemm_{gemm_variant}"
                 variants[("g0_range", gemm_key)] = (symbol, len(variants), None)
-                gemm_definitions.append(
-                    f"{symbol} = HopperWgmmaGemmPersistentKernel(\n"
-                    "    cutlass.Float32,\n"
-                    f"    {tile!r},\n"
-                    "    (1, 1),\n"
-                    "    1,\n"
-                    "    True,\n"
-                    f"    smem_capacity={phase.body.scratch.size_bytes},\n"
-                    "    reallocate_registers=False,\n"
-                    f"    splits={splits},\n"
-                    f"    bias_features={columns if bias else 0},\n"
-                    f"    bias_along_m={is_swap_ab(phase.body)!r},\n"
-                    f"    direct_store={is_swap_ab(phase.body) and splits == 1!r},\n"
-                    ")"
-                )
+                gemm_variant_specs[gemm_variant] = {
+                    "symbol": symbol,
+                    "scratch": phase.body.scratch.size_bytes,
+                    "splits": splits,
+                    "bias_features": columns if bias else 0,
+                    "swap_ab": is_swap_ab(phase.body),
+                    "bias": bias,
+                    "paired": paired,
+                }
             gemm_variant = gemm_variants[gemm_key]
+            epilogue_kind = 0
+            if fused:
+                entry = (
+                    epilogue_source(program, "_epilogue"),
+                    tuple(_layout_key(layout) for layout in fused_layouts),
+                )
+                kinds = variant_epilogues.setdefault(gemm_variant, [])
+                known = [(source, tuple(_layout_key(layout) for layout in layouts)) for source, layouts in kinds]
+                if entry not in known:
+                    kinds.append((entry[0], fused_layouts))
+                    epilogue_definitions.append(
+                        epilogue_source(program, f"_epilogue_{gemm_variant}_{len(kinds)}")
+                    )
+                    known.append(entry)
+                epilogue_kind = known.index(entry) + 1
             body_symbol, body_variant_id, _ = variants[("g0_range", gemm_key)]
             gemm_slots = [
                 _tensor_argument_index(
@@ -909,6 +946,9 @@ def _emit_table_module(
                 )
                 for load in program.loads
             ]
+            fused_slots = gemm_slots[len(program.loads) - len(fused_loads) :]
+            del gemm_slots[len(program.loads) - len(fused_loads) :]
+            second_a_slot = gemm_slots.pop() + 1 if paired else 0
             # Row: variant, A, B, C, then the bias slot + 1 (0 without bias).
             bias_slot = gemm_slots.pop() + 1 if bias else 0
             if is_swap_ab(phase.body):
@@ -924,8 +964,15 @@ def _emit_table_module(
             )
             gemm_index = len(gemm_rows)
             gemm_of_phase[phase.index] = gemm_index
-            gemm_weights.append(_gemm_weight_rows(plan, tensor_arguments, gemm_slots[:2]))
+            # swapAB GEMMs load the weight as CUTLASS A, which streaming
+            # loads ahead when no region of the launch writes it.
+            if is_swap_ab(phase.body) and all(
+                _read_only_input(plan, tensor_arguments[slot])
+                for slot in (gemm_slots[0], *((second_a_slot - 1,) if paired else ()))
+            ):
+                streamable_gemms.add(gemm_index)
             gemm_rows.append((gemm_variant, *gemm_slots, bias_slot))
+            gemm_extra_columns.append((second_a_slot, epilogue_kind, *fused_slots))
             if splits > 1:
                 output_tiles = -(-gemm_shapes[gemm_variant][0] // tile[0]) * -(
                     -gemm_shapes[gemm_variant][1] // tile[1]
@@ -938,48 +985,8 @@ def _emit_table_module(
             runner_key = ("g0_range", gemm_variant)
             if runner_key not in runner_variants:
                 representative_phases.append(phase)
-                split_state = (
-                    [
-                        "                (",
-                        "                    phase_floats,",
-                        "                    phase_counters,",
-                        "                    phase_table[phase, 4],",
-                        "                    phase_table[phase, 5],",
-                        "                ),",
-                    ]
-                    if splits > 1
-                    else []
-                )
-                bias_state = (
-                    [
-                        "                None," if splits == 1 else "",
-                        "                addresses[gemm_table[phase_table[phase, 6], 4] - 1],",
-                    ]
-                    if bias
-                    else []
-                )
-                runner_variants[runner_key] = (
-                    len(runner_variants),
-                    0,
-                    [
-                        f"            {body_symbol}.run_table(",
-                        f"                gemm_values[{gemm_variant}],",
-                        "                _gemm_scratch,",
-                        "                table_descriptors(tma_descriptors, phase_table[phase, 6]),",
-                        "                _rotated,",
-                        *split_state,
-                        *(line for line in bias_state if line),
-                        *(
-                            [
-                                "                c_address=addresses["
-                                "gemm_table[phase_table[phase, 6], 3]],"
-                            ]
-                            if is_swap_ab(phase.body) and splits == 1
-                            else []
-                        ),
-                        "            )",
-                    ],
-                )
+                # Lines are written once every phase's epilogue kind is known.
+                runner_variants[runner_key] = (len(runner_variants), 0, [])
             runner_id = runner_variants[runner_key][0]
             phase_rows.append(
                 (runner_id, int(phase.barrier is not None), 0, 0, 0, 0, gemm_index)
@@ -1223,6 +1230,123 @@ def _emit_table_module(
             continue
         phase_rows[index] = (*row[:2], offset % plan.launch.grid_size, *row[3:])
         offset += phase_tiles[index]
+    # Weight streaming: which GEMM's stages each CTA loads at which barrier.
+    stream_rows, stream_issues = _weight_stream_schedule(
+        plan,
+        [row[2] for row in phase_rows],
+        phase_units,
+        gemm_of_phase,
+        [row[0] for row in gemm_rows],
+        streamable_gemms,
+        WEIGHT_STREAM_STAGES,
+    )
+    streamed_variants = {
+        gemm_rows[gemm][0]
+        for row in stream_rows
+        for gemm in (entry - 1 for entry in row[0::3] if entry)
+    }
+    streaming = bool(streamed_variants)
+    for gemm_variant, spec in gemm_variant_specs.items():
+        kinds = variant_epilogues.get(gemm_variant, [])
+        epilogues = "".join(
+            f"_epilogue_{gemm_variant}_{kind}, " for kind in range(1, len(kinds) + 1)
+        )
+        gemm_definitions.append(
+            f"{spec['symbol']} = HopperWgmmaGemmPersistentKernel(\n"
+            "    cutlass.Float32,\n"
+            f"    {gemm_kernel_tiles[gemm_variant]!r},\n"
+            "    (1, 1),\n"
+            "    1,\n"
+            "    True,\n"
+            f"    smem_capacity={spec['scratch']},\n"
+            "    reallocate_registers=False,\n"
+            f"    splits={spec['splits']},\n"
+            f"    bias_features={spec['bias_features']},\n"
+            f"    bias_along_m={spec['swap_ab']!r},\n"
+            f"    direct_store={spec['swap_ab'] and spec['splits'] == 1!r},\n"
+            + (f"    epilogues=({epilogues}),\n" if kinds else "")
+            + ("    paired=True,\n" if spec["paired"] else "")
+            + (
+                f"    stream_stages={WEIGHT_STREAM_STAGES},\n"
+                if gemm_variant in streamed_variants
+                else ""
+            )
+            + ")"
+        )
+        split_state = (
+            [
+                "                (",
+                "                    phase_floats,",
+                "                    phase_counters,",
+                "                    phase_table[phase, 4],",
+                "                    phase_table[phase, 5],",
+                "                ),",
+            ]
+            if spec["splits"] > 1
+            else []
+        )
+        bias_state = (
+            [
+                "                None," if spec["splits"] == 1 else "",
+                "                addresses[gemm_table[phase_table[phase, 6], 4] - 1],",
+            ]
+            if spec["bias"]
+            else []
+        )
+        # One tuple of tensors per epilogue kind, all read from the row's
+        # epilogue slot columns; only the phase's own kind dereferences them.
+        epilogue_state = (
+            [
+                # A closure: the GEMM reads the kind and builds the tensors
+                # after its mainloop, so they hold no registers across it.
+                "                epilogue_state=lambda: (",
+                f"                    gemm_table[phase_table[phase, 6], {GEMM_EPILOGUE_KIND_COLUMN}],",
+                "                    (",
+                *(
+                    "                        ("
+                    + "".join(
+                        _gemm_slot_tensor_code(GEMM_EPILOGUE_COLUMN + position, layout) + ", "
+                        for position, layout in enumerate(layouts)
+                    )
+                    + "),"
+                    for _, layouts in kinds
+                ),
+                "                    ),",
+                "                ),",
+            ]
+            if kinds
+            else []
+        )
+        runner_id = runner_variants[("g0_range", gemm_variant)][0]
+        runner_variants[("g0_range", gemm_variant)] = (
+            runner_id,
+            0,
+            [
+                f"            {spec['symbol']}.run_table(",
+                f"                gemm_values[{gemm_variant}],",
+                "                _gemm_scratch,",
+                "                table_descriptors(tma_descriptors, phase_table[phase, 6]),",
+                "                _rotated,",
+                *split_state,
+                *(line for line in bias_state if line),
+                *(
+                    [
+                        "                c_address=addresses["
+                        "gemm_table[phase_table[phase, 6], 3]],"
+                    ]
+                    if spec["swap_ab"] and spec["splits"] == 1
+                    else []
+                ),
+                *epilogue_state,
+                *(
+                    ["                stream_tag=phase_table[phase, 6] + 1,"]
+                    if gemm_variant in streamed_variants
+                    else []
+                ),
+                "            )",
+            ],
+        )
+
     for index, length_slot in length_publishes.items():
         closing = next(
             (
@@ -1250,17 +1374,13 @@ def _emit_table_module(
             phase_rows[index] = (row[0], ordinal, *row[2:])
             ordinal += 1
     barrier_epochs = ordinal
-    # Trailing columns: the GEMM rows whose weights a phase prefetches into
-    # L2 before running its body (the first row and the row count), then the
-    # phase's work units.
-    prefetches, prefetch_sizes = _weight_prefetch_schedule(
-        plan, gemm_of_phase, gemm_weights, L2_PREFETCH_BYTES
-    )
+    # Trailing columns: the phase's work units, then, with weight streaming,
+    # the stream-table row its closing barrier streams weights from (0: none).
     phase_table = tuple(
         row
         + (0,) * (width - len(row))
-        + prefetches.get(index, (0, 0))
         + (phase_units[plan.phases[index].index],)
+        + ((stream_issues.get(index, 0),) if streaming else ())
         for index, row in enumerate(phase_rows)
     )
     # Resolved slot addresses: the slot behind each phase's tensor column
@@ -1273,31 +1393,10 @@ def _emit_table_module(
     ]
     resolved_slots = tuple(0 if slot is None else slot for slot in resolved)
     gemm_rows = [
-        (*row, *(
-            (weight[0], weight[1], weight[3], size)
-            if weight is not None and size
-            else (0, 0, 0, 0)
-        ))
-        for row, weight, size in zip(gemm_rows, gemm_weights, prefetch_sizes, strict=True)
+        (*row, *extra) for row, extra in zip(gemm_rows, gemm_extra_columns, strict=True)
     ]
-    # Only CTAs without tiles in the issuing phase prefetch: they would wait
-    # at its barrier anyway. The phase's tiles start at its rotation.
-    weight_prefetch = (
-        f"        if phase_table[phase, {width + 1}] != 0:\n"
-        f"            _units = phase_table[phase, {width + 2}]\n"
-        "            _idle = (_block + workers - phase_table[phase, 2]) % workers - _units\n"
-        "            if phase_table[phase, 2] >= 0 and _idle >= 0:\n"
-        "                prefetch_gemm_weights(\n"
-        "                    addresses,\n"
-        "                    gemm_table,\n"
-        f"                    phase_table[phase, {width}],\n"
-        f"                    phase_table[phase, {width + 1}],\n"
-        f"                    _idle * {plan.launch.threads_per_block} + _thread,\n"
-        f"                    (workers - _units) * {plan.launch.threads_per_block},\n"
-        "                )\n"
-        if prefetches
-        else ""
-    )
+    gemm_row_width = max((len(row) for row in gemm_rows), default=0)
+    gemm_rows = [row + (0,) * (gemm_row_width - len(row)) for row in gemm_rows]
     boundary_slots = tuple(
         index
         for index, argument in enumerate(tensor_arguments)
@@ -1324,8 +1423,16 @@ def _emit_table_module(
             )
         # The allocator sizes dynamic shared memory from the GEMM stages and
         # the generic union; the 1 KiB covers the GEMM buffers' alignment.
+        # Paired variants stage larger A tiles, so the GEMM storage is the
+        # union of every variant's buffers.
         shared_memory_bytes = (
-            next(iter(gemm_scratch_bytes))
+            (
+                table_gemm_shared_bytes(
+                    tuple(gemm_kernel_tiles.values()), next(iter(gemm_scratch_bytes))
+                )
+                if paired_variants
+                else next(iter(gemm_scratch_bytes))
+            )
             + _generic_scratch_bytes(scratch_plan, scratch_elements)
             + 1024
         )
@@ -1349,6 +1456,7 @@ def _emit_table_module(
     # buffers whose base never changes; the call counter selects this call's
     # entry, whose first word repeats the counter. The first CTA checks it and
     # copies the addresses into the device table before the first barrier.
+    # A stamp of -1 marks a CUDA graph's ring, whose addresses fit every call.
     ring_words = len(dynamic_slots) + 1
     dynamic_writes = (
         "        _dynamic = cute.make_tensor(\n"
@@ -1360,8 +1468,7 @@ def _emit_table_module(
         "            ),\n"
         f"            cute.make_layout({ring_words}),\n"
         "        )\n"
-        "        if _dynamic[0] != cutlass.Int64(_call):\n"
-        "            llvm.intr_trap()\n"
+        "        trap_if((_dynamic[0] != cutlass.Int64(_call)) & (_dynamic[0] != cutlass.Int64(-1)))\n"
         + (
             f"        for _position in cutlass.range(_thread, {len(dynamic_slots)}, {plan.launch.threads_per_block}, unroll=1):\n"
             "            addresses[dynamic_slot_table[_position]] = _dynamic[_position + 1]\n"
@@ -1373,8 +1480,10 @@ def _emit_table_module(
     # Phase barriers follow the address barrier and, with GEMMs, the
     # descriptor barrier.
 
+    stream_argument = "    stream_table: cute.Tensor,\n" if streaming else ""
     gemm_kernel_arguments = (
         "    gemm_table: cute.Tensor,\n"
+        f"{stream_argument}"
         "    tma_descriptors: cute.Tensor,\n"
         "    gemm_values,\n"
         if has_gemm
@@ -1382,6 +1491,7 @@ def _emit_table_module(
     )
     gemm_launch_arguments = (
         "    gemm_table: cute.Tensor,\n"
+        f"{stream_argument}"
         "    tma_descriptors: cute.Tensor,\n"
         "    gemm_tensors: tuple[tuple[cute.Tensor, cute.Tensor, cute.Tensor], ...],\n"
         "    max_active_clusters: cutlass.Constexpr,\n"
@@ -1404,7 +1514,15 @@ def _emit_table_module(
         else ""
     )
     gemm_scratch = (
-        "    _gemm_scratch = cutlass.utils.SmemAllocator().allocate(_gemm_0.shared_storage)\n"
+        (
+            "    _gemm_scratch = cutlass.utils.SmemAllocator().allocate(\n"
+            "        union_shared_storage(("
+            + "".join(f"_gemm_{variant}, " for variant in range(len(gemm_shapes)))
+            + "))\n"
+            "    )\n"
+            if paired_variants
+            else "    _gemm_scratch = cutlass.utils.SmemAllocator().allocate(_gemm_0.shared_storage)\n"
+        )
         if has_gemm
         else ""
     )
@@ -1420,7 +1538,12 @@ def _emit_table_module(
         f"                    {shape[:3]!r},\n"
         f"                    {shape[3]!r},\n"
         f"                    {gemm_splits[variant]!r},\n"
-        "                )"
+        + (
+            f"                    addresses[gemm_table[gemm, {GEMM_SECOND_A_COLUMN}] - 1],\n"
+            if variant in paired_variants
+            else ""
+        )
+        + "                )"
         for variant, shape in enumerate(gemm_shapes)
     )
     # One warp per CTA writes the descriptors of the GEMM phases it owns from
@@ -1429,25 +1552,42 @@ def _emit_table_module(
         "    _warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())\n"
         "    if _warp == 0:\n"
         f"        for gemm in cutlass.range(_block, {len(gemm_rows)}, workers, unroll=1):\n"
-        "            gemm_variant = gemm_table[gemm, 0]\n"
+        "            gemm_variant = cute.arch.make_warp_uniform(gemm_table[gemm, 0])\n"
         f"{gemm_builds}\n"
         "        cute.nvgpu.cpasync.fence_tma_desc_release()\n"
-        "    counting_grid_barrier(ready, workers, _ordinal + cutlass.Int32(1))\n"
+        + (
+            # Shared memory starts undefined: no CTA has streamed stages yet.
+            "    if _thread == 0:\n"
+            f"        _gemm_scratch.split_arrival[{STREAM_TAG_SLOT}] = cutlass.Int32(0)\n"
+            if streaming
+            else ""
+        )
+        + "    counting_grid_barrier(ready, workers, _ordinal + cutlass.Int32(1))\n"
         if has_gemm
         else ""
     )
     gemm_kernel_call = (
-        "        gemm_table,\n        tma_descriptors,\n        gemm_values,\n"
+        "        gemm_table,\n"
+        + ("        stream_table,\n" if streaming else "")
+        + "        tma_descriptors,\n        gemm_values,\n"
         if has_gemm
         else ""
     )
     launch_smem = "" if has_gemm else f"        smem={shared_memory_bytes},\n"
+    phase_barrier = (
+        "            counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])\n"
+        if not streaming
+        else _weight_stream_source(
+            f"phase_table[phase, {width + 1}]", sorted(streamed_variants)
+        )
+    )
     phase_table_width = len(phase_table[0])
     gemm_import = (
-        "from megabake.bodies.gemm import (\n"
+        "from megabake.bodies.cuda.sm90.gemm import (\n"
         "    HopperWgmmaGemmPersistentKernel,\n"
         "    build_table_descriptors,\n"
         "    table_descriptors,\n"
+        "    union_shared_storage,\n"
         ")\n"
         if has_gemm
         else ""
@@ -1458,8 +1598,16 @@ from cuda.bindings import driver as cuda
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.tensor import _Tensor
 
-from megabake.runtime import counting_grid_barrier, prefetch_gemm_weights, prefetch_l1
+from megabake.runtime import (
+    counting_grid_arrive,
+    counting_grid_barrier,
+    counting_grid_wait,
+    prefetch_l1,
+    trap_if,
+)
 {gemm_import}
+{_GEMM_SLOT_SOURCE if any(epilogue_definitions) else ""}
+{chr(10).join(epilogue_definitions)}
 {chr(10).join(gemm_definitions)}
 
 
@@ -1522,25 +1670,28 @@ def megabake_kernel(
             ready[workers + {call_counter_offset()}] = _call + cutlass.Int32(1)
 {gemm_prologue}{_phase_timer_stamp(len(plan.phases), "    ")}{_cta_timer_stamp("0", "    ")}
     for phase in cutlass.range({len(plan.phases)}, unroll=1):
-{weight_prefetch}        if _thread == 0:
+        if _thread == 0:
             if phase + 1 < {len(plan.phases)}:
                 prefetch_l1(phase_table.iterator + (phase + 1) * {phase_table_width})
                 prefetch_l1(addresses.iterator + {len(tensor_arguments)} + (phase + 1) * {slot_width})
-        variant = phase_table[phase, 0]
-        _rotated = (_block + workers - phase_table[phase, 2]) % workers
+        # Table entries are the same on every thread; saying so lets ptxas
+        # treat the dispatch branches around the GEMM bodies as warp-uniform.
+        variant = cute.arch.make_warp_uniform(phase_table[phase, 0])
+        _rotation = cute.arch.make_warp_uniform(phase_table[phase, 2])
+        _units = cute.arch.make_warp_uniform(phase_table[phase, {width}])
+        _rotated = (_block + workers - _rotation) % workers
         _workers = workers
-        if phase_table[phase, 2] < 0:
+        if _rotation < 0:
             # A recompute phase: this CTA runs every tile itself.
             _rotated = cutlass.Int32(0)
             _workers = cutlass.Int32(1)
-        if _rotated < phase_table[phase, {width + 2}]:
+        if _rotated < _units:
 {dispatch}
         if phase_table[phase, 2] < 0:
             # Later TMA reads in this interval see the generic-proxy writes.
             cute.arch.fence_proxy("async.global")
 {_cta_timer_stamp("1 + 2 * phase", "        ", synchronize=True)}        if phase_table[phase, 1] != 0:
-            counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])
-{_phase_timer_stamp("phase", "            ")}            # Every reader of this interval's KV valid length has finished.
+{phase_barrier}{_phase_timer_stamp("phase", "            ")}            # Every reader of this interval's KV valid length has finished.
             if phase_table[phase, 3] != 0:
                 if _block == 0:
                     if _thread == 0:
@@ -1609,7 +1760,13 @@ def launch(
             "phase_floats",
             "phase_counters",
             *(
-                ("gemm_table", "tma_descriptors", "gemm_tensors", "max_active_clusters")
+                (
+                    "gemm_table",
+                    *(("stream_table",) if streaming else ()),
+                    "tma_descriptors",
+                    "gemm_tensors",
+                    "max_active_clusters",
+                )
                 if has_gemm
                 else ()
             ),
@@ -1627,6 +1784,7 @@ def launch(
         resolved_slots=resolved_slots,
         barrier_epochs=barrier_epochs,
         gemm_table=tuple(gemm_rows),
+        stream_table=tuple(stream_rows) if streaming else (),
         gemm_template_phases=tuple(gemm_template_phases),
         gemm_splits=tuple(gemm_splits),
         phase_float_elements=float_elements,
@@ -1636,88 +1794,152 @@ def launch(
     return source, launch_metadata, _source_map(source, plan, phase_records)
 
 
-def _gemm_weight_rows(
-    plan: KernelPlan, tensor_arguments: Sequence[TensorArgument], slots: Sequence[int]
-) -> tuple[int, int, int, int] | None:
-    """(slot, rows, row bytes, row stride bytes) of the first GEMM operand
-    whose storage is a kernel input (weights are lifted inputs, often bound
-    through a transposed view), read in rows along its contiguous axis; None
-    without one."""
+# Table GEMM rows: variant, A, B, C, bias + 1, the second A slot + 1, the
+# fused epilogue kind (0: plain), then the slots of that epilogue's tensors.
+GEMM_SECOND_A_COLUMN = 5
+GEMM_EPILOGUE_KIND_COLUMN = 6
+GEMM_EPILOGUE_COLUMN = 7
+
+_GEMM_SLOT_SOURCE = """
+@cute.jit
+def _gemm_slot(
+    addresses: cute.Tensor,
+    gemm_table: cute.Tensor,
+    gemm: cutlass.Int32,
+    column: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    layout: cutlass.Constexpr,
+    alignment: cutlass.Constexpr,
+):
+    # A fused GEMM epilogue's tensor, from its GEMM row's slot column.
+    address = addresses[gemm_table[gemm, column]]
+    if cutlass.const_expr(dtype is cutlass.Boolean):
+        storage = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Int8, address, cute.AddressSpace.gmem, assumed_align=alignment
+            ),
+            layout,
+        )
+        return _Tensor(storage, dtype=cutlass.Boolean)
+    return cute.make_tensor(
+        cute.make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=alignment),
+        layout,
+    )
+"""
+
+
+def _gemm_slot_tensor_code(column: int, layout: Any) -> str:
+    return _slot_tensor_code(column, layout).replace(
+        "_slot(addresses, phase_table, phase,",
+        "_gemm_slot(addresses, gemm_table, phase_table[phase, 6],",
+        1,
+    )
+
+
+def _read_only_input(plan: KernelPlan, argument: TensorArgument) -> bool:
+    """Whether ``argument``'s storage is a launch input that no region of
+    the plan writes (weights), so it can be read before any barrier."""
     graph = plan.graph
-    for slot in slots:
-        argument = tensor_arguments[slot]
-        layout = argument.layout
-        if layout is None or len(layout.shape) != 2:
-            continue
-        root_id = graph.values[argument.value_id].storage_relation.storage_id
-        root = graph.values.get(root_id or argument.value_id)
-        if root is None or root.producer is not None or root.id not in graph.inputs:
-            continue
-        element = _DTYPE_BYTES[layout.dtype]
-        for axis in (1, 0):
-            if layout.strides[axis] != 1:
-                continue
-            stride = layout.strides[1 - axis] * element
-            row_bytes = layout.shape[axis] * element
-            if stride % 16 or row_bytes < 16:
-                return None
-            return slot, layout.shape[1 - axis], row_bytes, stride
-    return None
+    value = graph.values.get(argument.value_id)
+    if value is None or argument.kind == "state":
+        return False
+    root_id = value.storage_relation.storage_id or argument.value_id
+    root = graph.values.get(root_id)
+    if root is None or root.producer is not None or root.id not in graph.inputs:
+        return False
+    return not any(
+        (graph.values[output].storage_relation.storage_id or output) == root_id
+        for selection in plan.selection.selections
+        for output in selection.outputs
+    )
 
 
-def _weight_prefetch_schedule(
+def _weight_stream_schedule(
     plan: KernelPlan,
+    rotations: Sequence[int],
+    units: Mapping[int, int],
     gemm_of_phase: Mapping[int, int],
-    weights: Sequence[tuple[int, int, int, int] | None],
-    budget: int,
-) -> tuple[dict[int, tuple[int, int]], list[int]]:
-    """Which phase prefetches which GEMMs' weights into L2, and how much.
+    gemm_variants: Sequence[int],
+    streamable: set[int],
+    stages: int,
+) -> tuple[list[tuple[int, ...]], dict[int, int]]:
+    """Which GEMM's pipeline stages each CTA loads at which grid barrier.
 
-    Every barrier interval that runs GEMMs has its weights prefetched from
-    the first distributed phase of the first interval after the previous
-    GEMM interval, so the fetch overlaps the norms, RoPE and attention in
-    between; back-to-back GEMM intervals prefetch one interval ahead. CTAs
-    without tiles in the issuing phase issue the prefetches. At most ``budget`` bytes are
-    prefetched per interval, taken as the same leading share of every weight
-    row. Returns {issuing phase: (first GEMM row, GEMM count)} and the bytes
-    per row to prefetch for every GEMM row (0: none).
+    At the barrier closing an interval, every CTA can load the weights of
+    its first tile of the next interval: CTAs that finish early overlap the
+    loads with the wait, and every CTA with the norms folded into the next
+    interval. Only GEMM bodies use the GEMM's shared memory, so a CTA streams
+    for the first GEMM phase of the interval it has tiles in, when that
+    GEMM's weight is streamable. Rotations and units are the phase table's,
+    so the CTA's tiles follow from its block index.
+
+    Returns the stream table (row 0 all zero; see
+    ``LaunchMetadata.stream_table``) and {closing phase: stream-table row}.
     """
-    sizes = [0] * len(weights)
-    issues: dict[int, tuple[int, int]] = {}
-    if budget <= 0:
-        return issues, sizes
+    workers = plan.launch.grid_size
+    rows: list[tuple[int, ...]] = [(0,) * (3 * workers)]
+    issues: dict[int, int] = {}
+    if stages <= 0 or not streamable:
+        return rows, issues
     intervals: list[list[int]] = [[]]
     for phase in plan.phases:
         intervals[-1].append(phase.index)
         if phase.barrier is not None:
             intervals.append([])
-    previous: int | None = None
-    for position, members in enumerate(intervals):
-        gemms = [gemm_of_phase[index] for index in members if index in gemm_of_phase]
-        if not gemms:
-            continue
-        if previous is None:
-            issuer = 0 if position > 0 else None
-        else:
-            issuer = previous + 1 if previous + 1 < position else previous
-        previous = position
-        if issuer is None or gemms != list(range(gemms[0], gemms[0] + len(gemms))):
-            continue
-        total = sum(
-            weights[gemm][1] * weights[gemm][2] for gemm in gemms if weights[gemm]
-        )
-        if not total:
-            continue
-        share = min(1.0, budget / total)
-        for gemm in gemms:
-            if weights[gemm]:
-                size = int(weights[gemm][2] * share) // 16 * 16
-                sizes[gemm] = size if size >= 64 else 0
-        # Every CTA runs recompute phases, so none is idle in them.
-        distributed = [index for index in intervals[issuer] if not plan.phases[index].recompute]
-        if distributed and any(sizes[gemm] for gemm in gemms):
-            issues[distributed[0]] = (gemms[0], len(gemms))
-    return issues, sizes
+    for previous, members in zip(intervals, intervals[1:]):
+        entries = [0] * (3 * workers)
+        for cta in range(workers):
+            for index in members:
+                if index not in gemm_of_phase:
+                    continue
+                rotation = rotations[index]
+                if rotation < 0:
+                    # Recomputed on every CTA, so it takes every CTA's stages.
+                    break
+                rotated = (cta + workers - rotation) % workers
+                if rotated >= units[index]:
+                    continue
+                gemm = gemm_of_phase[index]
+                if gemm in streamable:
+                    entries[3 * cta : 3 * cta + 3] = (gemm + 1, gemm_variants[gemm], rotated)
+                break
+        if any(entries):
+            issues[previous[-1]] = len(rows)
+            rows.append(tuple(entries))
+    return rows, issues
+
+
+def _weight_stream_source(stream_row: str, variants: Sequence[int]) -> str:
+    """A phase's closing grid barrier that streams weights (see
+    ``_weight_stream_schedule``): after this CTA arrives, warp 0 loads the
+    stages of the GEMM its stream-table entry names, then the CTA waits."""
+    dispatch = "".join(
+        f"                        if _target_variant == {variant}:\n"
+        f"                            _gemm_{variant}.preload_table(\n"
+        f"                                gemm_values[{variant}],\n"
+        "                                _gemm_scratch,\n"
+        "                                table_descriptors(tma_descriptors, _target - 1),\n"
+        "                                _target_block,\n"
+        "                                _target,\n"
+        "                            )\n"
+        for variant in variants
+    )
+    return (
+        "            counting_grid_arrive(ready, workers)\n"
+        f"            _stream = cute.arch.make_warp_uniform({stream_row})\n"
+        "            if _stream != 0:\n"
+        "                if _warp == 0:\n"
+        "                    _target = cute.arch.make_warp_uniform(stream_table[_stream, 3 * _block])\n"
+        "                    if _target != 0:\n"
+        "                        _target_variant = cute.arch.make_warp_uniform(\n"
+        "                            stream_table[_stream, 3 * _block + 1]\n"
+        "                        )\n"
+        "                        _target_block = cute.arch.make_warp_uniform(\n"
+        "                            stream_table[_stream, 3 * _block + 2]\n"
+        "                        )\n"
+        f"{dispatch}"
+        "            counting_grid_wait(ready, workers, _ordinal + phase_table[phase, 1])\n"
+    )
 
 
 def _cta_timer_stamp(offset: str, indent: str, *, synchronize: bool = False) -> str:
@@ -1761,7 +1983,7 @@ def _value_layout(plan: KernelPlan, value_id: str) -> CuTeLayout | None:
         # Unused non-tensor inputs such as flags keep an empty slot.
         return None
     return CuTeLayout(
-        value.dtype, value.shape, value.strides, _DTYPE_BYTES[value.dtype]
+        value.dtype, value.shape, value.strides, DTYPE_BYTES[value.dtype]
     )
 
 
@@ -1778,7 +2000,7 @@ def _slot_tensor_code(column: int, layout: Any) -> str:
         if not shape
         else f"cute.make_layout({shape!r}, stride={strides!r})"
     )
-    alignment = _DTYPE_BYTES[layout.dtype]
+    alignment = DTYPE_BYTES[layout.dtype]
     return (
         f"_slot(addresses, phase_table, phase, {column}, {dtype}, "
         f"{layout_code}, {alignment})"
@@ -1915,7 +2137,7 @@ def _normalize_generic_selection(
             for domain in selection.program.iteration_domains
             if domain.axis not in selection.program.reduction_axes
         )
-        accumulator_size = _DTYPE_BYTES[selection.program.accumulator_dtype or ""]
+        accumulator_size = DTYPE_BYTES[selection.program.accumulator_dtype or ""]
         tiles = replace(
             body.tiles,
             cta_shape=(threads,) + (1,) * max(len(output_domains) - 1, 0),
@@ -1933,7 +2155,17 @@ def _normalize_generic_selection(
             body=replace(body, participants=participants, tiles=tiles, scratch=scratch),
         )
     elif family == "attention":
-        return replace(selection, body=replace(body, participants=participants))
+        # Decode attention keeps a statistic and a head-dim row of value
+        # partials per warp in its shared scratch.
+        head_dim = body.tiles.cta_shape[-1]
+        scratch = replace(
+            body.scratch,
+            size_bytes=body.scratch.size_bytes
+            + (threads - old_threads) // 32 * (1 + head_dim) * 4,
+        )
+        return replace(
+            selection, body=replace(body, participants=participants, scratch=scratch)
+        )
     else:
         raise UnsupportedCodegen(f"cannot normalize generic body family {family}")
 
@@ -2034,7 +2266,6 @@ def _generate_conversion_body(
                 "writes": (converted_id,),
                 "owns_storage": True,
             },
-            access_restrictions=("copy source coordinates exactly",),
         ),
         layouts=LayoutContract(
             {
@@ -2066,18 +2297,15 @@ def _generate_conversion_body(
             base_body.pipeline,
             barriers=(),
             async_operations=(),
-            shared_memory_layouts={},
         ),
         scratch=replace(
             base_body.scratch,
             owner="none",
             size_bytes=0,
-            initial_state="empty",
         ),
         completion=replace(
             base_body.completion,
             outputs_ready="copied elements are stored when run returns",
-            output_tiles_ready="each copied element is ready after its store",
             scratch_reusable="scratch is reusable when run returns",
         ),
     )
@@ -2154,10 +2382,6 @@ def _generic_scratch_bytes(
         offset = _round_up(offset, alignment) + body_bytes
         sizes.append(_round_up(offset, alignment))
     return max(sizes, default=0)
-
-
-def _round_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
 
 
 def _shared_scratch_source(
@@ -2280,7 +2504,7 @@ def _phase_scratch_elements(
     )
     return _phase_scratch_bytes(
         plan, phase, scratch_elements
-    ) // _DTYPE_BYTES[accumulator_dtype]
+    ) // DTYPE_BYTES[accumulator_dtype]
 
 
 def _phase_scratch_bytes(
@@ -2292,7 +2516,7 @@ def _phase_scratch_bytes(
             for selection in plan.selection.selections
             if selection.region_id == phase.region_id
         )
-        return scratch_elements[phase.index] * _DTYPE_BYTES[accumulator_dtype]
+        return scratch_elements[phase.index] * DTYPE_BYTES[accumulator_dtype]
     return phase.body.scratch.size_bytes
 
 
@@ -2417,6 +2641,7 @@ def _source_map(
                 for index, line in enumerate(source_lines, 1)
                 if "grid_barrier(ready, workers, epoch + phase + " in line
                 or "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])" in line
+                or "counting_grid_arrive(ready, workers)" in line
             )
             entries.append(
                 SourceMapEntry(

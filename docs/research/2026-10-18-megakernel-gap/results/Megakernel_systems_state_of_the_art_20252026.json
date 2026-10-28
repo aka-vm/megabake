@@ -1,0 +1,529 @@
+{
+  "name": "Megakernel systems state of the art 2025-2026",
+  "scope": "Web/literature survey (as of 2026-10-18) of published megakernel / persistent-kernel inference systems: Mirage MPK (arXiv 2512.22219, OSDI'26) cross-checked against the local checkout agent_space/mirage @ f9eb70c2 (2026-10-05); Hazy Research low-latency Llama-1B megakernel (May 2025) and throughput TP Llama-70B megakernel in Tokasaurus (Sep 2025); Event Tensor Compiler (arXiv 2604.13327, MLSys'26); TileRT (tile-ai); Triton-distributed mega_triton_kernel (ByteDance Seed); Cohere's hand-written MoE megakernel (Sep 2026); ForgeMegakernel (arXiv 2609.12379, agent-forged CUDA megakernels); AutoMegaKernel (arXiv 2606.09682, HF->single cooperative kernel with static safety gate); FlashMoE/FlashDMoE (single-kernel distributed MoE, NeurIPS'25); SambaNova Kernel Looping (arXiv 2410.23668); Blackwell Cluster Launch Control (CUTLASS PersistentTileSchedulerSm100, PTX clusterlaunchcontrol.try_cancel); PDL+CUDA graphs as the strongest multi-kernel baseline; Luminal (search-based compiler claiming automatic megakernels); MegaScale-Infer (checked: not a megakernel). Question answered for MegaBake: which published systems are truly automatic from a framework graph vs hand-built per model, what they report vs CUDA-graph baselines, which runtime mechanisms they share that MegaBake lacks, and where MegaBake (Dynamo/AOT FX -> one cooperative CuTe-DSL kernel, grid barriers, SM90 MIG 60 SMs) sits. Static analysis only; MegaBake numbers taken from ROADMAP.md section 6 and artifacts/full_model_2026-10-18/*/report.json.",
+  "key_sources": [
+    "https://arxiv.org/abs/2512.22219 (MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs, Cheng et al., OSDI'26; html v1 https://arxiv.org/html/2512.22219v1)",
+    "https://www.usenix.org/conference/osdi26/presentation/cheng (MPK OSDI'26 page)",
+    "agent_space/mirage/README.md:14 (MPK claims 1.2x-6.7x latency reduction)",
+    "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:842-2529 (hand-called layer API: rmsnorm_linear_layer:883, paged_attention_split_kv_layer:1435, splitk_linear_layer:2365, linear_with_residual_layer:2449, ...)",
+    "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:264-278 (num_workers / local+remote schedulers split)",
+    "agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:358-523 (per-model builder choosing grid_dim per layer)",
+    "agent_space/mirage/python/mirage/mpk/models/utils.py:3-15 (grid_for_rmsnorm_linear_layer: '96 and 64 are enough to cover all Qwen3 model?' - model-tuned task counts)",
+    "agent_space/mirage/include/mirage/persistent_kernel/tasks/hopper/linear_swapAB_hopper.cuh:60-73 (swapAB, BATCH_SIZE<=16, MMA_ATOM_N 8/16)",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:205-206 (local + remote worker queues)",
+    "agent_space/mirage/include/mirage/persistent_kernel/tasks/blackwell/ (sampling_sm100.cuh, argmax_sm100.cuh, mla_*_sm100.cuh, linear_fp8_sm100_scheduler.cuh: SM100 task library is far richer than hopper/)",
+    "agent_space/mirage/python/mirage/mpk/mpk.py:173,192 ('vllm-mpk integration' comments)",
+    "https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles (Look Ma, No Bubbles: Llama-1B low-latency megakernel)",
+    "https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-intro and https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-main (throughput TP megakernel, Llama-70B, Tokasaurus)",
+    "https://arxiv.org/abs/2604.13327 (Event Tensor: A Unified Abstraction for Compiling Dynamic Megakernel, MLSys'26; html https://arxiv.org/html/2604.13327v2)",
+    "https://proceedings.mlsys.org/paper_files/paper/2026/hash/53d3f45797970d323bd8a0d379c525aa-Abstract-Conference.html (Event Tensor MLSys page)",
+    "https://github.com/tile-ai/TileRT (TileRT README and releases)",
+    "https://inferencex.semianalysis.com/glossary/tilert (third-party characterization of TileRT as a resident engine kernel)",
+    "https://arxiv.org/abs/2504.19442 (Triton-distributed paper)",
+    "https://triton-distributed.readthedocs.io/en/latest/getting-started/megakernel/megakernel.html (mega_triton_kernel Qwen3 table)",
+    "https://cohere.com/blog/megakernels (Cohere hand-written megakernel for 30B-A3B MoE, Sep 2026)",
+    "https://arxiv.org/abs/2609.12379 (ForgeMegakernel, Tsinghua/ModelBest, Sep 2026; html v1)",
+    "https://arxiv.org/abs/2606.09682 and https://github.com/RightNow-AI/AutoMegaKernel (AutoMegaKernel, RightNow AI, Jun 2026)",
+    "https://arxiv.org/abs/2506.04667 (FlashDMoE / FlashMoE: Fast Distributed MoE in a Single Kernel, NeurIPS'25)",
+    "https://arxiv.org/abs/2410.23668 (Kernel Looping, SambaNova)",
+    "https://arxiv.org/abs/2504.02263 (MegaScale-Infer - disaggregated expert parallelism, not a megakernel)",
+    "https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_cluster_launch_control.html (CUTLASS CLC dynamic persistent scheduler)",
+    "https://nvidia.github.io/cccl/unstable/libcudacxx/ptx/instructions/clusterlaunchcontrol.html (PTX clusterlaunchcontrol.try_cancel / query_cancel)",
+    "https://triton-lang.org/main/gluon/api/generated/triton.experimental.gluon.language.nvidia.blackwell.clc.html (Gluon CLC API) and https://tilelang.com/autoapi/tilelang/language/cluster/index.html (TileLang clc_try_cancel)",
+    "https://docs.nvidia.com/cuda/archive/13.2.1/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html (PDL)",
+    "https://hn.svelte.dev/item/44963135 (Show HN: Luminal search-based GPU compiler) and https://forum.nousresearch.com/t/can-kernel-compiler-like-luminal-kernelbench-v3-enable-llm-driven-sota-kernel-engineering/310",
+    "ROADMAP.md:16-29 (latency-bound decode analysis), ROADMAP.md:42-51 (reference systems table), ROADMAP.md:118-129 (steps 8-12 status), ROADMAP.md:144,149 (counting barrier 0.70 us; split-K no gain on 60 SMs), ROADMAP.md:151-184 (results, where MegaBake loses), ROADMAP.md:206-221 (bucketed prefill)",
+    "artifacts/full_model_2026-10-18/{HuggingFaceTB--SmolLM-135M,HuggingFaceTB--SmolLM-1.7B,Qwen--Qwen2-0.5B,Qwen--Qwen3.5-0.8B}/report.json (fresh decode/prefill numbers; Qwen3.5 prefill fails on aten.cumsum / linalg_solve_triangular)",
+    "src/megabake/runtime.py:69-74 (old grid barrier, 13 us at 60 workers), runtime.py:112-134 (counting_grid_barrier), runtime.py:151-160 (cooperative_event_worker_loop, per-tensor launch only), runtime.py:210-245 (publish_event / wait_for_event), runtime.py:265-266 (plan bound to SM count)",
+    "src/megabake/schedule.py:487-590 (make_event_schedule / make_region_event_schedule), schedule.py:1380-1386 (_FOLD_* limits)",
+    "src/megabake/compiler.py:205-210 (_TABLE_LAUNCH_OPS=1000, _TABLE_LAUNCH_PARAMETER_BYTES=24000), compiler.py:416-422 (swapAB / split-K policy, MEGABAKE_SPLIT_K env)",
+    "src/megabake/bodies/gemm.py:1708-1711 (TABLE_GEMM_SHARED_BYTES fixed 8 stages of 64x64x64), gemm.py:1888-1905 (SWAP_AB_MAX_ROWS=64, SWAP_AB_ROW_TILES, SPLIT_K_MAX=16)",
+    "src/megabake/bodies/attention.py:420-423 (DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64)",
+    "src/megabake/bodies/blackwell.py:1-5,71 (SM100/SM120 provider uses mma.sync 16x32 only, no tcgen05/TMEM/CLC)",
+    "src/megabake/plan.py:494-507 (worker count = SMs x active blocks, plus half)",
+    "src/megabake/buckets.py:38 (DEFAULT_BUCKETS)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "MPK: compiler-derived SM-level task graph with event counters instead of kernel boundaries/grid barriers",
+      "how_it_works": "Each operator's output tensor is partitioned into disjoint tasks (one task = one SM's unit of compute or communication). An event is created for every producer/consumer task pair whose output and input regions overlap; graph is normalized so each task has at most one dependent and one triggering event (dummy tasks, <1% overhead), and tasks fired by the same event are linearized to contiguous indices (fan-out stored as first/last). A task waits on its dependent event's counter and atomically increments its triggering event on completion. Default task count is proportional to SM count, overridable per output dimension.",
+      "where_in_source": "arXiv 2512.22219 sec. 3-4; agent_space/mirage/python/mirage/mpk/persistent_kernel.py:842-2529; persistent_kernel.cuh:205-206"
+    },
+    {
+      "idea": "MPK: worker/scheduler split with hybrid AOT + JIT task launch",
+      "how_it_works": "Workers (104/128/144 on A100/H100/B200) run tasks from per-SM FIFO queues; 16 schedulers are warp-level (4 per SM). AOT tasks are pre-enqueued round-robin to workers and spin locally on their event; JIT tasks (used for data-dependent ops such as attention and everything downstream until a global barrier) are dispatched by schedulers only after their event activates. Workers prefer JIT tasks and run an AOT task only if its event is already active. Local and remote (NVSHMEM) queues exist per worker.",
+      "where_in_source": "arXiv 2512.22219 sec. 4; agent_space/mirage/python/mirage/mpk/persistent_kernel.py:264-278; persistent_kernel.cuh:205-206"
+    },
+    {
+      "idea": "MPK / Hazy: paged shared memory with cross-task (cross-op) pre-loading",
+      "how_it_works": "MPK splits smem into 32 KB pages (5/7/7 per SM on A100/H100/B200); Hazy splits the first 213 kB of H100 smem into 13x16 KiB pages. Each task/instruction has a load phase and a compute phase; once the current task has issued all its data-transfer instructions and enough pages are free, the next task's loads (weights) start while the current task still computes. Pages are released incrementally so the next op's TMA/cp.async weight stream begins before the previous op drains. MPK also prefetches the 352-byte task descriptor into smem. Reported ablation: 1.2-1.3x on Qwen3-8B final linear on B200.",
+      "where_in_source": "arXiv 2512.22219 sec. 5 (paged shared memory); Hazy no-bubbles blog (shared memory paging section)"
+    },
+    {
+      "idea": "Hazy: instruction-interpreter megakernel with few fused instructions per layer and chunked counters",
+      "how_it_works": "One CUDA template interprets a per-SM instruction stream generated ahead of time in Python and reused across forward passes. Llama-1B uses ~6 instructions/layer: RMSNorm+QKV+RoPE, attention, (conditional) attention reduction, O-proj+residual, RMSNorm+up/gate+SiLU, down-proj+residual, then final RMSNorm+LM head. Sync is global-memory counters; the MLP intermediate is split into 4 chunks with separate counters so the down projection starts when its chunk is ready. Cost model in the post: ~500 ns per global load/store round trip, ~60 ns per async barrier; B200 breakdown 250 us activation store/check/load, 200 us norm+matvec, 30 us waiting on weights, 40 us warp sync, 80 us setup.",
+      "where_in_source": "https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles"
+    },
+    {
+      "idea": "Hazy throughput megakernel: software-scheduled overlap of compute, memory and NVLink communication in one kernel (Tokasaurus, TP=8 Llama-70B)",
+      "how_it_works": "One kernel per GPU runs a software schedule that co-schedules GEMM, attention, and all-reduce/all-gather instructions on different SMs/warps so tensor cores, HBM and NVLink are busy simultaneously; supports arbitrary batch sizes, mixed prefill+decode, paged KV, CPU-side pipelining of batch scheduling.",
+      "where_in_source": "https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-main"
+    },
+    {
+      "idea": "Event Tensor Compiler: events as first-class symbolic-shape tensors; static vs dynamic schedule as a compiler transform",
+      "how_it_works": "Dependencies between tile tasks are expressed as an integer 'event tensor' indexed by task coordinates via einsum-like index maps (symbolic shapes cover dynamic dims; data-dependent cases like MoE routing map through index expressions). notify() = atomic decrement, wait() = spin to zero; no runtime event objects. Static scheduling precomputes per-SM queues on the host (round-robin; unseen shapes reuse the next larger sampled shape; data-dependent updates conservatively collapse to E[0]); dynamic scheduling uses a centralized global-memory queue with atomic push/pop and an early-push optimization. Built as TVM passes; tile device functions and dependency/prefetch annotations are written by hand, memory planning, notify/wait lowering, persistent-kernel emission and the weight-prefetch pass are automatic. AOT: no CUDA-graph captures.",
+      "where_in_source": "arXiv 2604.13327 (html v2), sections on Event Tensor, scheduling transforms, Table 1-3, Appendix D-E"
+    },
+    {
+      "idea": "Triton-distributed mega_triton_kernel: Triton-authored task library assembled per model into one persistent kernel",
+      "how_it_works": "A model file (python/triton_dist/mega_triton_kernel/models/qwen3.py) composes Triton task kernels into a single persistent launch with TP=8 communication inside; docs present it as a template to copy for other models (hand-built per model, Triton-generated per task).",
+      "where_in_source": "https://triton-distributed.readthedocs.io/en/latest/getting-started/megakernel/megakernel.html; arXiv 2504.19442"
+    },
+    {
+      "idea": "TileRT: tile-level runtime that decomposes operators into tile tasks and overlaps compute, I/O and inter-GPU communication; decode-only engine paired with vLLM/SGLang prefill",
+      "how_it_works": "Operators are decomposed into fine-grained tile tasks scheduled by a resident runtime across 8 GPUs; supports MTP (multi-token prediction) in-engine; prefill-decode disaggregation (vLLM does prefill). Backend kernels ship only as prebuilt binaries; compiler techniques promised to land in TileLang/TileScale.",
+      "where_in_source": "https://github.com/tile-ai/TileRT; https://inferencex.semianalysis.com/glossary/tilert"
+    },
+    {
+      "idea": "Cohere: hand-written MoE megakernel with static wave order, work-stealing queues for variable-size work, and weight prefetch ahead of activations",
+      "how_it_works": "One 12-warp threadblock per SM (controller, producer, storer, consumers) stays resident for the decode step; host splits the step into tiles dealt round-robin (task k -> SM k mod 132); full attention and MoE expert work are claimed from shared queues; counters in global memory; router and QKV weights are streamed from HBM before their activation inputs are ready; down-proj tiles start as soon as the matching expert's up-proj finishes. Schedule ordering ablation: tuned wave order 291 tok/s vs attention-first 236 tok/s (-19%).",
+      "where_in_source": "https://cohere.com/blog/megakernels"
+    },
+    {
+      "idea": "ForgeMegakernel: agent-forged per-model CUDA megakernels via a 10-milestone ladder (M5 single launch, M6 per-SM typed instruction streams, M7 counter semaphores with zero grid barriers, M8 smem buffer pool overlapping loads/stores) plus MBU measurement methodology",
+      "how_it_works": "A fresh coding agent per round edits a from-scratch CUDA megakernel, runs a mid-state test oracle, keeps/reverts; a second agent audits diffs. Methodology: exclude untied embedding table from bytes (can inflate MBU up to 1.22x), two-point slope timing (80 vs 16 tokens) to remove prefill, Nsight byte counts, declared timing scope.",
+      "where_in_source": "arXiv 2609.12379 (html v1)"
+    },
+    {
+      "idea": "AutoMegaKernel: HF model -> graph IR -> typed schedule IR (SM-level task DAG with monotonic counters) executed by a frozen hand-written VM, gated by a static safety checker, retargeted across sm_80/sm_90/sm_120, agent-tuned",
+      "how_it_works": "Each task is a fixed-size instruction record (op, <=8 inputs, 4 outputs, 8 waits, one out_counter, SM index, param blob). One cooperative launch, grid.sync only at entry/exit; producers release-fence + atomicAdd, consumers acquire-spin on (counter, threshold). validate() statically checks deadlock freedom (1<=t<=#producers, acyclic, each SM queue a linear extension of the DAG), race freedom (multi-producer counters are full joins; every read has an ordered writer via transitive happens-before; KV reads after append ordered), ABI caps. An agent proposes ScheduleConfig/micro-kernel knob edits (cols_per_warp, cp.async depth, N_tile, threads, fusion grouping, SM assignment, pipeline depth, page allocation) with A/B re-measurement and a roofline floor guard.",
+      "where_in_source": "arXiv 2606.09682; https://github.com/RightNow-AI/AutoMegaKernel"
+    },
+    {
+      "idea": "FlashMoE: whole distributed MoE layer (gate, dispatch, expert GEMMs, combine) as one persistent kernel with device-initiated NVSHMEM communication and tile-level task parallelism",
+      "how_it_works": "Actor-style persistent kernel built on CUTLASS GEMMs; communication is issued from the device per tile so stragglers do not serialize the layer; 1 GPU operation vs 33 (COMET) / 85 (Megatron-LM CUTLASS) per layer.",
+      "where_in_source": "arXiv 2506.04667"
+    },
+    {
+      "idea": "Kernel Looping (SambaNova): exploit repeated decoder layers by replacing N calls of the same fused layer kernel with one kernel containing a pipelined outer loop, removing layer-boundary synchronization",
+      "how_it_works": "Compiler-level global transform on a dataflow accelerator (SN40L): consecutive identical layer kernels become one kernel whose outer loop iterates layers so the next layer's weight loads pipeline under the current layer's compute.",
+      "where_in_source": "arXiv 2410.23668"
+    },
+    {
+      "idea": "Blackwell Cluster Launch Control (CLC) dynamic persistent scheduling",
+      "how_it_works": "SM100+ only. Kernel is launched with one CTA (cluster) per output tile as if non-persistent; a running CTA's scheduler warp issues clusterlaunchcontrol.try_cancel (16-byte response into smem, completion on an mbarrier) to atomically steal a not-yet-launched cluster's coordinates and process that tile, so persistence adapts to SMs actually available (e.g. shared with other kernels). CUTLASS PersistentTileSchedulerSm100 wraps it; exposed in Gluon, TileLang, Mojo, NVVM MLIR.",
+      "where_in_source": "https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_cluster_launch_control.html; https://nvidia.github.io/cccl/unstable/libcudacxx/ptx/instructions/clusterlaunchcontrol.html"
+    },
+    {
+      "idea": "Strongest multi-kernel baseline: CUDA graphs + PDL (programmatic dependent launch)",
+      "how_it_works": "PDL lets kernel N+1 launch and run its prologue (descriptor setup, weight prefetch that does not depend on N) before kernel N finishes, synchronizing with griddepcontrol.wait / cudaGridDependencySynchronize before reading N's output; usable inside CUDA graphs via stream capture or edge data. Overlap is opportunistic, not guaranteed. vLLM/SGLang decode replays CUDA graphs; Hazy measured ~1.3 us per launch with graphs vs ~2.1 us on a stream on H100.",
+      "where_in_source": "CUDA programming guide 4.5 (PDL); Hazy no-bubbles blog"
+    },
+    {
+      "idea": "In-kernel decode loop pieces: on-device sampling/argmax, spec-decode (MTP / EAGLE3 / DFlash) and runtime token counts",
+      "how_it_works": "MPK has argmax_sm100 / sampling_sm100 tasks and spec-decode builders (models/eagle3, models/dflash, speculative.py) so verification and next-token selection happen inside the persistent kernel; MPK uses a runtime token count instead of shape buckets (power-of-two batch variants only); TileRT runs MTP inside its decode engine; Hazy reuses one schedule over hundreds of forward passes.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/tasks/blackwell/{argmax_sm100,sampling_sm100}.cuh; agent_space/mirage/python/mirage/mpk/speculative.py; TileRT README"
+    },
+    {
+      "idea": "Luminal: search-based compiler claiming automatic megakernel generation with a dynamic global instruction queue",
+      "how_it_works": "[uncertain] Claimed: e-graph/search-based compiler fuses whole models into a single kernel scheduled by a runtime global instruction queue across SMs. No peer-reviewed numbers found.",
+      "where_in_source": "https://hn.svelte.dev/item/44963135; nousresearch forum post"
+    },
+    {
+      "idea": "MegaScale-Infer (ByteDance): disaggregated attention/FFN with ping-pong micro-batch pipeline - NOT a megakernel",
+      "how_it_works": "Splits attention and expert modules onto separate GPU pools, ping-pongs >= 2(1+Tc/Tf) micro-batches between them, M2N comm library; up to 1.90x per-GPU throughput. Included only because the task listed 'MegaScale'; no persistent-kernel component found.",
+      "where_in_source": "arXiv 2504.02263"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "MPK: compiler-derived SM-level task graph with event counters instead of kernel boundaries/grid barriers",
+      "status": "partial",
+      "evidence": "src/megabake/schedule.py:487-590 (make_event_schedule, make_region_event_schedule build producer/consumer events), runtime.py:151-245 (cooperative_event_worker_loop, publish_event/wait_for_event); ROADMAP.md:125 step 10 'not started'; ROADMAP.md:27 'Full models cannot use events'",
+      "notes": "MegaBake already derives region-level events automatically from FX regions (more automatic than MPK's builders), but only the per-tensor-parameter launch uses them; every full model goes through the table launch (compiler.py:205-210) which only has counting grid barriers (runtime.py:112-134). Granularity is region/phase, not per-SM task, and there is no event normalization or fan-out linearization."
+    },
+    {
+      "idea": "MPK: worker/scheduler split with hybrid AOT + JIT task launch",
+      "status": "missing",
+      "evidence": "runtime.py has only static cooperative worker loops; no scheduler warps or JIT queues",
+      "notes": "MegaBake assigns work statically per phase. Its split-context decode attention is the only load-balance device. Dynamic JIT dispatch matters mostly for variable-length attention and MoE; ETC found dynamic scheduling slower (0.82-0.89x) for dense TP decode, so static-first is consistent with the literature."
+    },
+    {
+      "idea": "MPK / Hazy: paged shared memory with cross-task (cross-op) pre-loading",
+      "status": "missing",
+      "evidence": "ROADMAP.md:124 step 9 'Cross-phase L2 weight prefetch: not started'; bodies/gemm.py:1708-1711 each GEMM phase owns a fixed 8-stage smem pipeline that is torn down at the phase barrier",
+      "notes": "No smem paging; each phase starts its TMA pipeline cold after the barrier. The ROADMAP plan uses cp.async.bulk.prefetch.L2 during waits rather than smem pages - cheaper to implement but only hides HBM->L2, not L2->smem latency."
+    },
+    {
+      "idea": "Hazy: instruction-interpreter megakernel with few fused instructions per layer and chunked counters",
+      "status": "partial",
+      "evidence": "ROADMAP.md:118 step 8 (interval folding 333->183 barriers on 135M, ~6 intervals/layer), schedule.py:1380-1386 (_FOLD_* limits), bias epilogue step 7",
+      "notes": "MegaBake reaches ~6 barrier intervals/layer - same count as Hazy's 6 instructions/layer - but each interval is a whole-grid phase rather than a per-SM instruction, and RMSNorm is recomputed by consumers rather than fused into the GEMM prologue; residual add and SiLU*mul are not in GEMM epilogues (ROADMAP.md:79). No chunked counters."
+    },
+    {
+      "idea": "Hazy throughput megakernel: software-scheduled overlap of compute, memory and NVLink communication in one kernel (Tokasaurus, TP=8 Llama-70B)",
+      "status": "not_applicable",
+      "evidence": "Single-GPU only (H200 MIG); no NVSHMEM/NVLink path",
+      "notes": "Relevant only if MegaBake goes multi-GPU."
+    },
+    {
+      "idea": "Event Tensor Compiler: events as first-class symbolic-shape tensors; static vs dynamic schedule as a compiler transform",
+      "status": "partial",
+      "evidence": "schedule.py:487-590 events exist as explicit lists of producer/consumer task IDs; runtime.py:320-338 admission checks counter overflow",
+      "notes": "MegaBake events are enumerated per task pair in Python (which is also why compile time grows with tile count, ROADMAP.md:221-224), not symbolic tensors with index maps. Adopting ETC-style symbolic event tensors would fix both the table-launch parameter problem and compile-time scaling. MegaBake is already AOT with zero graph captures, like ETC."
+    },
+    {
+      "idea": "Triton-distributed mega_triton_kernel: Triton-authored task library assembled per model into one persistent kernel",
+      "status": "not_applicable",
+      "evidence": "MegaBake uses CuTe-DSL, not Triton",
+      "notes": "Same per-model-builder pattern MegaBake intentionally avoids."
+    },
+    {
+      "idea": "TileRT: tile-level runtime that decomposes operators into tile tasks and overlaps compute, I/O and inter-GPU communication; decode-only engine paired with vLLM/SGLang prefill",
+      "status": "not_applicable",
+      "evidence": "No multi-GPU, no MTP",
+      "notes": "Hybrid split (other engine prefill + megakernel decode) is relevant: MegaBake already has fallback='inductor' (ROADMAP.md:73)."
+    },
+    {
+      "idea": "Cohere: hand-written MoE megakernel with static wave order, work-stealing queues for variable-size work, and weight prefetch ahead of activations",
+      "status": "missing",
+      "evidence": "No queue-based work claiming; phase order is the topological FX order",
+      "notes": "Wave-order ablation (up to 19%) suggests MegaBake's planner should search phase/tile order; not done."
+    },
+    {
+      "idea": "ForgeMegakernel: agent-forged per-model CUDA megakernels via a 10-milestone ladder (M5 single launch, M6 per-SM typed instruction streams, M7 counter semaphores with zero grid barriers, M8 smem buffer pool overlapping loads/stores) plus MBU measurement methodology",
+      "status": "partial",
+      "evidence": "MegaBake has 'mid-state oracle' analogues: per-region teacher-forced verification (ROADMAP.md:95-104) and bit-exact rerun with private workspaces",
+      "notes": "No agent loop; plan search is measured (plan.py budgets, compiler.py:1223-1247) but over a small candidate set. MBU methodology: MegaBake's PERFORMANCE_REPORT/ROADMAP floor (1.5 ms for 1.7B) should state whether embeddings are counted."
+    },
+    {
+      "idea": "AutoMegaKernel: HF model -> graph IR -> typed schedule IR (SM-level task DAG with monotonic counters) executed by a frozen hand-written VM, gated by a static safety checker, retargeted across sm_80/sm_90/sm_120, agent-tuned",
+      "status": "partial",
+      "evidence": "schedule.py simulate_event_schedule (called in make_event_schedule, schedule.py:586; runtime.py:323) simulates the schedule; HF frontend is Dynamo/AOT post-grad FX with 67 lowered ATen ops (ROADMAP.md:33)",
+      "notes": "MegaBake's frontend is strictly more generic than AMK's (AMK rejects non-Llama families). MegaBake's schedule simulation checks executability but there is no documented race-freedom/happens-before check like AMK's validate(); that becomes essential once step 10 replaces barriers with counters."
+    },
+    {
+      "idea": "FlashMoE: whole distributed MoE layer (gate, dispatch, expert GEMMs, combine) as one persistent kernel with device-initiated NVSHMEM communication and tile-level task parallelism",
+      "status": "not_applicable",
+      "evidence": "No MoE, no multi-GPU",
+      "notes": "Becomes relevant for MoE models (Qwen3-MoE, gpt-oss)."
+    },
+    {
+      "idea": "Kernel Looping (SambaNova): exploit repeated decoder layers by replacing N calls of the same fused layer kernel with one kernel containing a pipelined outer loop, removing layer-boundary synchronization",
+      "status": "partial",
+      "evidence": "MegaBake's whole decode is already one launch, so layer loops exist trivially; but codegen unrolls every layer into its own phases (table entries per phase)",
+      "notes": "Not a loop with a software-pipelined outer layer loop; weights of layer L+1 are not loaded under layer L."
+    },
+    {
+      "idea": "Blackwell Cluster Launch Control (CLC) dynamic persistent scheduling",
+      "status": "missing",
+      "evidence": "bodies/blackwell.py:1-5,71 uses mma.sync 16x32 with a static 'persistent range of output tiles'",
+      "notes": "Not applicable on SM90 MIG; relevant for SM100 port. On a MIG slice SMs are dedicated, so CLC's benefit (adapting to stolen SMs) is small; clock noise is a different problem."
+    },
+    {
+      "idea": "Strongest multi-kernel baseline: CUDA graphs + PDL (programmatic dependent launch)",
+      "status": "not_applicable",
+      "evidence": "MegaBake is a single kernel; the comparison baseline in report.json is Inductor with and without cudagraph trees",
+      "notes": "Important: in decode the 'inductor_cudagraphs' row is NOT actually graphed (complete_call 9.19 ms for 1.7B with 458 launches; ROADMAP.md:159 footnote: KV caches are mutated inputs). MegaBake has never been compared against a true CUDA-graph(+PDL) decode such as vLLM/SGLang."
+    },
+    {
+      "idea": "In-kernel decode loop pieces: on-device sampling/argmax, spec-decode (MTP / EAGLE3 / DFlash) and runtime token counts",
+      "status": "missing",
+      "evidence": "main.py:204 only checks argmax vs eager; buckets.py:38 DEFAULT_BUCKETS=(16..512) pads instead of a runtime token count (ROADMAP.md:223)",
+      "notes": "Each decode token is a separate host call through Dynamo guards (~290 us) and MegaBake host work (~360 us); no in-kernel sampling, no multi-step decode, no spec-decode."
+    },
+    {
+      "idea": "Luminal: search-based compiler claiming automatic megakernel generation with a dynamic global instruction queue",
+      "status": "missing",
+      "evidence": "No search-based fusion; region matchers in regions.py",
+      "notes": "Unverified system; listed for completeness."
+    },
+    {
+      "idea": "MegaScale-Infer (ByteDance): disaggregated attention/FFN with ping-pong micro-batch pipeline - NOT a megakernel",
+      "status": "not_applicable",
+      "evidence": "-",
+      "notes": "Not a megakernel technique."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Event-driven tile-granular dataflow across op boundaries (consumer tile starts when its producer tiles finish, other SMs keep running)",
+      "why_multi_kernel_cannot": "A kernel boundary is an all-to-all dependency: no CTA of kernel N+1 may read results until every CTA of kernel N has finished, so the slowest CTA (tail) idles the rest of the GPU. PDL only overlaps the dependent kernel's prologue; griddepcontrol.wait still waits for the whole primary grid. CUDA graphs remove CPU launch cost (~1.3 us/launch on H100 per Hazy) but not the tail+refill bubble (~5 us per boundary estimated by Hazy).",
+      "nearest_multi_kernel_substitute": "CUDA graph + PDL + horizontal fusion: removes launch latency and overlaps prologues, maybe 30-50% of the per-boundary bubble [uncertain]; never partial-producer overlap.",
+      "systems": "MPK, Hazy, ETC, Cohere, ForgeMegakernel (M7), AutoMegaKernel"
+    },
+    {
+      "opportunity": "Cross-op weight prefetch into smem pages / L2 while the previous op still computes or while a CTA waits for its event",
+      "why_multi_kernel_cannot": "A kernel cannot hold smem across its end, and the next kernel cannot be resident (its CTAs need the same SM resources) until the previous one drains; PDL can start the next kernel early only if resources allow co-residency, which large-smem GEMMs prevent. L2 prefetch from a prior kernel is possible but requires that kernel to know the next weights - a cross-kernel contract no library has.",
+      "nearest_multi_kernel_substitute": "PDL prologue issuing cp.async.bulk.prefetch.L2 for its own weights before griddepcontrol.wait (works only if co-residency is allowed; typically few us of overlap).",
+      "systems": "MPK paged smem (1.2-1.3x on one linear), Hazy 13 pages, Cohere weight streaming before activations, ETC prefetch pass, TPU bank ring"
+    },
+    {
+      "opportunity": "Grid-wide synchronization at ~0.5-0.7 us, or none, instead of ~2-5 us kernel boundaries",
+      "why_multi_kernel_cannot": "Kernel boundary costs include launch, drain, and cache/descriptor refill; inside one kernel a release-add/acquire-poll barrier is one memory round trip (MegaBake measured 0.70 us; Hazy ~500 ns per global round trip).",
+      "nearest_multi_kernel_substitute": "CUDA graphs (~1.3 us launch) + PDL.",
+      "systems": "All; MegaBake already exploits this (ROADMAP.md:144)."
+    },
+    {
+      "opportunity": "Multi-step decode loop in one launch with on-device sampling/argmax and next-token embedding (and in-kernel speculative verify)",
+      "why_multi_kernel_cannot": "A CUDA graph cannot branch on data or loop a data-dependent number of times without CPU involvement (conditional graph nodes exist since CUDA 12.4 but each step still replays hundreds of kernels); a persistent kernel can loop N tokens, sample, write the token, and start the next step's embedding without returning to the host.",
+      "nearest_multi_kernel_substitute": "CUDA graph capturing k decode steps + device sampling (vLLM multi-step scheduling); still pays per-kernel bubbles.",
+      "systems": "MPK (argmax/sampling tasks, EAGLE3/DFlash spec decode), TileRT (MTP), Hazy (schedule reused across hundreds of passes)"
+    },
+    {
+      "opportunity": "Global (whole-model) schedule optimization: wave/tile order, SM assignment, affinity of producer and consumer tiles on the same SM (L1/smem reuse)",
+      "why_multi_kernel_cannot": "The hardware block scheduler decides placement per kernel; there is no control over which SM runs which CTA across kernels.",
+      "nearest_multi_kernel_substitute": "Stream-K/persistent GEMMs inside one op only.",
+      "systems": "Cohere (19% from wave order), MPK, ETC static schedule, AutoMegaKernel SM assignment knobs"
+    },
+    {
+      "opportunity": "Fine-grained compute/communication overlap and different op types co-running on different SMs (tensor-core-bound GEMM next to HBM-bound attention or NVLink all-reduce)",
+      "why_multi_kernel_cannot": "Concurrent kernels on multiple streams can co-run but with no fine-grained dependency tracking and with launch/occupancy interference; NCCL kernels occupy SMs for whole collectives.",
+      "nearest_multi_kernel_substitute": "Multi-stream + userbuffers/NVSHMEM fused GEMM+comm kernels (Triton-distributed, cuBLASMp).",
+      "systems": "Hazy throughput megakernel, MPK multi-GPU (1.1x overlap ablation), FlashMoE, TileRT, ETC (1.40x fused GEMM+RS/AG)"
+    },
+    {
+      "opportunity": "Runtime token counts without re-capture (one kernel serves all lengths up to capacity) and AOT compile with zero graph captures",
+      "why_multi_kernel_cannot": "CUDA graphs bake grid dims and pointers; vLLM/SGLang capture one graph per batch size (ETC Table 1: 51-67 captures, 123-583 s warmup).",
+      "nearest_multi_kernel_substitute": "Piecewise CUDA graphs with padding to capture sizes.",
+      "systems": "MPK, ETC (35 s vs 123 s vLLM warmup)"
+    }
+  ],
+  "measured_or_reported_gains": [
+    "MPK (arXiv 2512.22219): up to 1.7x lower end-to-end latency vs kernel-per-operator serving (SGLang/vLLM with CUDA graphs), 1.0-1.7x single-GPU across A100/H100/B200, batch 1-16; Qwen3-8B on A100 per-token decode 14.5 -> 12.5 ms (estimated floor ~10 ms); 8xH100 TP 1.1-1.4x over SGLang/vLLM; up to 10x over PyTorch+CUDA graphs+torch.compile; cross-task pipelining ablation 1.2-1.3x on Qwen3-8B final linear (B200); comm overlap 1.1x on Qwen3-1.7B 4xH100. README claims 1.2-6.7x.",
+    "Hazy low-latency megakernel (May 2025), Llama-3.2-1B bf16 batch 1: H100 ~78% memory bandwidth vs <=50% for vLLM/SGLang; >1.5x faster than SGLang and ~2.5x faster than vLLM on H100; on B200 >3.5x vs vLLM and >1.5x vs SGLang, forward pass <680 us (breakdown sums to 600 us) [uncertain: ratios read from secondary summaries of Fig. 1].",
+    "Hazy throughput megakernel (Sep 2025): ~22% faster end-to-end than SGLang on 65,536 ShareGPT prompts, Llama-70B TP=8 on H100.",
+    "Event Tensor Compiler (MLSys'26), 8xB200: decode TPOT Qwen3-30B-A3B batch 1 1.48x over vLLM, 1.20x over SGLang; Qwen3-32B single GPU up to 1.15x vs vLLM (bs1), up to 1.09x vs SGLang (bs64); Qwen3-32B TP=4 0.99-1.06x vs vLLM and slower than SGLang; fused GEMM+RS / AG+GEMM up to 1.40x vs cuBLAS+NCCL; MoE layer up to 1.23x at 1024 tokens; warmup 35 s (AOT) vs 123 s vLLM / 583 s SGLang; static schedule 1.06-1.09x vs unfused megakernel on Qwen3-32B TP=4, dynamic 0.82-0.89x. Baselines vLLM 0.11.0rc2 / SGLang 0.5.3rc0 with CUDA graphs + torch.compile.",
+    "Triton-distributed mega_triton_kernel, bs1 ctx 512 TP=8: Qwen3-8B 5.49 -> 3.33 ms (8xH800), 5.52 -> 3.16 ms (8xH20); Qwen3-32B 10.80 -> 7.41 ms (H800), 13.87 -> 8.34 ms (H20), all vs torch+CUDA graph (31-43% lower).",
+    "TileRT (8xB200): up to 600 tok/s DeepSeek-V3.2, 500 tok/s GLM-5-FP8 (v0.1.3), single-sequence; v0.1.1 '~35% lower token latency'; no like-for-like CUDA-graph baseline published [uncertain].",
+    "Cohere megakernel (H100, 30B-A3B MoE bf16): 292 tok/s bs1 (62% of 470 tok/s speed-of-light) vs vLLM 185 tok/s (39%) = 1.58x; end-to-end 1.25-1.41x vs vLLM v0.24; bs8/8K ctx 1.32x (real routing).",
+    "ForgeMegakernel (H100, 14 cells, 0.6B-13B, bs1-16): 50.5-85.9% MBU vs SGLang 36.5-78.9% and MPK 20.6-75.9%; 1.10-1.61x over SGLang (geomean 1.21x, SGLang with CUDA graphs), 1.14-2.51x over MPK (geomean 1.54x); Llama-3.2-1B 74.0% MBU vs 74.6% for the reproduced Hazy kernel; ~4.63 us fitted per SGLang graph launch vs ~9.3 us once per step for the megakernel; ~$177 and 14.7 agent-hours per model.",
+    "AutoMegaKernel: vs CUDA-graphed cuBLAS (int8 W8A16 vs bf16, kernel only) 1.18-1.33x on L4, 1.00-1.08x on A10G, but 0.55-0.79x on A100 and 0.60-0.72x on H100; equal-precision bf16 on RTX 5090 1.23 ms vs CUDA-graph eager 1.08 ms (loses); SmolLM2-135M fp32 on H100 14.30 ms vs vLLM CUDA graph 8.65 ms (loses 1.65x). Clock-pinned H100 bandwidth 7.3% of spec. Shows that a generic megakernel with weak bodies and per-tile sync loses to CUDA graphs on datacenter GPUs.",
+    "FlashMoE: 1.25-15x vs state-of-the-art distributed MoE on 8xH100 [uncertain: from talk summary]; 1 GPU op per layer vs 33-85.",
+    "Kernel Looping (SN40L, not GPU): up to 2.2x decode on one socket, 3.7x vs DGX H100 TensorRT-LLM, 1.6x geomean [uncertain: figures differ between paper versions].",
+    "MegaBake (H200 MIG 3g.71gb, 60 SMs, ~2.2 TB/s, ctx<100, report.json 2026-10-18): decode complete call 135M 2.14 ms (kernel 1.50) vs Inductor 11.9 ms (kernels 1.38); 1.7B 3.31 ms (kernel 2.97) vs Inductor 10.3 ms (kernels 2.42); Qwen2-0.5B 2.38 ms (kernel 1.58) vs 10.7 ms (kernels 1.64). Prefill 4 tokens: 1.7B 3.34 ms vs Inductor+CUDA graphs 3.06 ms; 135M 2.13 vs 1.97 ms. Qwen3.5-0.8B prefill fails to compile (aten.cumsum, linalg_solve_triangular). Equivalent MBU: 1.7B ~1.5 ms floor / 2.97 ms kernel ~= 50%; 135M ~0.12/1.50 ~= 8%."
+  ],
+  "expected_impact_on_megabake": [
+    {
+      "rank": 1,
+      "item": "Benchmark against a true CUDA-graph decode baseline (vLLM/SGLang-style static KV + captured graph)",
+      "estimate": "No speedup, but changes the verdict: with ~2.42 ms of Inductor kernels plus ~1.3 us x 458 launches inside a graph (~0.1-0.6 ms with bubbles) a graphed 1.7B decode would land ~2.5-3.0 ms vs MegaBake 3.31 ms complete / 2.84 ms pipelined; on 135M ~1.4-2.2 ms vs MegaBake 2.14 ms. MegaBake's current end-to-end win (3-5x) is against an ungraphed host-bound baseline; every published megakernel reports vs graphed baselines.",
+      "reasoning": "report.json shows inductor_cudagraphs decode at 9.19 ms with 458 launches (not graphed). Graph replay bubble per kernel estimated 1.3 us (Hazy) to 4.6 us (ForgeMegakernel fit) [uncertain]."
+    },
+    {
+      "rank": 2,
+      "item": "Event counters in the table launch + static per-SM schedule (MPK/Hazy/ETC/AMK pattern, ROADMAP step 10)",
+      "estimate": "135M decode kernel 1.50 -> ~0.9-1.1 ms; 1.7B 2.97 -> ~2.5-2.7 ms (alone) [uncertain]",
+      "reasoning": "135M is purely latency-bound: (1.50-0.12 ms floor)/183 intervals ~= 7.5 us of non-bandwidth time per interval, of which 0.7 us is the barrier and the rest is cold pipeline start, per-phase imbalance and tail. Events remove barrier cost (~0.13 ms) and let independent work (e.g. K/V projections vs Q, attention chunks vs MLP weight loads of the same layer) overlap; Hazy's B200 breakdown attributes ~40% of time to activation store/check/load, so expect 30-40% reduction, not elimination. On 1.7B GEMMs already ~1.92 ms at ~1.8 TB/s; non-GEMM ~0.8-1.0 ms of which perhaps 0.3-0.5 ms recoverable."
+    },
+    {
+      "rank": 3,
+      "item": "Cross-phase weight prefetch (L2 bulk prefetch during waits; later smem page handoff) - ROADMAP step 9",
+      "estimate": "1.7B GEMM time 1.92 -> ~1.6-1.7 ms (ROADMAP exit criterion >=1.9 TB/s effective); combined with events 1.7B kernel ~2.0-2.2 ms, i.e. at or below Inductor's 2.42 ms",
+      "reasoning": "1.5 ms floor at 2.2 TB/s; each of ~7 GEMMs/layer x 24 layers restarts an 8-stage TMA pipeline cold (~1-2 us each at MIG clocks) = 0.17-0.34 ms. MPK measured 1.2-1.3x on a single linear from cross-task preloading."
+    },
+    {
+      "rank": 4,
+      "item": "Multi-step decode in one launch with in-kernel argmax/sampling and embedding (MPK sampling tasks)",
+      "estimate": "Removes ~0.45-0.65 ms host time per token: 135M per-token 2.14 -> ~1.5 ms (-30%), 1.7B 3.31 -> ~3.0 ms (-10%), larger once kernel time drops",
+      "reasoning": "report.json complete_call minus kernel_duration: 135M 0.64 ms, 1.7B 0.34 ms, Qwen2 0.80 ms; Dynamo guards (~290 us) + MegaBake host (~360 us) per ROADMAP.md:140."
+    },
+    {
+      "rank": 5,
+      "item": "Fuse RMSNorm into GEMM prologue and residual/SiLU*mul into epilogues (MPK rmsnorm_linear / linear_with_residual, Hazy 6 instructions/layer)",
+      "estimate": "-1 to -2 intervals/layer: 135M ~ -0.05 to -0.1 ms; 1.7B 49 RMSNorms x 2.8 us = 0.14 ms max",
+      "reasoning": "ROADMAP.md:79 and RMSNorm cost 2.8 us on 1.7B (ROADMAP.md:145)."
+    },
+    {
+      "rank": 6,
+      "item": "Search over phase/tile order and SM assignment (Cohere wave order, AMK knobs)",
+      "estimate": "0-10% [uncertain] once events exist; ~0 under grid barriers",
+      "reasoning": "Cohere 3-19% between orders on MoE with work queues; dense model gains smaller."
+    },
+    {
+      "rank": 7,
+      "item": "Prefill >64 tokens",
+      "estimate": "Megakernel techniques give little here (ETC: prefill benefits marginally); fix is bodies: non-swapAB 128x128/128x256 WGMMA tiles and a flash-attention prefill body; or route large prefills to Inductor+CUDA graphs (TileRT/hybrid pattern). Current 3-21x slowdown at 128-300 tokens is a body problem, not a runtime problem.",
+      "reasoning": "ROADMAP.md:206-219."
+    },
+    {
+      "rank": 8,
+      "item": "Blackwell CLC / dynamic scheduling",
+      "estimate": "~0 on SM90 MIG (not available); relevant only for SM100 port",
+      "reasoning": "MIG SMs are dedicated; ETC found dynamic scheduling 0.82-0.89x for dense decode."
+    }
+  ],
+  "generality_and_overfitting_risk": {
+    "landscape": "Almost every fast published megakernel is hand-built or per-model: Hazy (hand instruction set per model), Cohere ('no compiler'), Triton-distributed (copy qwen3.py per model), TileRT (binary per model family), ForgeMegakernel (agent re-forges per model, ~$177 each), MPK (paper claims torch.compile(backend=MPK) but the checked-out code builds every model through per-model builders calling ~70 layer APIs: agent_space/mirage/python/mirage/mpk/models/qwen3/builder.py:358-523, persistent_kernel.py:842-2529). ETC automates scheduling/prefetch but tile functions and dependency annotations are hand-written; graph->event-tensor generation is future work. AutoMegaKernel imports HF but only bias-free Llama-family and has no tensor-core GEMV. MegaBake's Dynamo/AOT FX frontend with per-primitive lowering is the most framework-generic of all surveyed systems; its weakness is runtime/perf, not coverage.",
+    "reference_overfitting_examples": [
+      "Mirage task counts tuned to Qwen3: agent_space/mirage/python/mirage/mpk/models/utils.py:3-15 ('96 and 64 are enough to cover all Qwen3 model? Please update...') - shows even the reference system hard-codes model-shaped splits.",
+      "Mirage swapAB limited to BATCH_SIZE<=16 by static_assert: tasks/hopper/linear_swapAB_hopper.cuh:71-72.",
+      "ETC static schedules reuse the next larger sampled shape; ForgeMegakernel milestones claim no model constants but evidence is one GPU (H100)."
+    ],
+    "megabake_flags": [
+      {
+        "item": "SWAP_AB_MAX_ROWS=64 and SWAP_AB_ROW_TILES=(16,32,64)",
+        "where": "src/megabake/bodies/gemm.py:1888-1896; selection compiler.py:416-421",
+        "classification": "hardware-specific (measured on 60 SMs, comment cites 0.84-1.04 -> 1.78-2.07 TB/s on 60 SMs)",
+        "generic_fix": "Pick orientation and token tile per GEMM by a roofline cost model: bytes moved per stage (weight vs padded activation) and tiles vs workers derived from TargetFacts; autotune at compile time over {normal, swapAB16/32/64} with the existing measured plan search (plan.py) instead of a launch-wide boolean."
+      },
+      {
+        "item": "Split-K disabled globally because 'no gain on the 60-SM slice'",
+        "where": "ROADMAP.md:149; compiler.py:422 (MEGABAKE_SPLIT_K env); gemm.py:1903-1917 (SPLIT_K_MAX=16, MIN_K_TILES=2)",
+        "classification": "hardware-overfit decision: on a full H100/H200 (132 SMs) small-N projections (e.g. 135M's 576-wide, Qwen2 K/V 128-wide) have far fewer 64-row weight tiles than SMs; MPK uses split-K on SM100 (grid_for_splitk_linear_layer)",
+        "generic_fix": "Make split-K a candidate in plan search, enabled when tiles < workers by the cost model; never an env flag."
+      },
+      {
+        "item": "TABLE_GEMM_SHARED_BYTES fixed to 8 A/B stages of 64x64x64 + 4 epilogue stages",
+        "where": "src/megabake/bodies/gemm.py:1708-1711",
+        "classification": "hardware-specific (SM90 228 KB smem); will not fit SM80 (164 KB) or consumer SM120 (~100 KB)",
+        "generic_fix": "Derive stages from TargetFacts.shared_memory_per_block_optin minus runtime reservations, as CUTLASS _compute_stages does."
+      },
+      {
+        "item": "Interval-folding limits _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6 and family whitelist",
+        "where": "src/megabake/schedule.py:1380-1386",
+        "classification": "possibly model-overfit [uncertain]: chosen while folding SmolLM-135M (333->183 barriers); the right limit depends on memory latency vs barrier cost (0.7 us on this slice)",
+        "generic_fix": "Fold when the modeled recompute cost (rounds x measured global-memory latency from a microbenchmark at compile time) is below barrier cost; replace with events once step 10 lands."
+      },
+      {
+        "item": "DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64 for split-context attention",
+        "where": "src/megabake/bodies/attention.py:420-423",
+        "classification": "hardware-specific / tuned on SmolLM head counts and 60 SMs [uncertain]",
+        "generic_fix": "chunks = clamp(workers / (batch x kv_heads), 1, keys/min_keys) computed from TargetFacts and runtime length (MPK paged_attention_split_kv / FlashDecoding heuristic)."
+      },
+      {
+        "item": "DEFAULT_BUCKETS=(16,32,64,128,256,512)",
+        "where": "src/megabake/buckets.py:38",
+        "classification": "generic but coarse (65 tokens pays for 128)",
+        "generic_fix": "Runtime token count in the table (MPK) with body variants per tile size; buckets only for tile-shape regime changes."
+      },
+      {
+        "item": "Table-launch thresholds _TABLE_LAUNCH_OPS=1000, _TABLE_LAUNCH_PARAMETER_BYTES=24000",
+        "where": "src/megabake/compiler.py:205-210",
+        "classification": "generic (derived from CUDA 32 KiB parameter limit) - but it is why full models lose events",
+        "generic_fix": "Make the table launch the only launch path and put events in it."
+      },
+      {
+        "item": "Worker count = SMs x active blocks, plus half",
+        "where": "src/megabake/plan.py:494-507; runtime.py:265-266 refuses plans compiled for another SM count",
+        "classification": "generic (derived from device properties); good practice",
+        "generic_fix": "Keep; extend TargetFacts with L2 size, measured bandwidth and barrier latency for the cost model."
+      },
+      {
+        "item": "Test coverage limited to SmolLM-135M/1.7B, Qwen2-0.5B (Gemma 3, Qwen3.5 partially)",
+        "where": "artifacts/full_model_2026-10-18/*; Qwen3.5 prefill fails (aten.cumsum)",
+        "classification": "evaluation overfit risk: all tested models are small dense GQA Llama-like decoders with hidden <= 2048",
+        "generic_fix": "Add a model zoo CI (Phi, Mistral-style sliding window, Gemma soft-cap, OLMo, MoE) and a second GPU target (full H100 or L40S) so thresholds are validated on >1 SM count."
+      }
+    ],
+    "how_references_avoid_it": "Inductor/CUTLASS derive stages and tiles from device properties and autotune at compile time; MPK sets default task count proportional to SM count (but overrides per model); ETC moves static/dynamic scheduling into a compiler transform with sampled shapes; AMK/ForgeMegakernel use measured search (agent-driven) gated by a static validator and a roofline floor guard; CUTLASS CLC moves load balance to hardware. Recommended for MegaBake: a single TargetFacts-driven analytical cost model (bytes, tiles/worker, measured barrier and memory latency) to prune candidates, followed by the existing measured plan search - no global constants chosen from one slice."
+  },
+  "hardware_portability": [
+    "Events/counters, static per-SM schedules, interval folding, in-kernel sampling, multi-step decode: target-independent (need only device-scope release/acquire atomics; SM70+). AMK runs the same counter VM on sm_80/sm_90/sm_120.",
+    "Counting grid barrier: requires all workers co-resident (cooperative launch); portable to any NVIDIA arch; on MIG/shared GPUs co-residency is guaranteed by cooperative launch but clock noise remains.",
+    "TMA + WGMMA swapAB GEMM, TMA descriptors written in-kernel per phase (table launch), cp.async.bulk.prefetch.L2: SM90-specific. SM80 needs cp.async + mma.sync bodies (Mirage tasks/ampere); SM100 needs tcgen05 MMA with TMEM accumulators, 2-CTA MMA, and CLC (Mirage tasks/blackwell, CUTLASS PersistentTileSchedulerSm100). SM120 (consumer Blackwell) has no WGMMA and no tcgen05 2-CTA - MegaBake's bodies/blackwell.py already falls back to mma.sync 16x32 (bodies/blackwell.py:1-5).",
+    "Paged smem cross-op preload: portable concept; page size/count must come from smem capacity (MPK: 5 pages on A100, 7 on H100/B200; Hazy 13x16 KiB on H100).",
+    "CLC dynamic persistence: SM100+ only; on SM90 the equivalent is an atomic global work queue (ETC dynamic, Cohere work stealing, MPK JIT queues).",
+    "Multi-GPU in-kernel communication: NVSHMEM/multimem (SM90+ NVLink SHARP for multimem) - MPK, ETC, Triton-distributed, Hazy TP, FlashMoE.",
+    "Design guidance: keep MegaBake's split of target-independent coverage/runtime (lowering, regions, schedule, events) from per-target body providers (bodies/interface.py TargetFacts + providers), and make every numeric choice a function of TargetFacts (SM count, smem/SM, L2 size, measured HBM bandwidth, measured barrier latency) evaluated by a cost model plus measured search."
+  ],
+  "recommended_actions": [
+    {
+      "action": "Add a true CUDA-graph decode baseline (static KV cache + captured decode step, e.g. HF StaticCache + torch.compile mode='reduce-overhead' or vLLM/SGLang on the same MIG slice) to benchmarks/full_model.py and report MBU with ForgeMegakernel's methodology (exclude untied embedding bytes, two-point slope)",
+      "expected_gain": "Correct positioning; prevents optimizing against a host-bound strawman",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "benchmarks/full_model.py, PERFORMANCE_REPORT.md",
+      "prerequisite": "GPU time"
+    },
+    {
+      "action": "Implement event counters in the table launch (ROADMAP step 10): store per-phase/per-tile event IDs and thresholds in the device table; static per-SM queues (MPK AOT / ETC static); keep grid barrier as fallback",
+      "expected_gain": "135M decode kernel ~-30% (1.50 -> ~1.0 ms), 1.7B ~-10-15% [uncertain]",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/runtime.py, schedule.py, codegen.py, compiler.py (table layout)",
+      "prerequisite": "Represent events symbolically (ETC-style index maps per region pair) so table size and compile time do not scale with tile pairs"
+    },
+    {
+      "action": "Add a static schedule validator for counter plans (AMK validate(): thresholds within producer counts, acyclic, per-SM queue is a linear extension, every read has an ordered writer, multi-producer counters are full joins), extending simulate_event_schedule",
+      "expected_gain": "Correctness/deadlock safety for step 10; no perf",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/schedule.py, tests",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Cross-phase L2 weight prefetch while waiting (ROADMAP step 9), then smem page handoff between consecutive GEMM phases on the same SM (MPK/Hazy paging)",
+      "expected_gain": "1.7B GEMMs 1.92 -> ~1.6-1.7 ms; with events 1.7B kernel ~2.0-2.2 ms (< Inductor 2.42)",
+      "effort": "M (L2) / L (smem pages)",
+      "generality": "generic concept; hw-specific instruction (SM90+ bulk prefetch, SM80 prefetch.global.L2)",
+      "files_to_touch": "src/megabake/bodies/gemm.py, codegen.py, runtime.py",
+      "prerequisite": "Event counters make waits productive; L2 prefetch can start under barriers"
+    },
+    {
+      "action": "Multi-step decode launch: declare megabake::sample (argmax/top-k/top-p) and embedding write-back so one launch runs k tokens; keep Dynamo out of the per-token path",
+      "expected_gain": "-0.3 to -0.8 ms per token host time (135M -30%)",
+      "effort": "M",
+      "generality": "generic (any causal LM via HF generate contract)",
+      "files_to_touch": "src/megabake/frontend.py, buckets.py, runtime.py, a new declared op in fx_handler",
+      "prerequisite": "Runtime token count / position in device table (already partly via device call counter)"
+    },
+    {
+      "action": "Replace global GEMM constants with a TargetFacts-driven cost model + measured candidate search: swapAB orientation and token tile per GEMM, split-K as a candidate, smem stages from capacity, decode attention chunks from workers/kv_heads",
+      "expected_gain": "Removes 60-SM overfit; likely gains on larger GPUs (split-K) [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py:1708-1917, bodies/attention.py:420-423, compiler.py:416-422, plan.py",
+      "prerequisite": "A second hardware target for validation"
+    },
+    {
+      "action": "Fuse RMSNorm into GEMM prologue and residual add / SiLU*mul into GEMM epilogue as generic 'prologue/epilogue program' slots of the tuned GEMM body (fed by regions.py tensor programs, not model matchers)",
+      "expected_gain": "-1 to -2 intervals per layer; 1.7B up to -0.14 ms",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py, regions.py, lowering.py",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Route large prefill (>64 tokens) through proper 128-row WGMMA tiles and a flash-attention prefill body, or explicitly fall back to Inductor+CUDA graphs for prefill (decode-only megakernel like TileRT)",
+      "expected_gain": "Removes 3-21x prefill regression",
+      "effort": "M (fallback) / L (bodies)",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py, bodies/gemm.py, buckets.py",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Schedule-order search (phase/tile order, SM affinity) inside plan search once events exist",
+      "expected_gain": "0-10% [uncertain]",
+      "effort": "S-M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/schedule.py, plan.py",
+      "prerequisite": "Event counters"
+    },
+    {
+      "action": "SM100 path: tcgen05/TMEM GEMM body and CLC-based tile claiming for variable-size work; keep the event runtime identical",
+      "expected_gain": "Portability; needed for B200 parity with MPK/ETC",
+      "effort": "L",
+      "generality": "hw-specific",
+      "files_to_touch": "src/megabake/bodies/blackwell.py, bodies/interface.py",
+      "prerequisite": "Access to SM100 hardware"
+    }
+  ],
+  "open_questions": [
+    "How much of MegaBake's ~7.5 us per interval (135M) is barrier vs cold TMA pipeline start vs load imbalance? Settle with tools/phase_profile.py extended to stamp per-CTA start/end of each phase body (not just after barriers) on 135M and 1.7B decode.",
+    "What does a true CUDA-graph decode (StaticCache + reduce-overhead, or vLLM on the MIG slice) achieve on these models? Settle by running it; this decides whether MegaBake currently wins end to end at all.",
+    "Does MPK's documented torch.compile(backend=MPK) path exist in a released branch, or only per-model builders? Local checkout f9eb70c2 shows only builders; check upstream mpk branch / OSDI artifact.",
+    "Are Hazy's B200 >3.5x vs vLLM and <680 us numbers exact? Only secondary summaries quote them; check Figure 1 of the blog or the ThunderKittens megakernel repo.",
+    "Luminal's automatic megakernel claims have no published benchmark; check their blog/repo before citing.",
+    "Would split-K and larger decode-attention chunk counts win on a full 132-SM H100/H200? Settle by rerunning the plan search with MEGABAKE_SPLIT_K=1 on a non-MIG GPU.",
+    "Is L2 prefetch alone (no smem paging) enough to approach MPK's 1.2-1.3x per-linear gain on a 60-SM slice with a shared L2? Settle with a two-GEMM microbenchmark in one cooperative kernel with and without cp.async.bulk.prefetch.L2 during the barrier wait.",
+    "Does static scheduling suffice for MegaBake's targets, or is dynamic needed for long variable-length attention? ETC shows dynamic is slower for dense decode; measure split-context attention imbalance at 2,000 cached tokens."
+  ],
+  "uncertain": [
+    "core_ideas[16].how_it_works (Luminal)",
+    "measured_or_reported_gains (Hazy B200 ratios, TileRT baseline, FlashMoE range, Kernel Looping figures)",
+    "expected_impact_on_megabake (event/prefetch estimates are derived, not measured)",
+    "generality_and_overfitting_risk.megabake_flags (fold limits and decode chunk constants classified as tuned without git blame evidence)",
+    "recommended_actions (expected_gain values)"
+  ]
+}

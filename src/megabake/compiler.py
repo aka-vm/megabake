@@ -12,7 +12,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
-import uuid
 
 import cutlass
 import cutlass.cute as cute
@@ -23,9 +22,15 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.gemm import cute_gemm_tensors, is_swap_ab, swap_ab_rows, wants_swap_ab
+from .bodies.cuda.sm90.gemm import (
+    TABLE_DESCRIPTORS_PER_GEMM,
+    cute_gemm_tensors,
+    is_swap_ab,
+    swap_ab_rows,
+    wants_swap_ab,
+)
 from .cache import PlanCache, make_plan_key
-from .codegen import GeneratedCuTeModule, emit_cute
+from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
@@ -40,13 +45,19 @@ from .plan import (
     search_plans,
 )
 from .planner import enumerate_body_selections
-from .schedule import EventSchedule, make_region_event_schedule
+from .schedule import (
+    EventSchedule,
+    _recompute_assignments,
+    _worker_assignments,
+    make_region_event_schedule,
+)
 from .regions import form_regions
 from .runtime import (
     DYNAMIC_ADDRESS_RING,
     EventRuntimeAdmission,
     RuntimeAdmission,
     admit_event_runtime,
+    _stream_is_capturing,
     admit_runtime,
     execute_event_plan,
     execute_phase_plan,
@@ -91,58 +102,33 @@ def _semantic_diagnostic(graph: ComputeGraph) -> CompilerDiagnostic | None:
     )
 
 
-def _structural_plan_exists(
-    graph: ComputeGraph,
-    target: TargetFacts,
-    policy: SelectionPolicy | None,
-    scheduler: str,
-) -> bool:
-    # One structurally complete plan proves existence; the measured search
-    # that follows builds its own candidates.
-    result = search_plans(
-        graph,
-        target,
-        policy,
-        SearchBudget(evaluator=None, max_plans=1),
-    )
-    return any(
-        candidate.plan is not None and candidate.status == "unmeasured"
-        for candidate in result.candidates
-    )
-
-
 def _preflight_complete_plan(
     graph: ComputeGraph,
     target: TargetFacts,
     policy: SelectionPolicy | None,
-    scheduler: str,
 ) -> None:
-    schedulers = ("phase", "region-events") if scheduler == "auto" else (scheduler,)
+    # One structurally complete plan proves existence; the measured search
+    # that follows builds its own candidates.
+    result = search_plans(
+        graph, target, policy, SearchBudget(evaluator=None, max_plans=1)
+    )
     if any(
-        _structural_plan_exists(graph, target, policy, scheduler_name)
-        for scheduler_name in schedulers
+        candidate.plan is not None and candidate.status == "unmeasured"
+        for candidate in result.candidates
     ):
         return
     semantic = _semantic_diagnostic(graph)
     if semantic is not None:
         raise CompilerError(semantic, safe_for_fallback=True)
-    reasons: list[str] = []
-    for scheduler_name in schedulers:
-        result = search_plans(
-            graph,
-            target,
-            policy,
-            SearchBudget(evaluator=None),
-        )
-        reasons.extend(
-            f"{candidate.description}: {candidate.reason or candidate.status}"
-            for candidate in result.candidates
-            if candidate.status != "measured"
-        )
-        reasons.extend(
-            f"{rejection.region_id}/{rejection.provider}: {rejection.reason}"
-            for rejection in result.rejections
-        )
+    result = search_plans(graph, target, policy, SearchBudget(evaluator=None))
+    reasons = [
+        f"{candidate.description}: {candidate.reason or candidate.status}"
+        for candidate in result.candidates
+        if candidate.status != "measured"
+    ] + [
+        f"{rejection.region_id}/{rejection.provider}: {rejection.reason}"
+        for rejection in result.rejections
+    ]
     raise CompilerError(
         CompilerDiagnostic(
             "plan-search",
@@ -189,13 +175,7 @@ class CompiledKernel:
 
 @dataclass(frozen=True)
 class CallableTrace:
-    invocation_id: uuid.UUID
-    epoch: int
-    stream: torch.cuda.Stream
-    input_data_ptrs: tuple[int, ...]
-    output_data_ptrs: tuple[int, ...]
     workload_kernel_launches: int
-    stream_synchronizations: int
     recurring_gpu_operations: tuple[tuple[str, int], ...]
 
 
@@ -459,7 +439,7 @@ def compile_post_grad(
         )
 
     def compile_selected() -> CompiledKernel:
-        _preflight_complete_plan(graph, selected_target, policy, scheduler)
+        _preflight_complete_plan(graph, selected_target, policy)
         state_snapshot = _StateSnapshot.create(graph, prepared.example_inputs)
         evaluation = replace(prepared, example_inputs=state_snapshot.inputs)
         with torch.no_grad():
@@ -556,9 +536,9 @@ def compile_post_grad(
         cache_hit = cache_result.hit
     else:
         compiled = compile_selected()
-    selected_candidate = next(
+    measurement = next(
         (
-            candidate
+            candidate.measurement
             for candidate in compiled.search.candidates
             if candidate.description == compiled.search.selected_description
             and candidate.measurement is not None
@@ -576,30 +556,12 @@ def compile_post_grad(
         ),
         "workspace_bytes": compiled.plan.storage.workspace_bytes,
         "performance": {
-            "median_isolated_launch_us": (
-                selected_candidate.measurement.median_isolated_launch_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
-            "median_device_event_span_us": (
-                selected_candidate.measurement.median_device_event_span_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
-            "median_complete_call_us": (
-                selected_candidate.measurement.median_complete_call_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
-            "median_device_event_span_us": (
-                selected_candidate.measurement.median_device_event_span_us
-                if selected_candidate is not None
-                and selected_candidate.measurement is not None
-                else None
-            ),
+            name: None if measurement is None else getattr(measurement, name)
+            for name in (
+                "median_isolated_launch_us",
+                "median_device_event_span_us",
+                "median_complete_call_us",
+            )
         },
     }
     parameter_tensors = _current_parameter_tensors(
@@ -1016,6 +978,21 @@ def bind_callable(
             active_stream = torch.cuda.current_stream(
                 next(iter(input_tensors.values())).device
             )
+            capturing = _stream_is_capturing(active_stream)
+            if capturing and (
+                _graph_capture is None
+                or state is None
+                or compiled_kernel.event_schedule is not None
+                or compiled_kernel.generated.launch.launch_policy
+                != "megabake_cooperative_table"
+            ):
+                raise CompilerError(
+                    CompilerDiagnostic(
+                        "callable-binding",
+                        "CUDA graph capture needs megabake.graphed and a table launch",
+                        requirement="graphed table launch",
+                    )
+                )
 
             if state is None:
                 ready = _initial_ready(compiled_kernel, active_stream.device)
@@ -1042,7 +1019,7 @@ def bind_callable(
                 launches += 1
 
             if compiled_kernel.event_schedule is None:
-                invocation = execute_phase_plan(
+                execute_phase_plan(
                     compiled_kernel.plan,
                     kernel,
                     active_stream,
@@ -1050,9 +1027,10 @@ def bind_callable(
                     ready=state.ready,
                     epoch=next_epoch,
                     synchronize=False,
+                    capturable=capturing,
                 )
             else:
-                invocation = execute_event_plan(
+                execute_event_plan(
                     compiled_kernel.event_schedule,
                     kernel,
                     active_stream,
@@ -1067,18 +1045,7 @@ def bind_callable(
             )
             trace.append(
                 CallableTrace(
-                    invocation.invocation_id,
-                    invocation.epoch,
-                    active_stream,
-                    state.input_pointers(input_tensors),
-                    tuple(
-                        output.data_ptr()
-                        for output in outputs
-                        if isinstance(output, torch.Tensor)
-                    ),
                     workload_kernel_launches=launches,
-                    # Launches are stream-ordered; the call does not block.
-                    stream_synchronizations=0,
                     recurring_gpu_operations=_recurring_operations(
                         launches, state.address_table_uploads - uploads_before
                     ),
@@ -1101,6 +1068,83 @@ def bind_callable(
     forward.megabake_context = context
     forward.megabake_runtime_state = state
     return forward
+
+
+# Runtime states launched by the capture in progress; None outside ``graphed``.
+_graph_capture: list[_RuntimeState] | None = None
+
+
+class GraphedCall:
+    """One MegaBake call captured in a CUDA graph; made by ``graphed``."""
+
+    def __init__(self, function: Callable[..., Any], args: tuple[Any, ...], warmup: int):
+        global _graph_capture
+        self._inputs, self._spec = pytree.tree_flatten(args)
+        saved = [
+            leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in self._inputs
+        ]
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(warmup):
+                function(*args)
+            # Warm-up calls advance stateful arguments (KV caches); undo them.
+            for leaf, original in zip(self._inputs, saved, strict=True):
+                if original is not None:
+                    leaf.copy_(original)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        del saved
+        self._graph = torch.cuda.CUDAGraph()
+        _graph_capture = []
+        try:
+            with torch.cuda.graph(self._graph):
+                self.output = function(*args)
+            self._states = tuple(dict.fromkeys(_graph_capture))
+        finally:
+            _graph_capture = None
+        if not self._states:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "callable-binding",
+                    "the captured call launched no MegaBake kernel",
+                    requirement="a MegaBake-compiled function",
+                )
+            )
+
+    def __call__(self, *args: Any) -> Any:
+        leaves, spec = pytree.tree_flatten(args)
+        if spec != self._spec:
+            raise ValueError("a graphed call takes the argument structure it was captured with")
+        for given, captured in zip(leaves, self._inputs, strict=True):
+            if given is captured:
+                continue
+            if not isinstance(captured, torch.Tensor):
+                if given != captured:
+                    raise ValueError(f"graphed call captured {captured!r}, got {given!r}")
+            elif given.shape != captured.shape or given.dtype != captured.dtype:
+                raise ValueError(
+                    f"graphed call captured a {captured.dtype} {tuple(captured.shape)} tensor, "
+                    f"got {given.dtype} {tuple(given.shape)}"
+                )
+            else:
+                captured.copy_(given)
+        for state in self._states:
+            state.graph_replayed()
+        self._graph.replay()
+        return self.output
+
+
+def graphed(function: Callable[..., Any], *args: Any, warmup: int = 2) -> GraphedCall:
+    """Capture one call of a MegaBake-compiled ``function`` in a CUDA graph.
+
+    Each later call copies tensor arguments passed as new objects into the
+    captured ones (pass the captured tensors, updated in place, to skip even
+    that), then replays the graph: no guards, binding or launch work on the
+    host. It returns the captured outputs, which the next call overwrites.
+    ``warmup`` calls run first; tensor arguments are restored afterwards.
+    """
+    return GraphedCall(function, args, max(warmup, 2))
 
 
 def _post_grad_graph(
@@ -1818,29 +1862,6 @@ def _with_worker_count(
     return replace(plan, phases=phases, storage=storage, launch=launch)
 
 
-def _recompute_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
-    from .schedule import _recompute_assignments as assignments
-
-    return assignments(region_id, tuple(work_items), worker_count)
-
-
-def _worker_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
-    from .schedule import WorkerAssignment
-
-    quotient, remainder = divmod(len(work_items), worker_count)
-    start = 0
-    assignments = []
-    for worker_id in range(worker_count):
-        count = quotient + (1 if worker_id < remainder else 0)
-        assignments.append(
-            WorkerAssignment(
-                worker_id, region_id, tuple(work_items[start : start + count])
-            )
-        )
-        start += count
-    return tuple(assignments)
-
-
 # Barrier epochs stay below int32's maximum.
 _MAX_EPOCH = 2**31 - 1
 # Calls kept in a generated callable's ``megabake_trace``.
@@ -1913,6 +1934,7 @@ class _RuntimeState:
         self._address_mirror: np.ndarray | None = None
         self._phase_table: tuple[torch.Tensor, Any] | None = None
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
+        self._stream_table: tuple[torch.Tensor, Any] | None = None
         # Phase scratch of table launches: FP32 elements and Int32 counters.
         self._phase_scratch: tuple[tuple[torch.Tensor, Any], tuple[torch.Tensor, Any]] | None = None
         # Per-invocation TMA descriptors (three 128-byte maps per table GEMM),
@@ -1942,6 +1964,9 @@ class _RuntimeState:
         # (arguments, packed execution arguments, what keeps them alive)
         self._packed_arguments: tuple[Any, Any, Any] | None = None
         self._work_iterator_views: tuple[Any, ...] | None = None
+        # Address rings of CUDA graphs that captured this state; kept alive
+        # with the state because the graphs read them on every replay.
+        self._graph_rings: list[torch.Tensor] = []
 
     @classmethod
     def create(
@@ -2010,16 +2035,29 @@ class _RuntimeState:
             return
         self._refresh_values(input_tensors)
 
-    def input_pointers(self, input_tensors: Mapping[str, torch.Tensor]) -> tuple[int, ...]:
-        """Data pointers of this call's graph inputs, in graph order."""
-        rebind = self._table_rebind
-        if rebind is not None and rebind.pointers is not None:
-            return tuple(rebind.pointers[: len(rebind.inputs)].tolist())
-        return tuple(tensor.data_ptr() for tensor in input_tensors.values())
-
     def reset_ready(self) -> None:
         reset_ready(self.ready)
         self._calls = 0
+
+    def _wrap_calls(self) -> None:
+        """Restart the call counter before barrier epochs would pass int32."""
+        # Counting barriers reach (ordinal + 1) * workers within a call.
+        stride = max(self.generated.launch.barrier_epochs, 1)
+        if (self._calls + 1) * stride * self.plan.launch.grid_size > _MAX_EPOCH:
+            if self._prepared_calls != self._calls_run:
+                raise CompilerError(
+                    CompilerDiagnostic(
+                        "runtime-binding",
+                        "the call counter wraps while launches are still prepared",
+                        requirement="ordered table launches",
+                    )
+                )
+            self.reset_ready()
+
+    def graph_replayed(self) -> None:
+        """Account for one replay of a graph that captured this state's launch."""
+        self._wrap_calls()
+        self._calls += 1
 
     def poison_workspace(self, value: int = 0xE5) -> None:
         self.workspace_base.fill_(value)
@@ -2357,7 +2395,11 @@ class _RuntimeState:
         return tuple(arguments)
 
     def _table_arguments(
-        self, stream: cuda.CUstream, *, include_constants: bool = False
+        self,
+        stream: cuda.CUstream,
+        *,
+        include_constants: bool = False,
+        ring: torch.Tensor | None = None,
     ) -> tuple[Any, ...]:
         """Kernel arguments of a table launch.
 
@@ -2460,9 +2502,16 @@ class _RuntimeState:
                     launch.gemm_table, dtype=torch.int32, device=device
                 )
                 self._gemm_table = (gemm_table, _cute_view(gemm_table))
+            if self._stream_table is None and launch.stream_table:
+                stream_table = torch.tensor(
+                    launch.stream_table, dtype=torch.int32, device=device
+                )
+                self._stream_table = (stream_table, _cute_view(stream_table))
             if self._tma_descriptors is None:
                 descriptors = torch.zeros(
-                    len(launch.gemm_table) * 3 * 16, dtype=torch.int64, device=device
+                    len(launch.gemm_table) * TABLE_DESCRIPTORS_PER_GEMM * 16,
+                    dtype=torch.int64,
+                    device=device,
                 )
                 self._tma_descriptors = (
                     descriptors,
@@ -2483,7 +2532,12 @@ class _RuntimeState:
             self._phase_scratch[0][1],
             self._phase_scratch[1][1],
             *(
-                (self._gemm_table[1], self._tma_descriptors[1], *gemm_views)
+                (
+                    self._gemm_table[1],
+                    *((self._stream_table[1],) if launch.stream_table else ()),
+                    self._tma_descriptors[1],
+                    *gemm_views,
+                )
                 if launch.gemm_table
                 else ()
             ),
@@ -2492,6 +2546,7 @@ class _RuntimeState:
         handle = int(stream)
         if (
             not include_constants
+            and ring is None
             and cached is not None
             and cached[2] == handle
             and len(cached[0]) == len(parts)
@@ -2504,20 +2559,25 @@ class _RuntimeState:
             parts[1],
             self._phase_table[1],
             self._work_iterator_views,
-            cutlass.Int64(self._dynamic_ring[0].data_ptr()),
+            cutlass.Int64((self._dynamic_ring[0] if ring is None else ring).data_ptr()),
             self._dynamic_slot_table[1],
             self._phase_scratch[0][1],
             self._phase_scratch[1][1],
         ]
         if launch.gemm_table:
             arguments.extend(
-                (self._gemm_table[1], self._tma_descriptors[1], gemm_views)
+                (
+                    self._gemm_table[1],
+                    *((self._stream_table[1],) if launch.stream_table else ()),
+                    self._tma_descriptors[1],
+                    gemm_views,
+                )
             )
             if include_constants:
                 arguments.append(self._max_active_clusters)
         arguments.append(stream)
         result = tuple(arguments)
-        if not include_constants:
+        if not include_constants and ring is None:
             self._table_argument_cache = (parts, result, handle)
         return result
 
@@ -2537,18 +2597,20 @@ class _RuntimeState:
             arguments = self.arguments(epoch, cu_stream)
             execution, keep = _pack_arguments(compiled, arguments)
             return (None, arguments, execution, keep)
-        # Counting barriers reach (ordinal + 1) * workers within a call.
-        stride = max(self.generated.launch.barrier_epochs, 1)
-        if (self._calls + 1) * stride * self.plan.launch.grid_size > _MAX_EPOCH:
-            if self._prepared_calls != self._calls_run:
-                raise CompilerError(
-                    CompilerDiagnostic(
-                        "runtime-binding",
-                        "the call counter wraps while launches are still prepared",
-                        requirement="ordered table launches",
-                    )
-                )
-            self.reset_ready()
+        if _stream_is_capturing(stream):
+            # A graph replays these addresses on every call, so every ring
+            # entry holds them, stamped -1; the eager ring stays untouched.
+            ring = torch.empty(
+                (DYNAMIC_ADDRESS_RING, len(self.generated.launch.dynamic_slots) + 1),
+                dtype=torch.int64,
+            ).pin_memory()
+            arguments = self._table_arguments(cu_stream, ring=ring)
+            ring[:, 0] = -1
+            ring[:, 1:] = torch.from_numpy(self._pending_dynamic_addresses)
+            self._graph_rings.append(ring)
+            _graph_capture.append(self)
+            return (None, arguments, *_pack_arguments(compiled, arguments))
+        self._wrap_calls()
         arguments = self._table_arguments(cu_stream)
         call = self._calls
         host, rows, events = self._dynamic_ring
@@ -2593,9 +2655,17 @@ class _RuntimeState:
         """TMA descriptors need 16-byte-aligned operand base addresses."""
         gemm_slots = getattr(self, "_gemm_slots", None)
         if gemm_slots is None:
+            table = np.asarray(self.generated.launch.gemm_table, dtype=np.int64)
+            second = table[:, GEMM_SECOND_A_COLUMN] if table.shape[1] > GEMM_SECOND_A_COLUMN else []
             gemm_slots = np.unique(
-                # Columns 1-3 are the A, B and C slots.
-                np.asarray(self.generated.launch.gemm_table, dtype=np.int64)[:, 1:4]
+                np.concatenate(
+                    (
+                        # Columns 1-3 are the A, B and C slots; paired GEMMs
+                        # also load their second A with TMA.
+                        table[:, 1:4].ravel(),
+                        np.asarray([slot - 1 for slot in second if slot > 0], dtype=np.int64),
+                    )
+                )
             )
             self._gemm_slots = gemm_slots
         misaligned = gemm_slots[addresses[gemm_slots] % 16 != 0]
@@ -2808,7 +2878,9 @@ def _g0_operands(
 ) -> tuple[torch.Tensor, ...]:
     """CUTLASS ``(A, B, C)`` for a G0 GEMM: activation, weight and output, or
     weight, activation and the transposed output for swapAB."""
-    # A bias (addmm) is read by the GEMM epilogue, not bound as an operand.
+    # A bias (addmm) and fused epilogue operands are read by the GEMM
+    # epilogue, not bound as operands; a paired GEMM's second weight shares
+    # the first one's descriptor template.
     activation_load, *weight_loads = selected.program.loads[:2]
     activation = _g0_activation_view(
         activation_load.value_id,
@@ -2820,6 +2892,9 @@ def _g0_operands(
         for load in weight_loads
     )
     output = values[selected.program.store.value_id]
+    if output.dim() != 2:
+        # A fused epilogue stores its chain's result, viewed as the GEMM output.
+        output = output.reshape(selected.program.store.shape)
     if is_swap_ab(body):
         return (*weights, activation, output.t())
     return (activation, *weights, output)

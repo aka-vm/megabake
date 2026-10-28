@@ -38,6 +38,8 @@ from .compiler import (
     compile_plan,
     compile_post_grad,
     bind_callable,
+    GraphedCall,
+    graphed,
 )
 from .runtime import (
     admit_event_runtime,
@@ -57,6 +59,8 @@ from .schedule import (
 )
 
 __all__ = [
+    "GraphedCall",
+    "graphed",
     "DEFAULT_BUCKETS",
     "PaddingDependence",
     "bucketed",

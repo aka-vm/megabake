@@ -6,7 +6,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 
 from megabake.bodies import SelectionPolicy
-from megabake.bodies.blackwell import BlackwellGemmProvider, emit_blackwell_gemm
+from megabake.bodies.cuda.sm100.gemm import BlackwellGemmProvider, emit_blackwell_gemm
 from megabake.compiler import _target_facts
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx

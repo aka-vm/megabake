@@ -121,12 +121,6 @@ class PhaseSchedule:
                 return frozenset(record.prerequisites)
         raise InvalidSchedule(f"region {region_id} has no prerequisite set")
 
-    def phase_for(self, region_id: str) -> ScheduledPhase:
-        for phase in self.phases:
-            if phase.region_id == region_id:
-                return phase
-        raise InvalidSchedule(f"region {region_id} is not scheduled")
-
 
 @dataclass(frozen=True)
 class ScheduleSimulation:
@@ -1404,7 +1398,7 @@ def _fold_small_intervals(
     only what it has written itself. A run does not fold if the receiving
     interval writes storage the run reads or writes.
     """
-    from .bodies.generic import single_cta_rounds
+    from .bodies.cuda.generic import single_cta_rounds
 
     graph = selection.graph
     threads = max(

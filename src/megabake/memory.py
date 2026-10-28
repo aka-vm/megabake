@@ -2,17 +2,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 from .bodies.interface import TargetFacts
-from .graph import ComputeGraph
-from .lowering import KVCacheAccess
+from .graph import DTYPE_BYTES, ComputeGraph
 from .plan import (
     BodySelectionPlan,
     CuTeLayout,
     KernelPlan,
     TileMap,
 )
-from .planner import _DTYPE_BYTES, make_tile_maps
+from .planner import make_tile_maps
 from .schedule import PhaseSchedule, ScheduledPhase
 
 
@@ -102,11 +102,6 @@ class StoragePlan:
     bindings: tuple[TensorBinding, ...]
     worker_scratch: tuple[WorkerScratch, ...]
     state: tuple[StateStorageAssignment, ...] = ()
-    allocation_provenance: str = (
-        "adapted from Mirage plan_stensor_memory "
-        "f9eb70c254acefc9f3667b2a973d0dcf25471fce; "
-        "uses verified half-open phase lifetimes and best-fit interval reuse"
-    )
 
     @property
     def workspace_bytes(self) -> int:
@@ -118,10 +113,6 @@ class StoragePlan:
     @property
     def worker_scratch_bytes(self) -> int:
         return max((scratch.size_bytes for scratch in self.worker_scratch), default=0)
-
-    @property
-    def worker_scratch_alignment_bytes(self) -> int:
-        return max((scratch.alignment_bytes for scratch in self.worker_scratch), default=1)
 
     @property
     def peak_live_workspace_bytes(self) -> int:
@@ -193,13 +184,19 @@ def assign_storage(
                         value_id=value_id,
                         storage_id=value_id,
                         kind="output",
-                        layout=tile_maps[selected.region_id].output_layout,
+                        layout=_value_shaped(
+                            tile_maps[selected.region_id].output_layout,
+                            selection.graph.values[value_id],
+                        ),
                         region_ids=(selected.region_id, *consumers.get(value_id, ())),
                     )
                 )
                 continue
 
-            source_layout = tile_maps[selected.region_id].output_layout
+            source_layout = _value_shaped(
+                tile_maps[selected.region_id].output_layout,
+                selection.graph.values[value_id],
+            )
             conversions = tuple(
                 conversion
                 for conversion in selection.conversions
@@ -742,7 +739,7 @@ def _state_layout(graph: ComputeGraph, value_id: str) -> CuTeLayout:
         value.dtype,
         value.shape,
         value.strides,
-        max(16, _DTYPE_BYTES.get(value.dtype, 1)),
+        max(16, DTYPE_BYTES.get(value.dtype, 1)),
     )
 
 
@@ -799,7 +796,7 @@ def _make_boundary_binding(
             dtype=value.dtype or "unknown",
             shape=value.shape,
             strides=value.strides,
-            alignment_bytes=_DTYPE_BYTES.get(value.dtype or "", 1),
+            alignment_bytes=DTYPE_BYTES.get(value.dtype or "", 1),
         )
     return TensorBinding(
         value_id=value_id,
@@ -821,6 +818,16 @@ def _make_boundary_binding(
         binding_name=value.binding_name,
         aliases=value.storage_relation.aliases,
     )
+
+
+def _value_shaped(layout: CuTeLayout, value: Any) -> CuTeLayout:
+    """``layout`` in ``value``'s own shape when it is a dense reshape of it:
+    a GEMM with a fused epilogue writes its consumer's result as the 2-D GEMM
+    output, while other regions index the value in its graph shape."""
+    if value.shape is None or value.strides is None or tuple(value.shape) == layout.shape:
+        return layout
+    shaped = CuTeLayout(layout.dtype, tuple(value.shape), tuple(value.strides), layout.alignment_bytes)
+    return shaped if layout.same_dense_memory(shaped) else layout
 
 
 def _deduplicate_bindings(bindings: list[TensorBinding]) -> list[TensorBinding]:
@@ -1006,7 +1013,7 @@ def _layout_size_bytes(layout: CuTeLayout) -> int:
         (dimension - 1) * stride
         for dimension, stride in zip(layout.shape, layout.strides, strict=True)
     )
-    return element_count * _DTYPE_BYTES.get(layout.dtype, 0)
+    return element_count * DTYPE_BYTES.get(layout.dtype, 0)
 
 
 def _round_up(value: int, alignment: int) -> int:

@@ -1,12 +1,11 @@
 from .catalog import get_candidates
-from .attention import (
+from .cuda.sm90.attention import (
     GeneratedAttentionBody,
     UnsupportedAttentionBody,
-    attention_candidates,
     emit_attention_body,
 )
-from .gemm import gemm_candidates
-from .generic import (
+from .cuda.sm90.gemm import gemm_candidates
+from .cuda.generic import (
     GeneratedContractionBody,
     GeneratedMapBody,
     GeneratedReductionBody,
@@ -19,9 +18,7 @@ from .generic import (
 )
 from .interface import (
     BodyConfig,
-    BodyProvider,
     CandidateSet,
-    DeviceBody,
     InvalidBodyConfig,
     SelectionPolicy,
     TargetFacts,
@@ -33,7 +30,6 @@ __all__ = [
     "gemm_candidates",
     "GeneratedAttentionBody",
     "UnsupportedAttentionBody",
-    "attention_candidates",
     "emit_attention_body",
     "GeneratedContractionBody",
     "GeneratedMapBody",
@@ -45,9 +41,7 @@ __all__ = [
     "emit_map_body",
     "emit_reduction_body",
     "BodyConfig",
-    "BodyProvider",
     "CandidateSet",
-    "DeviceBody",
     "InvalidBodyConfig",
     "SelectionPolicy",
     "TargetFacts",

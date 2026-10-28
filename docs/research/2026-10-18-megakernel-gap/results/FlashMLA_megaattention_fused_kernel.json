@@ -1,0 +1,281 @@
+{
+  "name": "FlashMLA mega-attention fused kernel (DeepSeek V4.1, SM100)",
+  "scope": "Examined the vLLM DeepSeek V4.1 layer that selects FlashMLA's fused 'Q norm + Q RoPE + sparse attention + O RoPE + O FP8 cast' kernel (agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py), its weight-permutation helpers (fused_layout.py), the CUDA-graph benchmark that produced the TP1-TP8 table (benchmarks/kernels/benchmark_dsv41_mega_attn.py), the unfused baseline epilogue (deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py), the vLLM cmake that pins FlashMLA, and the CUDA/CuTe source itself (sparse-cloned from vllm-project/FlashMLA at commit 5dceadbd, core_attn/config.h 358 lines, kernel.cuh 1685 lines, api/fused_norm_rope_attn_rope_cast_fwd.cpp). The kernel source is NOT vendored in agent_space/vllm (only fetched by cmake). Compared against MegaBake's attention body (src/megabake/bodies/attention.py), RoPE region matching (regions.py), interval folding (schedule.py) and HF attention routing (fx_handler/hf_attention.py). Question answered: which fusion kinds in this hand-written body (prologue absorption, epilogue cast-into-producer, layout absorption into neighbouring weights, padded-head tiling) a generic compiler like MegaBake can discover or express via an attention body with prologue/epilogue contracts, which must stay hand-written, and whether such a body is MegaBake's 'ideal output' or only one ideal body inside the megakernel. Answer in short: it is an ideal INTERVAL body, not an ideal program; the megakernel's job is the boundary it cannot remove (idle SMs at s_q=1, the following wo_a GEMM, the KV insert kernel before it).",
+  "key_sources": [
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:55-62 (fixed kernel conventions: GPT-J RoPE dim 64, per-32 ue8m0 scales, TMA-aligned col-major SF, round-to-nearest)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:64-89 (design rationale + measured TP1-TP8 table on GB300 under CUDA graphs, padded-vs-live-head explanation, 'measure under CUDA graphs' warning)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:105-134 (alloc_mega_attn_output: MN-major packed-ue8m0 scale buffer shared by prefill and decode segments so one fp8_einsum covers the step)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:150-176 (is_available_for: TP-dependent selection; requires 8 heads per wo_a group, SM10x only)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:186-193 (permute_on_load of wq_b rows and wo_a columns/scales into the kernel's chunk-interleaved layouts)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:198-201 (accepts_unnormed_unroped_query interface contract)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:212-238 (_o_proj consumes kernel FP8 output directly, positions unused)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:345-368 (decode call: fused_norm_rope_attn_rope_cast_decode with swa + extra NVFP4 caches, attn_sink)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:449-469 (prefill call on gathered bf16 KV chunks)",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_layout.py:1-80 (Q 16-element chunk interleave across heads, O 32-element chunk interleave across 8 heads of a wo_a group; fused = standard[perm])",
+    "agent_space/vllm/benchmarks/kernels/benchmark_dsv41_mega_attn.py:1-30,107-220 (what each arm launches; CUDA-graph timing harness)",
+    "agent_space/vllm/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py:1-80 (unfused baseline: Triton inverse RoPE + block FP8 quant, PDL)",
+    "agent_space/vllm/cmake/external_projects/flashmla.cmake:19-24,107-120 (pins vllm-project/FlashMLA 5dceadbd; 12 instantiations: {v41,v41fp4} x {h64,h128} x {prefill,decode} x {norm,nonorm})",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:1-67 (header: fused stages, warp-specialized roles, CLC persistent scheduling, 'Split-KV is not supported (the fused RoPE + FP8-quant epilogue cannot be combined across splits)')",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:97 (static_assert H_Q == 64 || H_Q == 128 -> head padding)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:164-180 (instruction-cache-driven COMPACT_PER_JOB_CODE; per-WG setmaxnreg budgets 184/128/72/128 or 256/56/72/128)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:204-213 (multi-rail GEMM: FOLD_FACTOR = 128 / 64 to fill the 128-lane TMEM with only 64 head rows)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:515-540 (WG0 timeline Q0 Q1 O0 Q2 O1...: Q prologue of job i+1 overlaps O epilogue of job i; cached cos/sin with negated sin for conjugate RoPE)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:600-616 (Q RoPE + sum of squares on load, before TMEM store)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:661-676 (lse, attention sink folded into output_scale = 1/(l + exp2(sink - m)))",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:725-800 (O epilogue tile: TMEM load, conjugate RoPE only on the last 64 dims, amax, ue8m0 power-of-two scale, scale folded into one multiplier, e4m3 RN convert, STG.256 evict_first + sf byte in MN-major layout)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:900-916 (Q RMSNorm absorbed into softmax score multiplier: sm_scale * rsqrt(sum_sq/d + eps))",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:1085-1140 (adaptive QK/SV issue order on the MMA warp)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:1190-1212 (CLC persistent job fetch)",
+    "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp:140-200 (h_q/n_wv_group checks; out_sf always per-32 because DeepGEMM einsum needs equal A/B scale granularity)",
+    "src/megabake/bodies/attention.py:86-236 (AttentionBodyProvider: BF16-only Q/K/V/O, static scale, sm90a only, no prologue/epilogue hooks)",
+    "src/megabake/bodies/attention.py:255-275,420-423,738-752 (scratch limits, DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64, cost model with hard-coded 0.15 penalty)",
+    "src/megabake/bodies/attention.py:754-790 (split-context decode: per-chunk max/sum exchange through phase scratch, last chunk merges in order)",
+    "src/megabake/schedule.py:1380-1420 (_fold_small_intervals: elementwise/reduction producers recomputed by every CTA at the start of the consumer interval; _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6)",
+    "src/megabake/regions.py:822-1000 (rotate_half RoPE matcher -> one fused region, family 'rope' in semantic facts)",
+    "src/megabake/fx_handler/hf_attention.py:120-145 (kv_attention scales by dim**-0.5; any other scale folded into q - the only algebraic absorption MegaBake does around attention)",
+    "src/megabake/bodies/interface.py:60-80,215-222 (body device entry run(work_iterator, tensor_bindings, scratch, epilogue) - 'epilogue' is phase scratch, not a fusion contract)",
+    "ROADMAP.md:28,79,123,129,143,146 and PERFORMANCE_REPORT.md:70-80 (per-layer costs: decode attention ~9-10 us/layer, RMSNorm 3.5-5 us, ~6 barrier intervals/layer after folding)",
+    "artifacts/full_model_2026-10-18/{HuggingFaceTB--SmolLM-135M,HuggingFaceTB--SmolLM-1.7B,Qwen--Qwen2-0.5B}/report.json (decode kernel_duration_us: MegaBake 1502 / 2974 / 1584 vs Inductor 1382 / 2425 / 1636)",
+    "https://github.com/vllm-project/FlashMLA (source fork pinned by vLLM)",
+    "https://docs.vllm.ai/en/v0.21.0/api/vllm/model_executor/layers/deepseek_v4_attention/ (FlashMLA sparse kernel supports only 64 or 128 heads; head count padded)",
+    "https://app.semanticdiff.com/gh/huggingface/transformers/commit/b6fb4ec0f24cfad232de46a02441b9cc6362cd22 (HF V4 partial-RoPE wrapper; V4 shares K and V so the rope channels of V/O need de-rotation)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "Q RMSNorm absorbed into the softmax scale (prologue algebraic absorption)",
+      "how_it_works": "RMSNorm without a weight multiplies every element of a head row by one scalar r = rsqrt(mean(q^2)+eps). Since scores are linear in q, softmax(scale * (r q) K^T) = softmax((scale*r) * q K^T). WG0 accumulates sum of squares while it loads Q tiles (before RoPE, which is norm-preserving anyway), publishes per-thread partials to smem, and WG3 (softmax) computes score_multiplier = sm_scale_div_log2 * rsqrtf(sum/D + eps). Q is never rewritten normalized. Any learnable norm weight must already be folded into wq_b (V4.1 actually norms qr before wq_b, so vLLM passes enable_q_norm=False).",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:600-616, 900-916; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:58-62"
+    },
+    {
+      "idea": "Q RoPE in the load prologue (producer-side elementwise fusion)",
+      "how_it_works": "WG0 issues LDG.256 for the per-token Q tile, applies GPT-J (interleaved-pair) RoPE to the last 64 of 512 dims using int32 positions and a cos/sin cache cached in lane registers, and stores bf16 Q straight into TMEM as the A operand of a TS UMMA. Removes the RoPE write+read of Q (64 heads x 512 x 2 B = 64 KB/token) and a launch.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:515-616"
+    },
+    {
+      "idea": "Inverse (conjugate) RoPE of the output in the epilogue",
+      "how_it_works": "DeepSeek V4 shares K and V (MQA with d_qk = d_v = 512) and RoPE was applied to the last 64 dims of the cached K/V, so the output's rope dims carry the key rotations and are de-rotated by the query position. Because rotation is linear and position is per row, it commutes with the softmax normalization 1/l; WG0 applies it in fp32 registers right after the TMEM load, only on the two 32-column tiles that hold dims 448..511 (warp-uniform predicate), reusing the Q's cos/sin with sin negated (cached_sin[0] = -cached_sin[1]). It is NOT absorbed into weights (position dependent); the 'absorption' is that it rides in the epilogue for free relative to the separate Triton fused_inv_rope_fp8_quant pass.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:527-540, 725-756; agent_space/vllm/vllm/models/deepseek_v4/common/ops/fused_inv_rope_fp8_quant.py"
+    },
+    {
+      "idea": "Attention-sink and softmax normalization folded into the quantization multiplier",
+      "how_it_works": "output_scale = 1/(l + exp2(sink - m)) (sink per head, in log2 units). Per 32-element tile: amax of the unnormalized O times output_scale gives the tile amax; sf = amax/448 rounded UP to a power of two by integer exponent arithmetic (ue8m0); the final multiplier output_scale * 2^-e is one FMUL per element before __nv_cvt_float2_to_fp8x2 (RN, satfinite; the .rs packed form is avoided for accuracy). Normalization, sink and quantization cost one multiply.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:661-676, 758-785"
+    },
+    {
+      "idea": "Cast-into-producer with the consumer's scale layout (MXFP8 output written in DeepGEMM MN-major packed-ue8m0 layout)",
+      "how_it_works": "Each tile writes 32 fp8 bytes with STG.256 (no_allocate, evict_first) and one ue8m0 byte into int32-packed scale words laid out MN-major (stride 1 along tokens, head-dim stride ceil4(num_tokens)), which is exactly what deep_gemm.fp8_einsum consumes, so wo_a skips transform_sf_into_required_layout and no bf16 O ever reaches HBM (halves O write bytes and removes a quant kernel). Scale granularity is forced to 32 even if numerically per-128 because DeepGEMM requires equal A/B granularity: the consumer's contract dictates the producer's epilogue.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:786-800; github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp:194; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:105-134, 212-238"
+    },
+    {
+      "idea": "Layout absorption into neighbouring weights (permute-on-load)",
+      "how_it_works": "The kernel wants Q with 16-element d-chunks interleaved across heads and writes O with 32-element chunks interleaved across the 8 heads of a wo_a group. Instead of shuffling activations each step, wq_b rows and wo_a columns (and their block scales, at chunk granularity) are permuted once at load (fused = standard[perm]), so the surrounding GEMMs produce/consume the kernel's layout directly. This is classic layout propagation into constant operands.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_layout.py:23-80; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:186-193"
+    },
+    {
+      "idea": "Padded-head vs live-head cost model (tile quantization of the head axis)",
+      "how_it_works": "UMMA M is 64 rows per CTA (the tensor datapath is 64 rows wide), every row of Q/P/O is a head, and only H_Q in {64,128} is instantiated, so a TP8 shard with 8 live heads still pays for 64 padded heads in QK, softmax and SV, while the work it absorbs (inverse RoPE, FP8 cast, Q RoPE) scales with LIVE heads. Net: up to 1.45x at TP1 (64 live), wash or ~2 us loss at TP2-TP8. vLLM therefore selects the layer by TP, not by batch size, and the fused insert kernel still has to zero-pad Q to 64 heads.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:97,118-125; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:64-89, 150-176"
+    },
+    {
+      "idea": "Nonlinear epilogue forbids split-KV (contract between reduction and epilogue)",
+      "how_it_works": "amax-based quantization of O needs the fully reduced, normalized row; partial O from split-KV chunks cannot be quantized and combined later without a second pass. So the fused kernel has no split-KV: one cluster per query token (grid = s_q * CLUSTER_SIZE). At s_q=1 on a 148-SM GB300 this uses one SM, and the flat ~29 us for s_q 1..32 in the table is per-token latency, not throughput. The linear parts (RoPE, 1/l, sink) would commute through a split-combine; only the cast does not.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:66; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:72-78"
+    },
+    {
+      "idea": "Warp-specialized, CLC-persistent, software-pipelined body (4 WGs x 128 threads, setmaxnreg)",
+      "how_it_works": "WG0 = Q prologue + O epilogue interleaved across jobs (Q_{i+1} load overlaps O_i store); WG1 = KV producer (TMA gather4 of fp8/NVFP4 rows + in-register dequant into bf16 smem slots, 3 slots); WG2 = MMA issue warp (adaptive QK/SV order using test_wait), CLC warp, index/validity mask warp, gather-front warp; WG3 = online softmax. Register budgets rebalanced per mode (decode 184/128/72/128; 1-CTA prefill 256/56/72/128). Multi-rail GEMM folds the 64-row Q into 128 TMEM lanes. Cluster Launch Control fetches the next token job inside the persistent CTA.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:24-60,164-213; github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.cuh:1085-1212"
+    },
+    {
+      "idea": "Mixed-format paged KV dequant inside the producer (fp8 SWA cache + NVFP4 compressed cache)",
+      "how_it_works": "Token records are 528 B (512 fp8 + 16 B scales) or 288 B (256 B e2m1 + 32 e4m3 scales); one KV block may mix both, resolved per 8 rows. Warp 11 gathers raw bytes+scales with TMA gather4 into the slot (128 B-aligned 4-row groups, odd 16 B strides for conflict-free LDS.128), WG1 dequantizes in place to bf16. The dequant is a KV-load prologue - a cast-into-consumer mirror of the cast-into-producer epilogue.",
+      "where_in_source": "github.com/vllm-project/FlashMLA@5dceadbd9eabc9acfc547ef18ec8f7b14b980682:csrc/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/config.h:30-60,140-160"
+    },
+    {
+      "idea": "Measure under CUDA graphs, charge every op each path launches",
+      "how_it_works": "The benchmark captures both arms (mega: fused Q-pad/KV insert + mega kernel; split-KV: insert with Q RoPE + flash_mla_with_kvcache + fused_inv_rope_fp8_quant) in a CUDA graph and times replay. Eager timing flatters whichever path launches fewer kernels 'several-fold'. The comparable MegaBake caveat: MegaBake wins end-to-end only via launch/host overhead, so fusion claims must be validated against kernel-time baselines (inductor_cudagraphs), not eager.",
+      "where_in_source": "agent_space/vllm/benchmarks/kernels/benchmark_dsv41_mega_attn.py:1-30,93-112; agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:86-89"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "Q RMSNorm absorbed into the softmax scale",
+      "status": "missing",
+      "evidence": "src/megabake/bodies/attention.py:478-480,655-657 (scale must be a static Python float); hf_attention.py:137 only folds a constant scale into q",
+      "notes": "MegaBake has no per-row dynamic score multiplier. Generic rule a compiler can discover: a per-row scalar multiply (norm denominator, any row-wise scale) feeding Q (or K per key) commutes into the score scale. Expressible with an attention prologue contract 'row_scale(q_row) -> float'. Qwen3/Gemma3 QK-norm has a learnable weight, so only the rsqrt part folds; the weight must stay elementwise on Q."
+    },
+    {
+      "idea": "Q RoPE in the load prologue",
+      "status": "partial",
+      "evidence": "regions.py:822-1000 fuses RoPE into one region; schedule.py:1380-1420 folds small elementwise producers into the consumer interval as recompute phases (ROADMAP.md:123,146: 11 -> ~6 intervals/layer)",
+      "notes": "MegaBake removes the barrier but still materializes roped Q/K in global memory and every CTA recomputes it before attention. A real prologue would apply RoPE on the attention body's Q load (and on the K append in kv_attention). Fully generic: an elementwise map on an attention operand whose index map is a pure function of (row, d) can be inlined into the operand load."
+    },
+    {
+      "idea": "Inverse RoPE of output in the epilogue",
+      "status": "not_applicable",
+      "evidence": "Tested models (SmolLM, Qwen2, Gemma3, Qwen3.5) use standard RoPE on Q/K only; no output de-rotation exists in their graphs",
+      "notes": "The generic mechanism (an elementwise, per-row-position-dependent map on attention output applied before store) is the same epilogue hook needed for o_proj input casts/residual tricks; implement as a generic attention epilogue, never as an 'inverse RoPE' special case."
+    },
+    {
+      "idea": "Sink + normalization folded into a single output multiplier",
+      "status": "missing",
+      "evidence": "attention.py provider rejects any extra outputs and has no sink parameter (lines 117-131); numerical policy pinned to bf16 scores/probabilities (lines 103-110)",
+      "notes": "Attention sinks (gpt-oss, DeepSeek V4, some Gemma variants) would need a mask/sink hook. MegaBake's bit-exact-with-eager policy (rounding probabilities to bf16) also prevents folding 1/l into the PV epilogue the way FlashAttention does; this is a deliberate numerics choice that blocks the algebraic rewrite."
+    },
+    {
+      "idea": "Cast-into-producer with consumer's scale layout",
+      "status": "missing",
+      "evidence": "attention.py:116-117 (output must be BF16); bodies/gemm.py is BF16 TMA/WGMMA with bias epilogue only; blackwell.py:53 rejects scaled contractions",
+      "notes": "MegaBake has no quantized activation path at all. If FP8/MX GEMMs are added, the generic rule is: when a quantize op's only consumer is a scaled GEMM, the producer body takes a 'quantized store' epilogue whose tile/scale layout is dictated by the consumer body's operand contract (LayoutContract in bodies/interface.py). That is expressible, not discoverable by pattern: the layout comes from the consumer's contract."
+    },
+    {
+      "idea": "Layout absorption into neighbouring weights",
+      "status": "missing",
+      "evidence": "No weight-permutation pass in src/megabake (weights are bound as captured; memory.py/plan.py place activations, not re-layout constants)",
+      "notes": "This is the most compiler-friendly idea here: weights are compile-time constants, so if a body declares a preferred activation layout (permutation of a feature axis), the compiler can permute the producing GEMM's output rows and the consuming GEMM's input columns once at compile time. Requires bodies to publish layout preferences and a propagation pass; fully generic."
+    },
+    {
+      "idea": "Padded-head vs live-head cost model",
+      "status": "partial",
+      "evidence": "attention.py:738-752 decode_chunks cost model (passes/chunks * (1 + 0.15*(passes-1))); swapAB for <=64 rows in bodies/gemm.py",
+      "notes": "MegaBake's attention is SIMT warp-per-row, so it has no head padding today (a tensor-core attention body would). The general lesson - a fused body's cost scales with the padded tile while the work it absorbs scales with live elements - should be a term in the body-selection cost model rather than a TP threshold."
+    },
+    {
+      "idea": "Nonlinear epilogue forbids split-KV",
+      "status": "partial",
+      "evidence": "attention.py:754-790 split-context decode merges chunks in order in the last chunk; there is no epilogue so the conflict does not arise yet",
+      "notes": "MegaBake's last-chunk merge is the right place to run any epilogue (the last-arriving chunk has the full row), so a megakernel can keep split-KV AND a nonlinear epilogue - which FlashMLA gave up. Must be a contract: epilogue declared 'row-complete' runs after merge; 'linear' epilogues could run per chunk."
+    },
+    {
+      "idea": "Warp-specialized CLC-persistent pipelined body",
+      "status": "partial",
+      "evidence": "GEMM body uses TMA/WGMMA pipelines (bodies/gemm.py); attention body is plain SIMT (attention.py:529-720); scheduling is a table of phases separated by grid barriers (codegen.py/runtime.py)",
+      "notes": "MegaBake is already persistent at kernel level; inside a phase it has no producer/consumer warp specialization for attention and no setmaxnreg budgets for attention."
+    },
+    {
+      "idea": "Mixed-format paged KV dequant in producer",
+      "status": "missing",
+      "evidence": "attention provider requires BF16 K/V (attention.py:135-140); KV cache is dense per-layer state (hf_attention.py:77-145)",
+      "notes": "Paged and quantized KV are model-agnostic serving features; would be an operand-load prologue contract (dequant(block_bytes, scales) -> bf16 tile)."
+    },
+    {
+      "idea": "Measure under CUDA graphs",
+      "status": "partial",
+      "evidence": "artifacts/full_model_2026-10-18/*/report.json contain inductor_cudagraphs and kernel_duration_us; PERFORMANCE_REPORT.md:26 notes earlier decode had no CUDA-graph baseline",
+      "notes": "Fresh reports now include inductor_cudagraphs; kernel-time comparisons (MegaBake 2974 vs Inductor 2425 us on 1.7B) are the honest metric for judging fusion."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Fill the idle SMs a non-splittable fused attention leaves",
+      "why_multi_kernel_cannot": "Because the FP8 epilogue forbids split-KV, the FlashMLA kernel runs one cluster per token: at s_q=1 one SM of 148 is busy for ~29 us (flat to s_q=32). Separate kernels can overlap only via streams/PDL, and the next kernel (wo_a einsum) depends on its output, so the GPU sits mostly idle. In a persistent megakernel the other SMs can run independent work in the same interval: prefetch wo_a/wo_b and next-layer weights into L2, run the KV-insert/indexer of the next layer, or other requests' tokens.",
+      "nearest_multi_kernel_substitute": "Split-KV + a separate inverse-RoPE/quant kernel (the 'split-KV' arm, roughly equal at TP2-TP8), or PDL to start the next kernel's prologue early; neither uses the idle SMs for useful bandwidth during the attention."
+    },
+    {
+      "opportunity": "Keep split-KV and a nonlinear (amax/quant) epilogue together",
+      "why_multi_kernel_cannot": "A single kernel cannot run 'combine then quantize' without a second launch or a grid-wide sync; FlashMLA chose no split. A megakernel already has cheap inter-CTA counters (MegaBake's split-context decode merges in the last-arriving chunk), so the epilogue runs on the merged row in the same phase, no extra launch.",
+      "nearest_multi_kernel_substitute": "Split-KV kernel + combine kernel with the quant fused into combine (FlashMLA's combine.cu + fused_inv_rope_fp8_quant): one extra launch and an fp32 partial round trip."
+    },
+    {
+      "opportunity": "Per-token dataflow from attention epilogue into the wo_a GEMM",
+      "why_multi_kernel_cannot": "The fused kernel finishes tokens one cluster-job at a time; across a kernel boundary wo_a cannot start until all tokens finish. With event counters (MegaBake ROADMAP step 10) the GEMM tile covering tokens [t0,t1) can start once those tokens' fp8 rows and scales are written.",
+      "nearest_multi_kernel_substitute": "PDL (griddepcontrol.launch_dependents) lets the next kernel's prologue start but its main loop still waits for full completion of the producer grid."
+    },
+    {
+      "opportunity": "Absorb the remaining 'Q pad + KV insert' kernel",
+      "why_multi_kernel_cannot": "vLLM still launches fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert before the mega kernel (benchmark mega arm) because the KV append must be visible to all attention CTAs; inside a megakernel the append becomes a recompute/fold phase or a counter-gated write in the same interval (MegaBake's deferred length publish already does this pattern).",
+      "nearest_multi_kernel_substitute": "Fuse insert into the preceding GEMM epilogue (one fewer launch) - possible but model-specific hand work."
+    }
+  ],
+  "measured_or_reported_gains": "From agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:69-84, GB300 (SM100), CUDA graphs on, DeepSeek V4.1 64-head layer, topk_swa=128, topk_extra=512, NVFP4 compressed cache, mega vs split-KV per-layer microseconds (all per-step ops charged): TP1 (64 live heads): s_q=1 29/29, 32 31/31, 128 31/40, 256 53/72, 512 96/140 -> up to 1.45x at s_q=512, 1.29x at 128, no gain at s_q<=32. TP2 (32 live): 29/29, 31/30, 35/35, 61/63, 110/119 (<=8%). TP4 (16 live): 29/29, 31/29, 34/34, 59/58, 109/109 (wash, ~2 us loss at s_q=32). TP8 (8 live): 29/29, 31/29, 33/33, 59/57, 107/104 (~3% loss). The flat ~29-31 us for s_q 1..32 is latency of a one-cluster-per-token kernel plus the insert kernel. Eager-mode timing 'overstates the fused one several-fold' (no number given) [uncertain]. Not independently reproduced here (no GPU runs allowed; SM100-only kernel; this machine is SM90) [uncertain].",
+  "expected_impact_on_megabake": "Ranked by impact on H200 MIG 3g.71gb (60 SMs, ~2.2 TB/s) for SmolLM-135M/1.7B, Qwen2-0.5B, Gemma3-270M. Baseline decode kernel time: 135M 1502 us, 1.7B 2974 us, Qwen2-0.5B 1584 us (Inductor 1382/2425/1636). (1) Epilogue-after-merge in split-context decode (enables future fused output transforms without losing split-KV): ~0 us today, enabling. (2) RoPE as attention Q/K-load prologue instead of a folded recompute phase: removes the roped-Q/K global write+read and the per-CTA redundant recompute at the start of the attention interval. Folded phases cost roughly one CTA's latency, ~1-2 us per layer [uncertain]; 1.7B 24 layers -> ~25-50 us (1-1.7%), 135M 30 layers -> ~30-60 us (2-4%) [uncertain]. (3) Row-scale absorption (QK-norm denominator, constant scales) into score multiplier: only matters for QK-norm models (Qwen3/Qwen3.5/Gemma3); saves the norm's store/reload, est. 1-3 us/layer where it applies [uncertain]; zero for SmolLM/Qwen2. (4) Layout absorption into weights: none of the tested bodies need non-standard activation layouts today, so ~0 now; becomes important if a tensor-core attention body or FP8 GEMM with interleaved layouts is added. (5) Cast-into-producer FP8/MX output and quantized KV: not applicable to the BF16 tested models; for future FP8 checkpoints it would halve attention-output bytes, but at decode those are tiny (1.7B: 2048 x 2 B = 4 KB/token) - the win is the removed quant phase/barrier (~0.7 us barrier + ~1-3 us phase per layer) [uncertain]. (6) Tensor-core, warp-specialized attention body: decode attention is ~10 us/layer (ROADMAP.md:129, ~0.24 ms of 1.7B's 2.97 ms) but MHA decode is bandwidth/latency bound, so tensor cores help mostly prefill (where MegaBake is 3-21x slower than Inductor at 128-300 tokens) - this is the largest single gain this item points to, but it is the attention body, not the fusion. Overall: the fusion kinds in this kernel are worth a few percent of decode on the tested models; the bigger lessons are the contract design (prologue/epilogue hooks, epilogue after split merge) and that a perfect body still leaves SMs idle that only a megakernel scheduler can fill.",
+  "generality_and_overfitting_risk": "FlashMLA kernel: extremely model- and hardware-specific by design - D_QK=D_V=512, D_ROPE=64 GPT-J style, WV_GROUP_SIZE=8, H_Q in {64,128}, per-32 ue8m0 only, rope_dim/neox/sf flags asserted at launch (kernel.cuh:1598-1602), SM10x only, 12 hand instantiations, register budgets and COMPACT_PER_JOB_CODE tuned to measured I-cache hit rates (config.h:164-180), B_TOPK 64/96, NUM_KV_SLOTS=3. vLLM gates it by TP topology (is_available_for), not a cost model, and documents the gate from one GB300 measurement. Generic parts that MegaBake could adopt: (a) row-scalar absorption into the score scale (pure algebra, any model); (b) elementwise Q/K prologue and per-row output epilogue (index-map inlining, any model); (c) consumer-dictated quantized store layout (generic if driven by body contracts); (d) constant-operand layout propagation (generic); (e) padded-vs-live cost accounting (generic cost-model term). Hand-only: the inverse-RoPE-of-shared-KV semantics recognition (should fall out of (b) instead), mixed fp8/NVFP4 per-8-row format resolution, warp-role/register partitioning, multi-rail TMEM folding. MegaBake overfitting flags in this area: src/megabake/bodies/attention.py:422-423 DECODE_MAX_CHUNKS=16 / DECODE_MIN_CHUNK_KEYS=64 and :750 the hard-coded 0.15 extra-pass penalty in decode_chunks are hand constants likely tuned on the 60-SM slice; :260-261 ATTENTION_SCRATCH_ROWS=16 / ATTENTION_SCRATCH_BYTES=32 KiB cap kv_length (a 32 KiB fp32 score row = 8192 keys max) and are not derived from target smem; :265-267 _VALUE_BLOCK/_VALUE_UNROLL=8; :103-110 numerical policy accepts only bf16 scores/probabilities (matches the HF eager models tested, rejects others); :220 target.architecture == 'sm90a' hard gate; :277 threads=128 fixed. schedule.py:1384-1386 _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6 are thresholds chosen on SmolLM decode (ROADMAP step 8 reports 135M 11->~6 intervals) and decide whether RoPE folds into attention; regions.py:822-1000 RoPE is recognized by two concrete ATen spellings (rotate_half cat forms), so a GPT-J interleaved RoPE (as in DeepSeek V4) or a complex-multiply RoPE would not match and would fall back to multiple phases. How references avoid this: FlashMLA/vLLM do not - they accept per-model hand kernels and gate by measurement; Inductor uses autotuning over templates; Mirage uses search over a superoptimizer space. Recommendation: express these as compiler rules (algebraic + index-map) and choose chunks/fold limits from a target-queried cost model (SM count, smem, measured barrier cost) with optional autotune, not constants.",
+  "hardware_portability": "SM100-only features used: tcgen05 UMMA (.ws 1-CTA and 2x1SM 2-CTA atoms), TMEM for Q (TS operand), P and O accumulators, tcgen05.ld with reduction (IS_TMEM_LD_WITH_RED_AVAILABLE for amax), Cluster Launch Control for persistent job fetch, TMA gather4 for sparse row gathers, NVFP4 e2m1 conversion. Shared with SM90: TMA, mbarriers, setmaxnreg warpgroup register reallocation, warp specialization, clusters/DSMEM. SM80: none of TMA/TMEM/setmaxnreg; only the algebraic and index-map fusions (norm-into-scale, RoPE prologue, epilogue de-rotation, cast-into-producer with ue8m0 computed by integer exponent ops, weight-layout absorption) port unchanged. For MegaBake (SM90 MIG slice): every fusion idea is target-independent at the IR level; only the body implementation differs (WGMMA with register accumulators instead of TMEM; amax via warp shuffles instead of tcgen05.ld.red; persistent table scheduling instead of CLC). Keep the design generic by putting fusions in region/contract space (prologue/epilogue expressions, layout contracts, row-complete vs linear epilogue tags) and letting per-target body providers (bodies/gemm.py sm90, bodies/blackwell.py sm100) implement them. Head padding to the MMA M (64 on both SM90 WGMMA and SM100 UMMA) is a portable cost-model fact.",
+  "recommended_actions": [
+    {
+      "action": "Add a prologue contract to attention bodies: an elementwise expression over (row/head, d, position) applied on Q and on the appended K load (inline RoPE), and let regions.py attach a RoPE/elementwise producer to the attention region instead of folding it as a recompute phase.",
+      "expected_gain": "1.7B decode ~25-50 us (1-1.7%), 135M ~30-60 us (2-4%) [uncertain]; also fewer intervals in prefill",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py, src/megabake/bodies/interface.py, src/megabake/regions.py, src/megabake/schedule.py",
+      "prerequisite": "RoPE region exposes its combine expression and index map (already in regions.py tensor_program)"
+    },
+    {
+      "action": "Add an epilogue contract to attention bodies, tagged 'linear-per-row' (may run per split chunk) or 'row-complete' (runs only after the split-context merge in the last-arriving chunk), covering casts, output transforms and future quantized stores.",
+      "expected_gain": "Enabling; avoids FlashMLA's no-split-KV trade-off, keeps decode attention spread over 60 SMs",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py (_split_decode_attention_body merge path), src/megabake/bodies/interface.py",
+      "prerequisite": "Prologue contract design (shared expression IR)"
+    },
+    {
+      "action": "Algebraic rule: a per-row scalar multiplier on Q (RMSNorm denominator, constant scale) commutes into the score multiplier; allow a dynamic per-row score scale in the attention body.",
+      "expected_gain": "1-3 us/layer on QK-norm models (Qwen3/Qwen3.5/Gemma3) [uncertain]; 0 on SmolLM/Qwen2",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py (scale handling at 478-480, 655-657, 854-862), src/megabake/regions.py",
+      "prerequisite": "Numerics check: folding changes rounding vs eager bf16 (MegaBake's bit-exact policy); needs a tolerance mode per ROADMAP.md:40"
+    },
+    {
+      "action": "Constant-operand layout propagation: when a body declares a preferred feature-axis permutation for an activation, permute the producing GEMM's weight rows and consuming GEMM's weight columns (and block scales) once at compile/load time.",
+      "expected_gain": "0 today; prerequisite for tensor-core attention and FP8 bodies without per-step shuffles",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/interface.py (LayoutContract), src/megabake/plan.py, src/megabake/memory.py, src/megabake/compiler.py",
+      "prerequisite": "Bodies publish layout preferences"
+    },
+    {
+      "action": "Add a padded-vs-live term to body selection: cost = f(padded tile) + absorbed work saved(live elements), compared against the unfused plan, instead of fixed thresholds (vLLM uses a TP gate).",
+      "expected_gain": "Prevents regressions like vLLM's TP4-TP8 wash when MegaBake gains tensor-core attention or GEMM bodies with M=64 tiles",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/planner.py, src/megabake/bodies/catalog.py",
+      "prerequisite": "Per-target body cost estimates (phase_profile data)"
+    },
+    {
+      "action": "Replace hand constants DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64, the 0.15 extra-pass penalty, ATTENTION_SCRATCH_* and _FOLD_MAX_* with values derived from TargetFacts (SM count, smem/CTA, measured barrier cost) and optionally autotuned per bucket.",
+      "expected_gain": "Robustness on non-MIG GPUs and other models; no measured gain on the current slice",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py:260-267,422-423,738-752; src/megabake/schedule.py:1384-1386",
+      "prerequisite": "None"
+    },
+    {
+      "action": "Generalize RoPE recognition from two ATen spellings to an index-map rule (pairwise rotation by position-dependent cos/sin over any pair mapping: rotate_half, GPT-J interleaved, partial rotary).",
+      "expected_gain": "Avoids multi-phase fallback on DeepSeek-style/partial RoPE models (e.g. the DeepSeek-V3 draft 0.6B in artifacts) [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/regions.py:822-1230",
+      "prerequisite": "None"
+    },
+    {
+      "action": "Use idle SMs during latency-bound attention: while attention runs on few CTAs, schedule L2 prefetch of the following o_proj and next-layer weights in the same interval (ROADMAP step 9) and gate o_proj tiles on per-row counters (step 10).",
+      "expected_gain": "Hides part of o_proj weight streaming behind attention; est. 1-3 us/layer [uncertain]",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/codegen.py, src/megabake/schedule.py, src/megabake/runtime.py",
+      "prerequisite": "ROADMAP steps 9 and 10"
+    },
+    {
+      "action": "Tensor-core warp-specialized prefill attention body (TMA producer, WGMMA QK/PV, online softmax WG) with the same prologue/epilogue contracts.",
+      "expected_gain": "Largest lever this item points to: prefill at 128-300 tokens is 3-21x slower than Inductor; attention body rewrite is a major part",
+      "effort": "L",
+      "generality": "hw-specific",
+      "files_to_touch": "src/megabake/bodies/attention.py (new provider), src/megabake/bodies/blackwell.py for SM100",
+      "prerequisite": "Prologue/epilogue contracts; layout propagation"
+    }
+  ],
+  "open_questions": [
+    "Does the measured 1.45x at TP1 hold on other GPUs or with fp8-only caches? Settle by running benchmark_dsv41_mega_attn.py on B200/GB200 with --extra-bytes 528 and 288 and --local-heads 64/32/16/8 (needs SM100 hardware, not available here).",
+    "How much of the flat ~29 us at s_q<=32 is the mega kernel vs the separate Q-pad/KV-insert kernel? Settle with nsys on the captured graph, per-kernel durations.",
+    "What does a RoPE recompute (folded) phase actually cost per layer in MegaBake decode? Settle with tools/phase_profile.py on SmolLM-1.7B decode, attributing time between the folded RoPE prologue and the attention phase start (GPU busy with benchmarks; run later).",
+    "Would folding the QK-norm denominator into the score scale stay within MegaBake's correctness bounds given the bit-exact-vs-eager policy? Settle by a numerics A/B on Qwen3.5-0.8B/Gemma-3-270M per-region comparison.",
+    "Is the inverse RoPE in DeepSeek V4 exact de-rotation by query position or an approximation of relative position on shared K/V? The kernel applies the conjugate rotation with the query's cos/sin; confirm against the reference model code (HF transformers V4 implementation) before treating it as a generic rule [uncertain].",
+    "Can MegaBake's last-chunk merge host a nonlinear epilogue without serializing the tail (the last CTA does merge + epilogue for a row)? Settle by microbenchmarking split-context decode with a synthetic amax-quant epilogue at 60 workers."
+  ],
+  "uncertain": [
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake",
+    "open_questions"
+  ]
+}

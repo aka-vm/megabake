@@ -74,7 +74,9 @@ def test_task31_builds_and_emits_complete_smollm_architecture_plan(tmp_path):
         canonicalize_semantics(import_fx(capture.graph, capture.context))
     )
     assert all(operation.tensor_program is not None for operation in graph.ops.values())
-    assert len(graph.ops) > 240
+    # Both layers are captured; per-layer duplicates (the causal mask, RoPE
+    # tables) merge into one copy each.
+    assert len(graph.ops) > 220
     assert _gather_index_is_static(graph, "value:unsqueeze_3")
     assert not _gather_index_is_static(graph, graph.inputs[0])
 

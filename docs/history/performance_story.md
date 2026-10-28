@@ -1,5 +1,7 @@
 # MegaBake Task 20 performance story
 
+> **Historical document.** This is the Task 20 gated-MLP measurement (2026-10-13), corrected by PERFORMANCE_REPORT.md. Current numbers are in [ROADMAP.md](../../ROADMAP.md#measured-state). It is kept for its evidence and history and is not maintained. The current design is [ARCHITECTURE.md](../../ARCHITECTURE.md) and the current plan is [ROADMAP.md](../../ROADMAP.md).
+
 This report consolidates the final Task 20 measurement in `artifacts/task20/mlp.json`, the Chrome traces under `artifacts/task20/traces/`, and the historical Task 16–19 artifacts. All times are microseconds unless explicitly marked otherwise.
 
 > **Correction, 2026-10-13.** A later profile of the warm call showed that the time outside the kernel is Python binding work, not launch or scheduling. The real launch takes about 30 us. The affected statements below are corrected in place. See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) for the attribution and next steps.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from math import prod
+
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import product
@@ -78,10 +80,6 @@ class CuTeLayout:
     def cute_stride(self) -> tuple[int, ...]:
         return tuple(reversed(self.strides))
 
-    @property
-    def cute_layout(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return self.cute_shape, self.cute_stride
-
     def offset(self, coordinates: Sequence[int]) -> int:
         if len(coordinates) != len(self.shape):
             raise InvalidTileMap("coordinates do not match the CuTe layout rank")
@@ -94,7 +92,30 @@ class CuTeLayout:
         )
         return self.swizzle.apply(offset) if self.swizzle is not None else offset
 
+    def same_dense_memory(self, other: CuTeLayout) -> bool:
+        """Whether both layouts are row-major and dense over the same number
+        of elements, so one is a reshape of the other in memory."""
+
+        def dense(layout: CuTeLayout) -> bool:
+            stride = 1
+            for size, actual in zip(reversed(layout.shape), reversed(layout.strides)):
+                if size != 1 and actual != stride:
+                    return False
+                stride *= size
+            return layout.swizzle is None
+
+        return (
+            self.dtype == other.dtype
+            and prod(self.shape) == prod(other.shape)
+            and dense(self)
+            and dense(other)
+        )
+
     def needs_conversion_to(self, other: CuTeLayout) -> bool:
+        if self.shape != other.shape and self.same_dense_memory(other):
+            # A GEMM with a fused epilogue stores its consumer's result as
+            # the 2-D GEMM output; consumers read the same memory reshaped.
+            return False
         if self.dtype != other.dtype or self.shape != other.shape:
             raise InvalidTileMap("conversion layouts must have the same value domain")
         normalize = lambda layout: tuple(

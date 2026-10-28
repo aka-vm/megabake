@@ -6,7 +6,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from torch.export.graph_signature import InputKind
-from torch.utils import _pytree as pytree
 
 from ..frontend import CaptureContext, prepare_fx_graph
 

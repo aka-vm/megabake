@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megabake.bodies import SelectionPolicy, TargetFacts, gemm_candidates
-from megabake.bodies.gemm import (
+from megabake.bodies.cuda.sm90.gemm import (
     compile_g0_range_gemm,
     g0_range_body,
     g0_range_resources,

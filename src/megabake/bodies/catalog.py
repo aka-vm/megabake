@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
-from ..graph import Region
-from .attention import AttentionBodyProvider
-from .gemm import G0RangeBodyProvider
-from .blackwell import BlackwellGemmProvider
+from ..graph import DTYPE_BYTES, Region
+from .cuda.sm90.attention import AttentionBodyProvider
+from .cuda.sm90.gemm import G0RangeBodyProvider, _access_effects
+from .cuda.sm100.gemm import BlackwellGemmProvider
 from .interface import (
     BodyConfig,
     CandidateSet,
@@ -25,20 +24,6 @@ from .interface import (
     TileContract,
     validate_body_config,
 )
-
-
-_DTYPE_BYTES = {
-    "torch.bool": 1,
-    "torch.uint8": 1,
-    "torch.int8": 1,
-    "torch.int16": 2,
-    "torch.int32": 4,
-    "torch.int64": 8,
-    "torch.float16": 2,
-    "torch.bfloat16": 2,
-    "torch.float32": 4,
-    "torch.float64": 8,
-}
 
 
 class GenericBodyProvider:
@@ -74,6 +59,17 @@ class GenericBodyProvider:
                 (
                     ProviderRejection(
                         self.provider_name, "aliasing view needs no device body"
+                    ),
+                ),
+            )
+        if region.semantic_facts.get("family") == "gemm_epilogue":
+            # The fused region only pays off in a tuned GEMM body; without one
+            # the planner keeps the unfused GEMM and its consumers.
+            return CandidateSet(
+                (),
+                (
+                    ProviderRejection(
+                        self.provider_name, "GEMM epilogue fusion needs a tuned GEMM body"
                     ),
                 ),
             )
@@ -141,7 +137,7 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
     threads = 128
     warp_count = threads // 32
     scratch_bytes = (
-        warp_count * _DTYPE_BYTES[program.accumulator_dtype]
+        warp_count * DTYPE_BYTES[program.accumulator_dtype]
         if is_reduction
         else 0
     )
@@ -149,17 +145,10 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
     cta_shape = (128,) + (1,) * max(len(output_axes) - 1, 0)
     completion = CompletionContract(
         outputs_ready="assigned output elements are stored when run returns",
-        output_tiles_ready=(
-            "each assigned element is ready after its predicated store"
-            if not is_contraction
-            else "each assigned element is ready after its reduction and store"
-        ),
-        async_work_complete="run performs no asynchronous work",
         scratch_reusable="scratch is reusable after the CTA reduction barrier"
         if is_reduction
         else "scratch is reusable when run returns",
         register_fragments="none",
-        warp_roles_on_return="unchanged",
     )
     evidence = (
         ResourceEvidence(
@@ -205,11 +194,7 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
             source_op_ids=region.source_op_ids,
             numerical_policy="source_semantics",
             expression_hooks=("vector_chain",) if is_fused_chain else (),
-            expression_hook_restrictions=(
-                "none; expressions are generated from the tensor program",
-            ),
             access_effects=_access_effects(program),
-            access_restrictions=("loads and stores must match the tensor program",),
         ),
         layouts=_layouts(program),
         tiles=TileContract(
@@ -235,25 +220,12 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
             stage_count=1,
             barriers=barriers,
             async_operations=(),
-            shared_memory_layouts=(
-                {
-                    "reduction_partials": (
-                        "one accumulator scalar per warp in the CTA scratch row"
-                    )
-                }
-                if is_reduction
-                else {}
-            ),
             drain_rule="no asynchronous pipeline to drain",
         ),
         scratch=ScratchContract(
             owner="cta" if is_reduction else "none",
             size_bytes=scratch_bytes,
             alignment_bytes=16,
-            initial_state="uninitialized reduction partials"
-            if is_reduction
-            else "empty",
-            reuse_rule=completion.scratch_reusable,
         ),
         completion=completion,
         evidence=evidence,
@@ -272,7 +244,7 @@ def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract
             dtype=load.dtype,
             axes=tuple(load.axes),
             strides=tuple(load.strides),
-            alignment_bytes=alignment_bytes or _DTYPE_BYTES[load.dtype],
+            alignment_bytes=alignment_bytes or DTYPE_BYTES[load.dtype],
             shape=(
                 tuple(load.source_shape)
                 if load.source_shape is not None
@@ -293,16 +265,8 @@ def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract
             dtype=store.dtype,
             axes=output_axes,
             strides=tuple(store.strides),
-            alignment_bytes=alignment_bytes or _DTYPE_BYTES[store.dtype],
+            alignment_bytes=alignment_bytes or DTYPE_BYTES[store.dtype],
             shape=tuple(store.shape),
         )
     }
     return LayoutContract(inputs, outputs)
-
-
-def _access_effects(program: Any) -> Mapping[str, Any]:
-    return {
-        "reads": tuple(load.value_id for load in program.loads),
-        "writes": (program.store.value_id,),
-        "owns_storage": program.store.owns_storage,
-    }

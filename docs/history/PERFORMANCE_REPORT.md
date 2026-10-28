@@ -1,5 +1,7 @@
 # MegaBake performance report
 
+> **Historical document.** This is the 2026-10-13 MLP and 2026-10-16 SmolLM-135M reports. Current numbers are in [ROADMAP.md](../../ROADMAP.md#measured-state). It is kept for its evidence and history and is not maintained. The current design is [ARCHITECTURE.md](../../ARCHITECTURE.md) and the current plan is [ROADMAP.md](../../ROADMAP.md).
+
 Two reports, newest first:
 
 - **Full model (2026-10-16).** The pinned SmolLM-135M checkpoint compiled into one kernel in prefill and decode.

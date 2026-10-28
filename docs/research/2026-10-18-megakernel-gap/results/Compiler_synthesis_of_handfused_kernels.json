@@ -1,0 +1,304 @@
+{
+  "name": "Compiler synthesis of hand-fused kernels",
+  "scope": "Question: should MegaBake's ideal output look like vLLM's agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py, where one hand-written FlashMLA kernel does Q RoPE, sparse attention, inverse RoPE of O, and an MXFP8 cast, and weights are permuted at load so the neighboring GEMMs speak its layouts? If so, how much of that can a compiler synthesize automatically, and where should the line between hand-written and compiled code sit? Examined: the vLLM file plus common/ops/fused_layout.py, the attention-interface contract in deepseek_v41/attention.py, and vLLM fusion passes and backend capability flags; PyTorch Inductor template prologue/epilogue fusion (select_algorithm.py, scheduler.py, config.py); MegaBake's body contract and providers (bodies/interface.py, catalog.py, gemm.py, attention.py), region matchers (regions.py), the HF attention hook (fx_handler/hf_attention.py), ARCHITECTURE.md, ROADMAP.md, PERFORMANCE_REPORT.md, and the fresh artifacts/full_model_2026-10-18 reports; the earlier sibling results (MegaBake_overfitting_audit.json, Mirage_superoptimizer_and_compiler_pipeline.json). Web sources: Mirage (OSDI'25), Event Tensor (MLSys'26), AutoMegaKernel (arXiv 2606.09682), Kernel Forge (arXiv 2607.24762), KernelBench-Verified (arXiv 2607.16241), Hazy Research's ThunderKittens megakernel, Hexcute layout synthesis, cuTile/Tile IR, Helion, and equality-saturation work (TENSAT, XLA eqsat, MLIR eqsat). No GPU jobs were run; everything below comes from static analysis and published numbers.",
+  "key_sources": [
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:1-15 (design: one kernel does Q RoPE + attention + inverse RoPE + FP8 cast; wq_b rows and wo_a cols permuted at load)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:52-87 (hard-coded _HEAD_DIM_V=512, _ROPE_DIM=64, GPT-J RoPE, per-32 ue8m0 scales; measured table: wins only at TP1, ~2 us penalty at small s_q, 'measure before assuming a win')",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:140-195 (is_available_for topology gate; permute_on_load of wq_b, wo_a, and the scales)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:199-245 (contract properties accepts_unnormed_unroped_query, packed_kv_cache_dtype, _alloc_attn_out, _o_proj consuming QuantizedActivation without repacking)",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_layout.py:1-80 (permutations as closed-form index maps 'fused = standard[perm]', applied by a composed weight loader)",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:205-220 (attention-interface contract declared by the platform subclass)",
+    "agent_space/vllm/vllm/v1/attention/backend.py:928 (fused_output_quant_supported: generic capability flag consumed by AttnFusionPass)",
+    "agent_space/vllm/vllm/compilation/passes/fusion/{attn_quant_fusion.py, mla_attn_quant_fusion.py, qk_norm_rope_fusion.py, rope_kvcache_fusion.py, mla_rope_kvcache_cat_fusion.py} (vLLM's generic route: pattern-replacement passes onto fused custom ops)",
+    "agent_space/pytorch/torch/_inductor/config.py:308-318 (epilogue_fusion=True, prologue_fusion gated by prologue_fusion_enabled())",
+    "agent_space/pytorch/torch/_inductor/select_algorithm.py:664,1040-1060 (prologue_supported_inputs: templates declare which inputs accept a fused prologue)",
+    "agent_space/pytorch/torch/_inductor/scheduler.py:3551-3562,5715-5740 (prologue/template/epilogue split; is_prologue_fusion)",
+    "src/megabake/bodies/interface.py:84-178 (SemanticContract with expression_hooks, LayoutContract, TileContract, PipelineContract, CompletionContract, BodyConfig)",
+    "src/megabake/bodies/catalog.py:59-67,100-129 (providers reject multi-program regions; PROVIDERS tuple of 4 providers)",
+    "src/megabake/bodies/gemm.py:1791-1918 (G0RangeBodyProvider: BF16 only, K-major operands and row-major output required, sm90a only, one table config, swapAB)",
+    "src/megabake/bodies/gemm.py:1927-1965 (bias is the only epilogue; only alpha=beta=1)",
+    "src/megabake/bodies/gemm.py:2136 (GEMM declares expression_hooks=())",
+    "src/megabake/bodies/attention.py:89-140,220,311 (attention provider: single tensor program, BF16 policy literal, sm90a, hooks ('score','mask'))",
+    "src/megabake/regions.py:686-819 (RMSNorm matcher), :822-1232 (RoPE matchers as their own region), :2159-2290 (gated MLP 'paired_gemm_epilogue' candidate always rejected at :2240)",
+    "src/megabake/fx_handler/hf_attention.py:28-38 (megabake_attention_forward receives post-RoPE query/key, so RoPE cannot be absorbed through the HF hook alone)",
+    "ARCHITECTURE.md:185-290 (sections 5-6: parameterized generators, expression hooks, coupled configurations, run(work_iterator, tensor_bindings, scratch, epilogue))",
+    "ROADMAP.md:46-51 (no system is both fast and general), :79 (step 4.2.3 epilogue/prologue fusion planned), :120-133 (status table, 1.7B decode breakdown: 1.92 ms GEMM, 49 RMSNorm x 5 us, 24 attention x 10 us, 267 intervals)",
+    "PERFORMANCE_REPORT.md:74-77,261-262,278,282,337 (phase breakdown; SiLU*mul epilogue estimate 2-4 us; sequential GEMM variants sum scratch; paired GEMM rejected)",
+    "artifacts/full_model_2026-10-18/*/report.json (decode kernel ms MegaBake vs Inductor: 1.7B 2.97/2.42, 135M 1.50/1.38, Gemma-3-270M 2.08/1.03, gemma-2b 3.59/3.11, Qwen3.5-0.8B 5.62/2.03, Qwen2-0.5B 1.58/1.64)",
+    "agent_space/megakernel_gap_research/results/MegaBake_overfitting_audit.json and Mirage_superoptimizer_and_compiler_pipeline.json (constants and matchers already audited)",
+    "https://arxiv.org/abs/2405.05751 and https://www.usenix.org/conference/osdi25/presentation/wu-mengdi (Mirage multi-level superoptimizer, up to 3.5x)",
+    "https://arxiv.org/html/2604.13327v2 (Event Tensor / ETC, MLSys 2026: event tensors, static and dynamic scheduling, TVM-DSL tile functions, 1.48x over vLLM on Qwen3-30B-A3B bs1 on B200)",
+    "https://arxiv.org/abs/2606.09682 (AutoMegaKernel: agent harness plus static deadlock/race validator; trails cuBLAS on A100/H100)",
+    "https://www.alphaxiv.org/abs/2607.24762 (Kernel Forge: MCTS agent harness for PyTorch to CUDA kernels)",
+    "https://arxiv.org/pdf/2607.16241 (KernelBench-Verified: hard-coded outputs; best model 1.43x -> 0.88x after verification)",
+    "https://arxiv.org/abs/2510.17891 (TritonRL: reward hacking in kernel generation)",
+    "https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles (ThunderKittens Llama-1B megakernel: hand-written instruction set + interpreter, 78% of H100 bandwidth)",
+    "https://arxiv.org/html/2504.16214v3 (Hexcute: thread-value layouts as types; layout and task-mapping synthesis by type inference)",
+    "https://developer.nvidia.com/blog/simplify-gpu-programming-with-nvidia-cuda-tile-in-python (cuTile / CUDA Tile IR, CUDA 13.1)",
+    "https://pytorch.org/blog/helion/ (Helion: one kernel spec, implicit autotuning space over Triton configs)",
+    "https://pytorch.org/blog/flexattention/ (score_mod/mask_mod hooks compiled into a tuned attention template)",
+    "https://2025.splashcon.org/details/OOPSLA/42/Mind-the-Abstraction-Gap-Bringing-Equality-Saturation-to-Real-World-ML-Compilers (equality saturation for fusion/layout in XLA); https://arxiv.org/abs/2505.09363 (MLIR eqsat dialect)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "Hand-fused 'mega body' with a declared interface contract (vLLM DeepSeek V4.1 FlashMLA mega attention)",
+      "how_it_works": "A single SM100 kernel (torch.ops._flashmla_C.fused_norm_rope_attn_rope_cast_decode/_fwd) takes the raw wq_b output. Q is not yet RoPE'd and arrives in a 16-element chunk-interleaved head layout. The kernel applies GPT-J RoPE to Q, runs sparse MLA over the paged NVFP4/FP8 caches, applies inverse RoPE to O, quantizes O to FP8 with per-32 ue8m0 scales in DeepGEMM's MN-major layout, and writes straight into the buffer that the grouped wo_a fp8_einsum consumes. The layer advertises this through properties (accepts_unnormed_unroped_query, packed_kv_cache_dtype, _alloc_attn_out, _o_proj), so the generic model code skips its own RoPE and quantization steps. The contract is behavioural (which ops the kernel absorbs) plus a layout contract (input/output physical layout).",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:1-15,199-245,310-335; deepseek_v41/attention.py:205-220"
+    },
+    {
+      "idea": "Weight pre-permutation so neighbours speak the body's layout (layout propagation into parameters)",
+      "how_it_works": "Each permutation is a closed-form index map with fused = standard[perm]: q_fused_permutation for wq_b rows, o_fused_permutation for wo_a columns, and a per-chunk form for the scales. A composed weight_loader applies the gather (index_select on a byte view) once at load. The producer GEMM therefore emits the body's input layout and the consumer GEMM contracts over the body's output layout, with no per-step shuffle kernel. This is valid because a GEMM's output-feature axis (rows of W) and contraction axis (columns of W) can be renamed freely when the weight is a constant. Generically, a permutation P on a GEMM output can be pushed into W[P,:] (and into the bias), and P on a GEMM input into W[:,P], provided every op between the GEMM and the body commutes with P.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_layout.py:1-80; flash_mla_mega_attn.py:182-188"
+    },
+    {
+      "idea": "Cost-gated selection of the hand body (applicability plus measured profitability)",
+      "how_it_works": "is_available_for checks the arch family (sm_10x), the op build, and topology divisibility (heads per wo_a group == 8 after TP). The comment table measured on GB300 shows the fused kernel wins only at TP1 (up to 1.45x). From TP2 down the absorbed per-live-head work cancels the padded-head cost (h_q fixed at 64/128), with a ~2 us penalty at small s_q. Profitability is therefore configuration-dependent, and a fixed 'always fuse' rule overfits.",
+      "where_in_source": "flash_mla_mega_attn.py:62-87,140-170"
+    },
+    {
+      "idea": "Generic template prologue/epilogue fusion (Inductor) and pattern-to-fused-op passes with capability flags (vLLM)",
+      "how_it_works": "Inductor fuses pointwise nodes into Triton/CUTLASS template epilogues (config.epilogue_fusion=True). It fuses them into prologues only for inputs the template lists in prologue_supported_inputs (select_algorithm.py), then benchmarks fused against unfused choices (benchmark_epilogue_fusion). vLLM keeps hot ops as custom ops and uses pattern-replacement passes (attn+quant, qk_norm+rope, rope+kvcache) that fire only when the backend declares a capability such as fused_output_quant_supported(quant_key). This is the 'declared contract plus generic matcher' split that MegaBake needs, but the patterns are written by hand per fusion.",
+      "where_in_source": "agent_space/pytorch/torch/_inductor/config.py:308-318; select_algorithm.py:664,1040-1060; scheduler.py:3551-3562,5715-5740; agent_space/vllm/vllm/v1/attention/backend.py:928; vllm/compilation/passes/fusion/*.py"
+    },
+    {
+      "idea": "Superoptimization of small fused subgraphs (Mirage muGraphs)",
+      "how_it_works": "Mirage enumerates kernel, thread-block, and thread-level graphs (muGraphs) for a small subgraph, prunes them with abstract expressions, checks equivalence probabilistically over finite fields, and profiles the survivors. It discovers fusions such as RMSNorm+MatMul, gated MLP, and attention variants (reported up to 3.5x on A100/H100). The search is exponential in op count and practical for roughly 3-8 ops. Its grid and frange candidate sets are hard-coded, and its thread-block bodies are not TMA/WGMMA warp-specialized pipelines. It cannot discover a FlashMLA-class pipeline (sparse paged gather, online softmax, async TMA, in-kernel quantization); MPK uses hand-written tasks for those.",
+      "where_in_source": "https://arxiv.org/abs/2405.05751; agent_space/mirage (see Mirage_superoptimizer_and_compiler_pipeline.json)"
+    },
+    {
+      "idea": "Compiler-scheduled megakernel around library tile functions (Event Tensor / ETC)",
+      "how_it_works": "Tiled tasks are linked by Event Tensors, multi-dimensional arrays of counters with an affine or data-dependent map from task coordinates to event coordinates. notify is an atomic decrement and wait spins to zero. Static scheduling precomputes per-SM queues (an unseen shape reuses the next larger sampled shape); dynamic scheduling uses a GPU global queue. Tile bodies are written in a TVM-based tile DSL or supplied as builtins, so the compiler owns scheduling, dependencies, and prefetch (from user annotations), not the inner kernels. Reported: 1.48x over vLLM and 1.20x over SGLang on Qwen3-30B-A3B bs1 on B200, up to 1.15x on Qwen3-32B, 35 s warmup versus vLLM 123 s. The authors note their compiler-generated GEMM tiles are less tuned than cuBLAS in some configurations.",
+      "where_in_source": "https://arxiv.org/html/2604.13327v2"
+    },
+    {
+      "idea": "Hand-written instruction-set megakernel (ThunderKittens / Hazy 'No Bubbles')",
+      "how_it_works": "A small set of hand-written fused 'instructions' (e.g., RMSNorm+QKV+RoPE, attention, O-proj+residual, RMSNorm+up/gate+SiLU, down+residual) run under an on-GPU interpreter. A CPU-side schedule assigns an instruction sequence per SM, and SMEM is paged between instructions so the next instruction's weights load while the current one finishes. This reached 78% of H100 bandwidth on Llama-3.2-1B bs1, more than 1.5x over vLLM/SGLang. It is the clearest evidence that about 5 fused bodies per layer are the right granularity, but the bodies and schedule are per-model.",
+      "where_in_source": "https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles"
+    },
+    {
+      "idea": "Agent-written kernels and megakernels (AutoMegaKernel, Kernel Forge, KernelBench lineage)",
+      "how_it_works": "LLM agents propose kernel source or schedules in a loop of compile, test, and profile. AutoMegaKernel adds a frozen static validator for deadlock and race freedom (0 false accepts on 7,160 adversarial schedules) and retargets sm_80/90/120. It improves 1.25-1.72x over its own baseline but trails CUDA-graphed cuBLAS on A100/H100 (the authors cite cross-SM sync), and its wins elsewhere use W8A16 against bf16. Kernel Forge uses MCTS over optimization paths. KernelBench-Verified shows frontier models hard-code outputs and game tests; the best model's aggregate speedup fell from 1.43x to 0.88x after verification. Agents are a body-authoring tool, gated by verification, not a compiler pass.",
+      "where_in_source": "https://arxiv.org/abs/2606.09682; https://www.alphaxiv.org/abs/2607.24762; https://arxiv.org/pdf/2607.16241; https://arxiv.org/abs/2510.17891"
+    },
+    {
+      "idea": "Automatic layout synthesis by constraint solving (Hexcute; CuTe layout algebra)",
+      "how_it_works": "Hexcute makes thread-value layouts part of the tensor type. Tile ops (copy, mma, reduce) impose constraints between operand layouts, and type inference solves for layouts and task mappings, picking instructions (ldmatrix, cp.async, mma shapes) systematically. Reported 1.7-11.28x over DL compilers on mixed-type GEMM and parity with CUTLASS at 1.27-7.94x less code. The same idea applies one level up: edge layouts between mega bodies are unknowns, and each body contract constrains them.",
+      "where_in_source": "https://arxiv.org/html/2504.16214v3"
+    },
+    {
+      "idea": "Tile-level languages with autotuned templates (Triton/Helion, cuTile, TVM MetaSchedule/Ansor)",
+      "how_it_works": "Helion turns one PyTorch-like kernel into an implicit search space (block sizes, loop order, indexing mode) and autotunes hundreds of Triton variants, in about 10 minutes per kernel. cuTile/Tile IR is a virtual tile ISA, initially Blackwell plus Ampere/Ada with Hopper to follow, so a portable target for generated bodies. MetaSchedule/Ansor search schedules with learned cost models and tensorize to MMA. They reach library-level GEMM and fused-epilogue kernels for standard shapes. They do not invent algorithmic restructurings like online softmax, inverse-RoPE-before-quant, or sparse paged gathers; those enter as templates. FlexAttention's score_mod/mask_mod is the canonical 'tuned template plus compiled hooks' pattern.",
+      "where_in_source": "https://pytorch.org/blog/helion/; https://developer.nvidia.com/blog/simplify-gpu-programming-with-nvidia-cuda-tile-in-python; https://pytorch.org/blog/flexattention/"
+    },
+    {
+      "idea": "Equality saturation for contract matching and layout/fusion exploration",
+      "how_it_works": "E-graphs (TENSAT; XLA eqsat at OOPSLA 2025; the MLIR eqsat dialect) hold all equivalent rewritings of a subgraph at once. Extraction with a cost model then picks a fusion and layout assignment. For MegaBake the useful application is narrow: canonicalize the ops around a body (RoPE spelled as rotate_half or as GPT-J interleave, norms with different cast placement, transpose/reshape chains) so a contract's hook slots match by expression rather than by aten op spelling, and prove that a permutation commutes with the ops between a GEMM and a body. State explosion limits it to local windows.",
+      "where_in_source": "https://2025.splashcon.org/details/OOPSLA/42/Mind-the-Abstraction-Gap-Bringing-Equality-Saturation-to-Real-World-ML-Compilers; https://arxiv.org/abs/2505.09363"
+    },
+    {
+      "idea": "MegaBake's existing body contract (BodyConfig) as the substrate for a mega-body library",
+      "how_it_works": "BodyConfig already carries a SemanticContract (operation_family, expression_hooks, access effects), LayoutContract (per-input/output TensorLayout with axes, strides, alignment, tail policy), TileContract, ParticipantContract, PipelineContract, ScratchContract, CompletionContract (outputs_ready, output_tiles_ready, register_fragments), and ResourceEvidence. ARCHITECTURE.md sections 5-6 prescribe exactly this design: a small set of parameterized generators, typed expression hooks compiled into device code, coupled GEMM configurations, and run(work_iterator, tensor_bindings, scratch, epilogue). What is missing is multi-op absorption, layout negotiation, and parameter repacking.",
+      "where_in_source": "src/megabake/bodies/interface.py:84-178; ARCHITECTURE.md:185-290"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "Hand-fused mega body with declared interface contract",
+      "status": "partial",
+      "evidence": "bodies/interface.py:84-178 (contract types exist); fx_handler/hf_attention.py:28-38 (declared megabake::attention op); bodies/attention.py:311 (hooks 'score','mask')",
+      "notes": "MegaBake has declared attention and kv_attention ops and a contract schema, but each body implements exactly one tensor program (catalog.py:59-67, attention.py:98-99, gemm.py:1803). No body absorbs neighbouring ops: RoPE is its own region (regions.py:822-1232), and the HF hook receives post-RoPE Q/K, so attention cannot take un-RoPE'd Q. Attention output cannot be cast or quantized in-body, and BF16 is a literal requirement (attention.py:107-140)."
+    },
+    {
+      "idea": "Weight pre-permutation / parameter repacking",
+      "status": "missing",
+      "evidence": "No permutation, concatenation, or packing of parameters anywhere in src/megabake (grep for permut/repack/qkv in compiler.py, memory.py, planner.py, regions.py, codegen.py finds only activation views). ARCHITECTURE.md:407 already requires an invalidation rule for packed or folded parameters.",
+      "notes": "There are no fused QKV or interleaved gate/up weights, so the paired gate/up GEMM with a SiLU*mul epilogue cannot be built without a runtime pack (regions.py:2240 rejects it unconditionally). Mirage MPK and vLLM both pack at load."
+    },
+    {
+      "idea": "Cost-gated selection of hand bodies",
+      "status": "partial",
+      "evidence": "plan.py SearchBudget/PlanEvaluator exist, but compiler.py:427-431 forces max_plans=1 for table launches (per MegaBake_overfitting_audit.json); bodies/gemm.py:1853-1880 returns exactly one table config",
+      "notes": "Body selection is effectively rule-based: the first legal candidate wins and there is no fused-versus-unfused comparison. The vLLM table shows a fused body can lose by about 2 us in some configurations, so MegaBake needs per-configuration measurement or a calibrated cost model."
+    },
+    {
+      "idea": "Generic prologue/epilogue fusion with capability flags",
+      "status": "partial",
+      "evidence": "bodies/gemm.py:1927-1965 (bias epilogue only, alpha=beta=1, BF16); gemm.py:2136 (expression_hooks=()); ROADMAP.md:79 (residual/SiLU*mul epilogues and RMSNorm prologue planned, not done); schedule.py fold of small intervals into consumers (ROADMAP step 8) is the only generic cross-region fusion",
+      "notes": "The schema has expression_hooks, but GEMM declares none. Epilogue hooks should be typed scalar expressions over (row, col, acc, loaded per-row/per-col vectors), the same ScalarExpression trees regions.py already builds for vector chains."
+    },
+    {
+      "idea": "Superoptimization of small fused subgraphs (Mirage)",
+      "status": "not_applicable",
+      "evidence": "See Mirage_superoptimizer_and_compiler_pipeline.json",
+      "notes": "Not worth integrating as an online pass: search time and the lack of async-pipeline bodies make it unsuitable for MegaBake's hot bodies. Its verify-then-profile loop is worth copying for body configuration selection."
+    },
+    {
+      "idea": "Compiler-scheduled megakernel around library tile functions (Event Tensor)",
+      "status": "partial",
+      "evidence": "ROADMAP.md step 10 (event counters in table launch: not started); schedule.py exact tile prerequisite sets exist",
+      "notes": "MegaBake is structurally the same split as ETC (bodies plus a compiler-owned schedule), but it still uses grid barriers between dependency levels (~6 per layer at decode)."
+    },
+    {
+      "idea": "Hand-written instruction-set megakernel (ThunderKittens)",
+      "status": "partial",
+      "evidence": "Table-driven phases (codegen.py, runtime.py) are an interpreter over phase records",
+      "notes": "MegaBake's phases are finer-grained (one op family each) than TK's fused instructions (about 5 per layer). The mega-body proposal moves MegaBake toward TK granularity while keeping bodies model-agnostic."
+    },
+    {
+      "idea": "Agent-written kernels",
+      "status": "missing",
+      "evidence": "No agent loop in the repo; bodies are hand-ported from CUTLASS/Mirage (catalog.py:164-198 evidence strings)",
+      "notes": "Useful offline to draft new body variants, such as an SM100 tcgen05 GEMM or a GDN scan, provided they enter the library only through the same contract validation and teacher-forced verification (ROADMAP 4.4)."
+    },
+    {
+      "idea": "Automatic layout synthesis",
+      "status": "missing",
+      "evidence": "gemm.py:1834-1845 requires K-major operands and row-major output, otherwise rejects; LayoutContract (interface.py:104-107) is emitted from the tensor program and never negotiated",
+      "notes": "Today a body either matches the captured strides or is rejected (fallback to generic_contraction, 100x slower per the overfitting audit). No layout-conversion insertion or layout choice per edge."
+    },
+    {
+      "idea": "Tile-level languages with autotuned templates",
+      "status": "partial",
+      "evidence": "CuTe DSL bodies (bodies/gemm.py, attention.py, generic.py); table launch uses one shared GEMM smem layout (gemm.py:1711)",
+      "notes": "There are templates but no autotuning space per body. One TABLE_GEMM_SHARED_BYTES layout forces a single tile for every GEMM in a launch (PERFORMANCE_REPORT.md:278)."
+    },
+    {
+      "idea": "Equality saturation for contract matching",
+      "status": "missing",
+      "evidence": "Matchers are aten-spelling specific: regions.py:686-819 (HF LlamaRMSNorm order), :836 (HF rotate_half RoPE)",
+      "notes": "A local rewrite or e-graph canonicalizer over ScalarExpression would let hooks match RoPE and norm variants generically."
+    },
+    {
+      "idea": "BodyConfig contract substrate",
+      "status": "implemented",
+      "evidence": "bodies/interface.py:84-284, catalog.py:114-129 (validate_body_config on every candidate)",
+      "notes": "Good foundation. Extend it with absorbable prologue/epilogue hook slots, layout families with free parameters, a parameter-transform field (weight permutation/packing requests), and a cost function."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Body fusion decisions made per call-site without separate kernel binaries",
+      "why_multi_kernel_cannot": "In a multi-kernel graph each fusion variant (e.g., GEMM+residual, GEMM+residual+norm-stats) is a separate compiled kernel. The combinatorics of prologue/epilogue variants times tile configs is paid in binary count, autotune time, and launch-boundary placement. In a megakernel the hooks are compiled into one binary and the phase table chooses which hooked variant runs where, and a non-fused fallback costs a barrier interval, not a launch.",
+      "nearest_multi_kernel_substitute": "Inductor/vLLM generate a specialized fused kernel per pattern (vLLM fusion passes). The fused result is equivalent but compile and maintenance costs scale with patterns. Honest caveat: the fusion itself (e.g., FlashMLA's RoPE+attn+cast) is NOT megakernel-exclusive; vLLM ships it as a normal kernel."
+    },
+    {
+      "opportunity": "Tile-granular hand-off between a mega body's epilogue and the next body's prologue",
+      "why_multi_kernel_cannot": "CompletionContract.output_tiles_ready lets a consumer body start on tile i once the producer's tile i is published (event counters). Across kernel launches even PDL (griddepcontrol) only overlaps the consumer's preamble; data dependence is still whole-kernel. Example: the attention body's per-head-group output feeds wo_a tiles for that group immediately, which is exactly the 'group of 8 heads per wo_a group' structure in the vLLM kernel.",
+      "nearest_multi_kernel_substitute": "PDL plus stream-K style overlap, or fusing attention and O-proj into one kernel (rarely done). PDL recovers launch latency (~2-4 us) but not per-tile pipelining."
+    },
+    {
+      "opportunity": "Cross-body weight prefetch keyed by contract",
+      "why_multi_kernel_cannot": "When a body declares its weight access pattern (which W tiles each CTA will read), the megakernel can issue cp.async.bulk.prefetch.L2 or TMA loads into SMEM for the next body's weights while the current body (e.g., attention, which is latency- not bandwidth-bound at decode) runs on the same SM. A separate kernel cannot start loading until it launches, and L2 prefetch from a previous kernel does not know the next kernel's CTA-to-tile mapping.",
+      "nearest_multi_kernel_substitute": "PDL with an early prefetch in the dependent kernel's preamble gets part of this. CUDA-graph replay does not."
+    },
+    {
+      "opportunity": "SMEM-resident activations shared across several bodies on one CTA",
+      "why_multi_kernel_cannot": "At decode the normalized hidden row (e.g., 2048 bf16 = 4 KB) can stay in SMEM across the Q, K, V, gate, and up GEMM bodies assigned to the same CTA. This works only if the contracts declare a compatible SMEM input layout and the scheduler co-locates them. Separate kernels must re-read from L2/HBM.",
+      "nearest_multi_kernel_substitute": "Concatenated QKV and gate/up weights (one GEMM) achieve similar reuse in vLLM; that is a weight-packing transform MegaBake should also do, and it is not exclusive."
+    },
+    {
+      "opportunity": "Free layout conversions at body boundaries via redistributed tiles",
+      "why_multi_kernel_cannot": "When weight pre-permutation cannot absorb a layout mismatch (e.g., between two activation-only bodies), a megakernel can fold the conversion into the consumer's load path for the specific tiles it owns, without a materialized transpose. A multi-kernel graph needs either a transpose kernel or a template that supports the alternate stride.",
+      "nearest_multi_kernel_substitute": "Inductor prologue fusion (prologue_supported_inputs) does this for Triton templates when the template opts in."
+    }
+  ],
+  "measured_or_reported_gains": "vLLM FlashMLA mega attention (GB300, DeepSeek V4.1 64 heads, topk_swa=128, topk_extra=512, CUDA graphs on): TP1 29/29, 31/31, 31/40, 53/72, 96/140 us (fused/split) at s_q 1/32/128/256/512, i.e. up to 1.45x. At TP2-TP8 the two paths are within a few percent, with a ~2 us fused penalty at small s_q (flash_mla_mega_attn.py:68-87). Mirage superoptimizer: up to 3.5x over existing approaches on A100/H100 (OSDI'25 abstract). Event Tensor/ETC on B200: 1.48x over vLLM and 1.20x over SGLang at bs1 on Qwen3-30B-A3B; up to 1.15x over vLLM on Qwen3-32B; 0.99-1.06x at TP4; MoE layer 1.23x; warmup 35 s vs vLLM 123 s vs SGLang 583 s. ThunderKittens Llama-1B megakernel: 78% of H100 memory bandwidth, >1.5x over vLLM/SGLang at bs1. AutoMegaKernel: 1.25-1.72x over its own baseline. W8A16 beats bf16 cuBLAS+CUDA graphs on L4 (1.33x), L40S, A10G, and RTX 5090, but trails on A100/H100 [uncertain: self-reported, precision-asymmetric]. KernelBench-Verified: the best model's aggregate speedup falls from 1.43x to 0.88x after removing hard-coded/gamed kernels. Hexcute: 1.7-11.28x over DL compilers on mixed-type ops, up to 2.91x end-to-end [uncertain: author-reported]. MegaBake's own estimates: SiLU*mul in the GEMM epilogue saves 2-4 us per MLP at batch 4 (PERFORMANCE_REPORT.md:262); 49 RMSNorms x 5 us and 24 decode attentions x 10 us on 1.7B decode (ROADMAP.md:133).",
+  "expected_impact_on_megabake": "Baseline (artifacts/full_model_2026-10-18): decode kernel MegaBake vs Inductor is 1.7B 2.97 vs 2.42 ms, 135M 1.50 vs 1.38, gemma-2b 3.59 vs 3.11, Gemma-3-270M 2.08 vs 1.03, Qwen3.5-0.8B 5.62 vs 2.03 (GDN not a body yet). On 1.7B decode (24 layers), 1.92 ms is GEMM at ~1.78 TB/s and ~1.05 ms is everything else, mostly per-phase latency. Ranked by expected gain from adopting contract-based mega bodies: (1) RMSNorm absorbed as a GEMM prologue: each CTA recomputes the row's sum of squares (decode rows of 2048-4096 elements; recompute costs roughly 0.3-0.5 us per CTA from L2) and applies the scale on the A-operand load. This removes one dependency level per norm: 49 x (~0.7 us barrier + ~3-4 us norm phase - ~0.5 us prologue) gives about 0.15-0.2 ms on 1.7B and about 0.1-0.15 ms on 135M (61 norms, 30 layers) [uncertain: the step-8 fold already recomputes some norms in consumers for batch<=2]. (2) Residual add in the o_proj/down epilogue, plus the next norm's partial sum-of-squares as an epilogue side output: 48 phases x ~2-3 us is about 0.1-0.15 ms on 1.7B. (3) Paired gate/up GEMM with a SiLU*mul epilogue. This needs gate/up interleaving at bake time (weight pre-permutation) and removes the SiLU*mul phase and one interval per layer: 24 x 2-4 us is about 0.05-0.1 ms. (4) RoPE plus KV-cache write absorbed into the QKV epilogue, or Q RoPE into the attention prologue: about 24 x 3 us, so 0.05-0.08 ms. Total about 0.35-0.5 ms on 1.7B decode, which would bring the kernel from 2.97 ms to roughly 2.5-2.6 ms, near Inductor's 2.42. A similar ~15-25% applies to 135M and Qwen2-0.5B. These estimates assume the bodies run at the same per-phase bandwidth. Event counters (ROADMAP step 10) and L2 prefetch (step 9) are complementary and attack the same latency, so gains are not additive [uncertain]. Prefill (128-300 tokens, 3-21x slower than Inductor+CUDA graphs): epilogue fusion is second-order there. The dominant fix is per-GEMM tile choice and larger-M bodies (the single table smem layout, PERFORMANCE_REPORT.md:278), which is a body-library and autotuning issue rather than a fusion issue. Mega attention bodies matter only once prefill attention is a tuned tiled pipeline. Inner-kernel fusions like FlashMLA's inverse-RoPE+FP8 cast matter only for quantized or MLA models, which MegaBake does not yet run; expect zero gain on the tested BF16 models.",
+  "generality_and_overfitting_risk": "The vLLM file is a negative example of where model knowledge should live, though a positive example of the contract shape. It hard-codes _HEAD_DIM_V=512, _ROPE_DIM=64, GPT-J RoPE, a per-32 quant group, WV_GROUP_SIZE=8, h_q in {64,128} padding, sm_10x only, and the NVFP4 cache format (flash_mla_mega_attn.py:52-62, fused_layout.py:15-19). Its own measurements show that profitability flips with TP, which shows a fused body is not uniformly better. If MegaBake's ideal output were 'one such kernel per model', it would be a per-model library (the Mirage MPK and TK situation), which is exactly the overfitting the user fears. Proposed rule: hand-written code may contain only (a) inner pipelines of an algorithm family (GEMM mainloop, attention online-softmax/KV-streaming loop, row reduction, chunked scan) parameterized by dtype, head_dim, group size, and tile; and (b) a fixed set of hook slots. Every model-varying detail must be compiled from the captured graph into hook expressions or parameter transforms: RoPE style and partial rotary, norm variant and epsilon, activation, bias, scaling and soft-cap, output cast/quant, layouts, head grouping. A new body family is admitted only if it serves at least two model families or is a fundamental algorithm with no generic lowering. Existing MegaBake items in this area that look fitted to tested models: GEMM epilogue is only BF16 bias with alpha=beta=1 (gemm.py:1927-1965); GEMM accepts only K-major operands and row-major output (gemm.py:1834-1845); one table GEMM smem layout and tile (gemm.py:1711,1853-1880); SWAP_AB_MAX_ROWS=64 and row tiles (16,32,64) measured on 60 SMs (gemm.py:1893-1896); the attention numerical policy is a BF16 literal (attention.py:107-115); the RMSNorm matcher follows HF Llama spelling (regions.py:686-819) and the RoPE matcher follows HF rotate_half (regions.py:836-1232); the attention head-axis stride heuristic broke on Gemma 3 MQA (regions.py:1250-1264); the gated-MLP matcher is SiLU-only and dead (regions.py:2240). How references avoid overfitting: Inductor templates declare prologue-capable inputs and benchmark fused against unfused choices per shape; vLLM gates fusions on backend capability flags plus measured selection; ETC compiles schedules from generic event tensors over library tiles; Helion and MetaSchedule search per shape; Hexcute derives layouts by inference instead of fixing them. Required guard: a held-out model set (e.g., Phi-3, Mistral/Ministral, OLMo-2, Granite, GPT-NeoX) that is never used for tuning. CI should fail when a change improves tuned models but regresses held-out ones, and should log every region that falls back to a generic body.",
+  "hardware_portability": "Contract semantics (hook expressions, logical layouts as CuTe layouts over logical axes, parameter permutations, completion and event semantics) are target-generic and should live outside bodies/. Body implementations are per target. SM90 uses TMA, WGMMA with register accumulators, setmaxnreg, and clusters, so epilogue hooks can operate on register fragments. On SM100 (tcgen05, TMEM accumulators, CLC, 2-CTA MMA) epilogue warps must tcgen05.ld from TMEM; this is why hooks must be expressed as scalar expressions over (row, col, acc), not register-fragment code, so the same hook compiles into both. FlashMLA's mega kernel is SM100-only for exactly this reason. SM80 lacks TMA and WGMMA. Weight pre-permutation still applies (cp.async/ldmatrix-friendly swizzles); an SM80 GEMM body would prefer different permutations, so the permutation must be requested by the selected body, not fixed by the model. Layout families differ per MMA instruction (WGMMA K-major vs MN-major operand support, FP8 requiring K-major on SM90), so layout assignment must query the body's accepted-layout set per target. cuTile/Tile IR (Blackwell, Ampere/Ada, Hopper planned) and Triton/Helion are plausible portable backends for non-hot generic bodies. Hand mega bodies stay CuTe-DSL per arch. Agent-written bodies retargeting sm_80/90/120 (AutoMegaKernel) show retargeting is feasible but slower than vendor GEMM on H100; vendor-quality GEMM mainloops should be ported from CUTLASS/DeepGEMM, not generated.",
+  "recommended_actions": [
+    {
+      "action": "Answer to the user's question: do NOT make 'one hand-fused kernel per model like flash_mla_mega_attn.py' the target. Make the target the automatic generation of that file's integration layer (contract matching, weight permutation, buffer layout handoff, selection gate) around a small, model-agnostic library of mega bodies. Write this boundary into ARCHITECTURE.md as an explicit rule (hand code = inner pipelines plus hook slots; compiler = everything model-varying).",
+      "expected_gain": "Prevents per-model body sprawl; no direct speedup",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "ARCHITECTURE.md (sections 5-6), ROADMAP.md",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Extend BodyConfig with absorbable hook slots: GEMM prologue {row_scale from a reduction (RMSNorm/LayerNorm), input cast}, GEMM epilogue {per-col/per-row vector loads, residual tensor, activation/gate pair, RoPE-on-output-features, cast/quant with scale output, KV-cache scatter}, attention prologue {q/k norm, RoPE as an index-map expression}, attention epilogue {cast/quant, output layout}. Hooks are ScalarExpression trees that regions.py already builds; the provider's get_candidates receives a multi-program region and returns which neighbour programs it absorbed.",
+      "expected_gain": "Enables actions 3-5; about 0.35-0.5 ms on 1.7B decode combined [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/interface.py:84-178, bodies/catalog.py:59-67, bodies/gemm.py:1791-1965,2136, bodies/attention.py:89-140,311, src/megabake/regions.py",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Generic RMSNorm/LayerNorm-as-GEMM-prologue and residual-in-epilogue, chosen by comparing the recompute cost against the barrier plus phase cost calibrated per device (not a fixed fold threshold).",
+      "expected_gain": "0.25-0.35 ms on 1.7B decode; 0.15-0.25 ms on 135M [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py (A-operand load path / epilogue), src/megabake/regions.py:686-819, src/megabake/schedule.py (fold logic)",
+      "prerequisite": "Action 2; device calibration of barrier us and per-SM bandwidth"
+    },
+    {
+      "action": "Parameter-transform pass (bake-time weight pre-permutation and packing): a body may request a permutation or concatenation on its producer's weight rows or consumer's weight columns; the pass proves the permutation commutes with intermediate ops (per-feature elementwise, head-split views, permutation-invariant reductions with permuted affine weights), applies it once to parameters with an invalidation rule, and records it in the plan cache key. First uses: fused QKV, interleaved gate/up for the paired SiLU*mul epilogue (unblocks regions.py:2240), swizzled weight layouts for future FP8/SM100 bodies.",
+      "expected_gain": "0.05-0.1 ms on 1.7B from paired gate/up; enabler for QKV co-scheduling and any layout-specialized body",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "new src/megabake/param_transforms.py, src/megabake/compiler.py (parameter binding), src/megabake/memory.py, src/megabake/cache.py, src/megabake/regions.py:2159-2290",
+      "prerequisite": "Action 2; ARCHITECTURE.md:407 invalidation rule"
+    },
+    {
+      "action": "Layout assignment pass: treat the physical layout of every edge between bodies as an unknown; each body contributes its accepted and produced layout family; solve with a simple cost (conversion phase bytes vs free weight permutation vs body variant cost), Hexcute/XLA-layout-assignment style. Replace hard rejections like gemm.py:1834-1845 with 'accepts these layouts' sets.",
+      "expected_gain": "Removes generic_contraction fallbacks on unusual strides (100x cliffs); enables RoPE-into-attention without a transpose phase",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/planner.py, src/megabake/plan.py, src/megabake/bodies/interface.py:94-107, bodies/gemm.py",
+      "prerequisite": "Action 4"
+    },
+    {
+      "action": "Make RoPE absorbable into attention despite the HF hook: when the graph shows megabake::attention's q/k produced by a RoPE region whose only consumer is the attention op (and the KV-cache write), match the region into the attention body's prologue hook (k RoPE happens at cache-write time in the QKV epilogue).",
+      "expected_gain": "0.05-0.08 ms on 1.7B decode [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/fx_handler/hf_attention.py, src/megabake/regions.py:822-1232, src/megabake/bodies/attention.py",
+      "prerequisite": "Action 2"
+    },
+    {
+      "action": "Measured fused-versus-unfused selection: re-enable a small plan search (top-k by analytic cost, measure 2-4) for body variants with and without absorbed hooks, cached per (GPU, SM count, shape bucket). This copies vLLM's lesson that the fused body loses in some configurations.",
+      "expected_gain": "Prevents fusion regressions (vLLM saw up to 2 us per call); 0-5% on tested models",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py:427-431, src/megabake/plan.py, src/megabake/cache.py",
+      "prerequisite": "Cheaper per-candidate compile"
+    },
+    {
+      "action": "Expression canonicalizer (local rewrite system or egglog) for hook matching: normalize RoPE spellings (rotate_half, GPT-J interleave, partial rotary), norm cast placement, and Gemma (1+w), so contracts match by semantics, not aten spelling.",
+      "expected_gain": "Coverage on held-out models without new matchers",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/regions.py, new src/megabake/canonicalize.py",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Optional offline agent loop for new body variants (e.g., SM100 GEMM, GDN chunked scan, FP8 epilogue), admitted only via validate_body_config, teacher-forced verification (ROADMAP 4.4), randomized-shape tests, and a held-out-model benchmark. Never run in the compile path.",
+      "expected_gain": "Faster body authoring; no direct runtime gain",
+      "effort": "M",
+      "generality": "hw-specific",
+      "files_to_touch": "tools/ (new agent harness), tests/",
+      "prerequisite": "Contract and test harness from actions 2 and 7"
+    },
+    {
+      "action": "Held-out model gate in CI: maintain models never used for tuning (Phi-3-mini, OLMo-2-1B, Granite-3-1B, a GPT-NeoX/Pythia model) and report fallback counts and kernel-vs-Inductor ratios for them alongside the tuned set.",
+      "expected_gain": "Detects overfitting of fusion and matcher work",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "benchmarks/full_model.py, tools/phase_profile.py",
+      "prerequisite": "none"
+    }
+  ],
+  "open_questions": [
+    "How much of the 1.7B decode non-GEMM time (~1.05 ms) is per-phase body work versus barrier drain and fill? Settle with tools/phase_profile.py per-interval timelines before and after a prototype RMSNorm-prologue GEMM on one layer.",
+    "Does the RMSNorm-as-prologue recompute (each of ~60 CTAs re-reading a 4-8 KB row from L2 and reducing it) beat the separate norm phase at batch 1 and batch 16-64? Settle with a microbenchmark of the swapAB GEMM with and without the prologue hook across hidden sizes 576-4096.",
+    "Can the SM90 table-launch GEMM carry per-call-site epilogue variants without growing register pressure or the shared smem layout (TABLE_GEMM_SHARED_BYTES)? Settle by compiling a variant set and reading ptxas register and spill reports.",
+    "Is the step-8 consumer recompute (fold) already capturing most of the norm and pointwise gains for batch <= 2? Settle by counting folded versus unfolded intervals per layer in the fresh 1.7B decode plan.",
+    "How large is the permutation-commutation analysis in practice (head-split views, per-head QK-norm, partial RoPE)? Settle by running the proposed proof over the post-grad FX graphs of all 8 benchmark models and counting provable permutations.",
+    "Would Event Tensor's TVM-DSL tile functions or cuTile be viable portable backends for MegaBake's generic bodies (not hot GEMMs)? Settle by porting the generic reduction body and comparing against the CuTe version.",
+    "Exact Event Tensor and AutoMegaKernel numbers come from abstracts and HTML; verify the full papers' baselines (vLLM versions, CUDA graphs on or off) before using them as targets."
+  ],
+  "uncertain": [
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake"
+  ]
+}

@@ -1,0 +1,401 @@
+{
+  "name": "Megakernel-exclusive optimizations catalogue",
+  "scope": "Question answered: which optimizations exist only, or are only cheap, when a whole decode step runs as one persistent kernel? A graph of about 500 kernels cannot match them even with CUDA Graphs, PDL and streams. For each one: does MegaBake have it, and what would it gain on decode on the H200 MIG 3g.71gb slice (60 SMs, ~2.2 TB/s, 29 MiB L2)? Sources examined: (a) web and literature: Hazy Research 'Look Ma, No Bubbles' Llama-1B low-latency megakernel; the Hazy TP Llama-70B throughput megakernel integrated in Tokasaurus; ThunderKittens (the framework those kernels are written in); the Mirage MPK paper (arXiv 2512.22219, OSDI 2026); Event Tensor / ETC (arXiv 2604.13327, MLSys 2026); TileRT; ClusterFusion and ClusterFusion++ (DSMEM cross-op fusion); Kernel Looping (SambaNova, arXiv 2410.23668); ForgeMegakernel (arXiv 2609.12379); the NVIDIA PDL programming-guide section; CUTLASS Blackwell Cluster Launch Control docs. (b) Code: agent_space/mirage persistent_kernel runtime (worker loop, events, in-kernel prepare_next_batch, argmax/sampling/speculative tasks); agent_space/tpu-megakernels/qwen/decode_megakernel.py (cross-op weight bank ring). (c) MegaBake static analysis: src/megabake/codegen.py table kernel loop, runtime.py barriers, bodies/gemm.py per-phase pipeline, schedule.py interval folding, bodies/attention.py split-context decode, compiler.py knobs. (d) MegaBake docs and measurements: ROADMAP.md section 6, PERFORMANCE_REPORT.md, and artifacts/full_model_2026-10-18/*/report.json. No GPU jobs were run; every MegaBake gain estimate is an analytical estimate from these measured numbers.",
+  "key_sources": [
+    "https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles - Llama-1B batch-1 megakernel: instruction interpreter, 13 x 16 KiB smem pages, counter sync, B200 time breakdown, 78% of H100 bandwidth",
+    "https://github.com/HazyResearch/Megakernels - open-source code of the Hazy megakernels (ThunderKittens-based)",
+    "https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-main - throughput TP megakernel: loader/consumer/storer/controller warps, cross-instruction pipelining ablation (3.4 vs 10.2 us gaps), global work queue (+14.2% at bs 8192, -1.9% at bs 1024), op interleaving",
+    "https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-intro - Tokasaurus integration, +22% vs SGLang on ShareGPT",
+    "https://arxiv.org/abs/2512.22219 and https://arxiv.org/html/2512.22219 - MPK (OSDI 2026): SM-level tGraph, events, hybrid JIT/AOT task launch, 32 KB smem pages, cross-task pipelining (1.2-1.3x on Qwen3-8B final linear, B200), 293 launches/token cost 0.2 ms with CUDA graphs, in-kernel request scheduling",
+    "https://arxiv.org/html/2604.13327 - Event Tensor Compiler (MLSys 2026): event tensors, static vs dynamic scheduling ablation (dense TP4: static 1.06-1.09x, dynamic 0.82-0.89x), weight prefetch pass, warmup 35 s vs vLLM 123 s",
+    "https://github.com/tile-ai/TileRT and https://pypi.org/project/tilert/ - tile-level runtime for batch-1 ultra-low-latency decode (GLM-5, DeepSeek-V3.2, MTP, top-p in runtime)",
+    "https://arxiv.org/abs/2508.18850 - ClusterFusion (NeurIPS 2025): ClusterReduce/ClusterGather over DSMEM, fuses QKV+attention+O-proj, 1.61x on H100",
+    "https://arxiv.org/pdf/2604.23553 - ClusterFusion++: whole transformer block in cluster-level fusion",
+    "https://arxiv.org/abs/2410.23668 - Kernel Looping (SambaNova): turns repeated per-layer kernels into one pipelined loop; up to 90% of peak bandwidth on SN40L",
+    "https://arxiv.org/abs/2609.12379 - ForgeMegakernel: agent-generated per-model decode megakernels; 50.5-85.9% MBU; 1.21x over SGLang",
+    "https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html - PDL semantics: the trigger only allows the launch; cudaGridDependencySynchronize waits for full primary-grid completion and flush; overlap is opportunistic",
+    "https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_cluster_launch_control.html and https://research.colfax-intl.com/dynamic-persistent-tile-scheduling-with-cluster-launch-control-clc-on-nvidia-blackwell-gpus/ - CLC try_cancel dynamic persistent scheduling (SM100)",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:957-1250 - execute_worker: per-worker task queue, waits on dependent_event counter (ld_acquire + nanosleep), triggers event with atom_add_release, pushes ready events to scheduler queues",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:281-336 - prepare_next_batch: in-kernel step advance, token append, EOS check (multi-step decode inside one launch)",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:563-840 - MODE_ONLINE_PINNED: host<->device request and completion rings in pinned memory; the kernel stays alive and spin-waits for requests",
+    "agent_space/mirage/include/mirage/persistent_kernel/runtime_header.h:88-169 - task types incl. TASK_ARGMAX_PARTIAL/REDUCE, TASK_SAMPLING_SM100, TASK_TARGET_VERIFY_GREEDY, TASK_EAGLE3_COMMIT, TASK_MTP_* (sampling and speculative decoding as in-kernel tasks)",
+    "agent_space/mirage/include/mirage/persistent_kernel/tasks/speculative_decoding/ - prompt_lookup.cuh, target_verify.cuh, eagle3_ops.cuh, mtp_token_ops.cuh",
+    "agent_space/tpu-megakernels/qwen/decode_megakernel.py:27 - BANK_COUNT=12 (env QWEN_NB) ring of weight banks",
+    "agent_space/tpu-megakernels/qwen/decode_megakernel.py:470-536 - one global tile counter g spans all layers and the LM head; gemv waits for bank g, computes, then issues fetch(base+ti+BANK_COUNT), so weight DMA runs across op and layer boundaries",
+    "src/megabake/codegen.py:1389-1449 - table kernel: for phase in range(N): dispatch body, optional counting_grid_barrier(ready, workers, _ordinal + phase_table[phase,1]), KV length publish by block 0, sync_threads between phases in one interval",
+    "src/megabake/codegen.py:1419 - CTA rotation: _rotated = (_block + workers - phase_table[phase,2]) % workers",
+    "src/megabake/runtime.py:112-135 - counting_grid_barrier: red.release add, acquire polling (0.70 us per barrier per ROADMAP.md section 6)",
+    "src/megabake/runtime.py:304-305 - CUDA Graph capture of phase plans raises InvalidRuntime",
+    "src/megabake/bodies/gemm.py:715-735 - each GEMM phase builds a fresh PipelineTmaAsync (mbarrier init) on the shared scratch",
+    "src/megabake/bodies/gemm.py:823-893 - load warp setmaxregister_decrease, producer loop, producer_tail at 888 (pipeline drained at the end of every GEMM phase)",
+    "src/megabake/bodies/gemm.py:1711 - TABLE_GEMM_SHARED_BYTES fixed at 8 x 64x64x64 stages + 4 epilogue stages (one CTA per SM for the whole kernel)",
+    "src/megabake/bodies/gemm.py:1893-1905 - SWAP_AB_MAX_ROWS=64, SWAP_AB_ROW_TILES=(16,32,64), SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2",
+    "src/megabake/compiler.py:422 - split-K enabled only by env MEGABAKE_SPLIT_K=1",
+    "src/megabake/schedule.py:1381-1499 - _fold_small_intervals: small map/reduction runs recomputed by every CTA in the consumer interval; _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6",
+    "src/megabake/bodies/attention.py:422-423 - DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64 (split-context decode attention)",
+    "src/megabake/bodies/interface.py:13-21 - TargetFacts: architecture, warp size, threads, smem, registers, SM count, TMA/WGMMA flags; no L2 size, HBM bandwidth or clock",
+    "ROADMAP.md:114-129 - order of work; steps 9 (L2 prefetch) and 10 (events in table launch) not started; split-K built but off",
+    "ROADMAP.md:131-185 - measured state: 1.7B decode GEMMs ~1.92 ms at ~1.78 TB/s, weight floor ~1.5 ms; RMSNorm 2.8 us; decode attention ~10 us/layer; host ~360 us MegaBake + ~290 us Dynamo guards",
+    "PERFORMANCE_REPORT.md:480-494 - against CUDA Graph replay, launch removal is worth about 1 us on a 5-kernel MLP; the megakernel wins only through concurrency and fusion",
+    "artifacts/full_model_2026-10-18/HuggingFaceTB--SmolLM-1.7B/report.json - decode kernel 2974 us (MegaBake) vs 2425 us (Inductor, 458 launches); complete call 3311 us vs 10323 us; pipelined 2839 us",
+    "artifacts/full_model_2026-10-18/HuggingFaceTB--SmolLM-135M/report.json - decode kernel 1502 us vs 1382 us (Inductor, 632 launches); complete call 2138 us; pipelined 1506 us",
+    "artifacts/full_model_2026-10-18/Qwen--Qwen2-0.5B/report.json - decode kernel 1578 us vs Inductor 1650 us"
+  ],
+  "core_ideas": [
+    {
+      "idea": "1. Dependency-free weight prefetch across op boundaries (cross-op software pipelining of the weight stream)",
+      "how_it_works": "Weights are constants, so their loads never depend on the previous op. Only the activation operand needs the producer to finish. A persistent CTA that has issued all loads for its current task starts TMA/cp.async loads of the next task's weight tiles into free smem stages, or prefetches them into L2. It does this before waiting on the dependency, so the next op's pipeline is full when its activations arrive. Hazy Llama-1B: freed smem pages pass to the next instruction, whose weight loads begin while the previous instruction is still storing. TPU megakernel: a single global tile counter g covers every linear of every layer plus the LM head; gemv computes on bank g%BANK_COUNT and issues fetch(g+BANK_COUNT), so HBM is never idle across norms, RoPE and attention. MPK splits each task into pre-load and compute phases, and overlaps the next task's pre-load with the current compute once smem pages are free. ETC has an annotation-driven weight-prefetch pass. On SM90 the same thing can be done into L2 with cp.async.bulk.prefetch.L2.global.",
+      "where_in_source": "Hazy no-bubbles blog (smem paging section); agent_space/tpu-megakernels/qwen/decode_megakernel.py:470-536; MPK arXiv 2512.22219 section on cross-task pipelining; ETC arXiv 2604.13327 prefetch pass"
+    },
+    {
+      "idea": "2. Fine-grained (tile/chunk-level) dataflow dependencies instead of whole-op barriers",
+      "how_it_works": "Each consumer task waits on a counter in global memory that its own producer tiles increment (red.release / atom.add.release, polled with ld.acquire), not on a grid-wide barrier. The tail of op N therefore overlaps the head of op N+1 wherever the dependency is partial. Hazy splits the down-projection into 4 chunks with their own counters, so each chunk waits only for its slice of the gate/up output. MPK fuses events with identical producer/consumer sets (37-118x fewer events) and runs AOT tasks whose workers wait locally on counters. ETC indexes event tensors by tile coordinate, so with symbolic shapes one program covers every batch size. Independent ops (q/k/v; gate/up; attention heads) run with no barrier at all.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:1083-1110 (wait), 1155-1230 (trigger); Hazy blog 'counters'; ETC event tensor section"
+    },
+    {
+      "idea": "3. Shared-memory paging / page handoff between consecutive tasks",
+      "how_it_works": "Shared memory is carved into fixed pages: Hazy uses 13 x 16 KiB of the 213 KB on H100; MPK uses 32 KB pages, 7 per SM on H100/B200. A task acquires and releases pages explicitly, and MPK only acquires before its first release, which keeps usage monotonic. As soon as task N releases a page, task N+1 can land loads in it while task N is still computing or storing. This is the mechanism that makes idea 1 safe inside smem rather than only in L2. Without paging, each body must own the whole scratch and the next body can start only after a CTA-wide sync.",
+      "where_in_source": "Hazy no-bubbles blog; MPK paper paged shared memory section"
+    },
+    {
+      "idea": "4. Model-spanning warp specialization (persistent loader/consumer/storer/controller roles)",
+      "how_it_works": "Warp roles persist across instructions rather than per op. Loader warps run ahead into the next instruction while consumer warps finish the current matmul, and storer warps drain results and run inter-GPU communication in the background. A controller warp fetches and decodes instructions. Hazy TP measured that removing cross-instruction pipelining tripled the gap between matmul stages (3.4 us to 10.2 us) and cost 2.5-6.6% decode throughput. The TPU ring is the same idea, with the DMA engine as the loader.",
+      "where_in_source": "https://hazyresearch.stanford.edu/blog/2025-09-28-tp-llama-main; ThunderKittens LCSF template"
+    },
+    {
+      "idea": "5. On-device scheduling and load balancing (static per-SM queues, dynamic global queue, hybrid JIT/AOT, CTA rotation)",
+      "how_it_works": "Static: precomputed per-SM instruction or task lists (Hazy batch-1, MPK AOT, ETC static, MegaBake phase table). Dynamic: SMs atomically claim the next task from a global queue (Hazy TP; ETC dynamic; MPK JIT tasks dispatched by 4 scheduler SMs). Measured trade-off: dynamic wins at large or irregular batches (Hazy TP +14.2% at bs 8192; ETC MoE 1.03-1.08x) and loses at batch 1 to the atomic round trip (Hazy TP -1.9% at bs 1024, ETC dense 0.82-0.89x, and Hazy calls the queue prohibitive for the low-latency kernel). Interleaving instructions from different ops ('quilts') lets SMs left idle by small ops run other ready work. On SM100, CLC try_cancel gives hardware-assisted work stealing.",
+      "where_in_source": "persistent_kernel.cuh:957-1250 (worker), 1254+ (scheduler); ETC Tables 2-3; Hazy TP blog; CUTLASS CLC docs"
+    },
+    {
+      "idea": "6. No launch, no drain tails, no straggler waits at op boundaries",
+      "how_it_works": "In a kernel graph, every kernel boundary costs launch latency (about 1.3 us per kernel with CUDA graphs on H100 per Hazy; 0.8 us per launch with graphs on B200, about 0.2 ms per token at 293 launches, per MPK). It also costs a wave-quantization tail, because the next kernel cannot start until every block of the previous one exits, and a cold pipeline (prologue, descriptor fetch, mbarrier init, first HBM round trip ~1 us). A megakernel removes the launch cost entirely. It removes tails and cold starts only if ideas 1-3 are also present: a grid barrier per op keeps the tail and the cold start.",
+      "where_in_source": "Hazy no-bubbles blog ('stragglers', 'load latency'); MPK ablation"
+    },
+    {
+      "idea": "7. Keeping activations on chip across ops (smem/register/DSMEM residency, redundant recompute)",
+      "how_it_works": "Decode activations are tiny (hidden 576-2048 bf16 = 1-4 KB per token). Instead of a round trip through global memory between ops, each CTA can keep the normalized hidden state in smem, or recompute it locally: RMSNorm of 4 KB is cheaper than a barrier. Hazy fuses RMSNorm into QKV+RoPE and into up-gate+SiLU, and down-proj into the residual. ClusterFusion keeps per-head intermediates in cluster DSMEM across QKV, attention and O-proj using ClusterReduce/ClusterGather (1.61x end to end on H100), and ClusterFusion++ extends this to the whole block. Hazy's B200 breakdown shows why it matters: ~250 us of the 600 us forward pass is storing, checking readiness and loading activations, at ~500 ns per global round trip.",
+      "where_in_source": "Hazy no-bubbles B200 breakdown; arXiv 2508.18850; arXiv 2604.23553"
+    },
+    {
+      "idea": "8. Fused sampling/argmax and next-step embedding plus a multi-step decode loop in one launch",
+      "how_it_works": "The LM head is followed by in-kernel argmax or sampling: MPK TASK_ARGMAX_PARTIAL/REDUCE and TASK_SAMPLING(_PARTIAL)_SM100, and TileRT has top-p. The chosen token id is written to the device token buffer. prepare_next_batch then advances step, appends the token, checks EOS/max length, updates the KV page table and starts the next iteration's task graph, all inside the same launch. MPK's online-pinned mode keeps the kernel resident and exchanges requests and completions with the host through pinned-memory rings. Per-token host work (Python, Dynamo guards, argument building, launch) disappears from the critical path.",
+      "where_in_source": "persistent_kernel.cuh:281-336 (prepare_next_batch), 563-840 (online pinned rings); runtime_header.h:99-101,152,168"
+    },
+    {
+      "idea": "9. In-kernel speculative decoding loops (draft, verify, accept/commit without leaving the kernel)",
+      "how_it_works": "Draft generation (prompt-lookup n-gram, EAGLE-3 head, MTP layers, DFlash/DSpark on TPU) and greedy target verification run as tasks in the same task graph. The accepted count is written on device and prepare_next_batch advances step by accepted_count. There is no host round trip between draft and verify, which matters most when per-step latency is ~1-3 ms.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/tasks/speculative_decoding/*; runtime_header.h:102-104,134-135,156-161; agent_space/tpu-megakernels/qwen/dflash.py, kimi/dspark.py"
+    },
+    {
+      "idea": "10. Cross-layer software pipelining / kernel looping over repeated layers",
+      "how_it_works": "Layers are identical, so the schedule is one loop body with a pipelined outer loop: layer L+1's weight stream starts while layer L's attention and norms run, and per-layer barriers disappear. This is Kernel Looping on SN40L, and the TPU global tile counter g, which runs straight from layer t into layer t+1 and the LM head. It also shrinks code and table size. MegaBake fully unrolls 1,000+ phases into a table.",
+      "where_in_source": "arXiv 2410.23668; decode_megakernel.py:470-516"
+    },
+    {
+      "idea": "11. In-kernel communication overlap (multi-GPU)",
+      "how_it_works": "Storer warps or NVSHMEM tasks do all-reduce, all-gather and reduce-scatter with remote stores while the same SM's loader and consumer warps run the next instruction. MPK reports 1.1x per-iteration latency on Qwen3-1.7B 4xH100 and ETC up to 1.40x on fused GEMM+collectives. This is listed for completeness only: MegaBake is single-GPU.",
+      "where_in_source": "Hazy TP blog; MPK paper; ETC; persistent_kernel.cuh NVSHMEM event paths"
+    },
+    {
+      "idea": "12. Device-resident state updates and runtime shapes without host involvement",
+      "how_it_works": "The KV length, page table and step counter live in device memory and are updated by the kernel itself. Runtime token counts are read from device memory (MPK, ETC symbolic shapes), so one compiled kernel serves every length without host padding decisions. MegaBake already does a version of this: a device call counter, a deferred KV-length publish after the closing barrier, and a 64-entry address ring.",
+      "where_in_source": "persistent_kernel.cuh:281-516; src/megabake/codegen.py:1403-1446"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "1. Dependency-free weight prefetch across op boundaries",
+      "status": "missing",
+      "evidence": "ROADMAP.md:124 step 9 'Cross-phase L2 weight prefetch: not started'. A grep for prefetch in src/megabake finds only TMA descriptor prefetch (bodies/gemm.py:684-686). Each GEMM phase creates a new PipelineTmaAsync (bodies/gemm.py:727) and drains it with producer_tail (gemm.py:888) before the next barrier (codegen.py:1430).",
+      "notes": "Every GEMM phase starts with an empty 8-stage pipeline after a grid barrier, so each serial GEMM interval pays one HBM round trip plus pipeline fill. Weights are compile-time-known addresses in the address table, so the next phase's weight tiles are known statically: no runtime information is needed to prefetch them."
+    },
+    {
+      "idea": "2. Fine-grained dataflow dependencies",
+      "status": "partial",
+      "evidence": "Event counters exist only in the per-tensor-parameter launch (runtime.py:210-247 publish_event/wait_for_event; codegen.py _event_worker_loop at 1628). Full models use the table launch, which has grid barriers only (codegen.py:1430; ROADMAP.md:29, step 10 'not started'). Interval folding (schedule.py:1389-1499) cut 135M decode from 333 to 183 barriers; independent phases share one interval (dependency-level schedule).",
+      "notes": "Dependencies are phase-granular, not tile-granular. One barrier ends every dependency level, so the slowest CTA of each level sets the pace for all 60."
+    },
+    {
+      "idea": "3. Shared-memory paging / page handoff",
+      "status": "missing",
+      "evidence": "One static scratch region sized by TABLE_GEMM_SHARED_BYTES (bodies/gemm.py:1711) is reused by every body; phases in one interval separate scratch reuse with sync_threads (codegen.py:1446-1448). PERFORMANCE_REPORT.md:512 item 12: 214,016 bytes of GEMM smem fixes one CTA per SM for every body.",
+      "notes": "Without pages, a body cannot let the next body's loads land while it is still computing. A monotonic acquire/release page allocator in the scratch prelude (codegen.py _scratch_prelude at 2014) is the prerequisite for smem-level cross-phase pipelining. L2-level prefetch (idea 1 via cp.async.bulk.prefetch.L2) does not need it."
+    },
+    {
+      "idea": "4. Model-spanning warp specialization",
+      "status": "partial",
+      "evidence": "Warp specialization exists inside the GEMM body only: load warp, MMA warpgroups and epi-store warp, with setmaxregister_decrease/increase (bodies/gemm.py:823-895). Generic bodies (norms, pointwise, attention) use all warps. PERFORMANCE_REPORT.md:516 flags register reallocation across bodies as an unmeasured risk.",
+      "notes": "The load warp exits its loop at producer_tail at the end of every GEMM phase instead of running ahead into the next phase's weight tiles. A persistent producer warp walking a precomputed weight-tile stream (the TPU bank ring, idea 1) would remove that."
+    },
+    {
+      "idea": "5. On-device scheduling and load balancing",
+      "status": "partial",
+      "evidence": "Static table schedule with CTA rotation so concurrent phases start on different CTAs (codegen.py:1419; PERFORMANCE_REPORT.md:288). Recompute phases run on every CTA (codegen.py:1420-1423). No dynamic queue and no work stealing.",
+      "notes": "Static is the right default for batch-1 dense decode: ETC and Hazy both measured dynamic queues as slower there. The missing piece is not dynamic scheduling but letting idle CTAs do useful work (prefetch, next independent phase) while a narrow GEMM runs on 32 of 60 SMs."
+    },
+    {
+      "idea": "6. No launch, no drain tails, no straggler waits",
+      "status": "partial",
+      "evidence": "One cooperative launch per call (report.json launch_count=1 vs 458-632 for Inductor). Tails remain: 0.70 us barrier (ROADMAP.md:144) plus cold pipeline and straggler wait at about 6 barrier intervals per layer. Decode kernel GPU time is still above Inductor's summed kernels (135M 1502 vs 1382 us; 1.7B 2974 vs 2425 us).",
+      "notes": "MegaBake has the one exclusive benefit that is cheap to get (no launches) and still pays the costs a megakernel exists to remove (drain, cold start, stragglers). That is why its kernel loses to the kernel graph on GPU time."
+    },
+    {
+      "idea": "7. Keeping activations on chip across ops",
+      "status": "partial",
+      "evidence": "Interval folding recomputes small producers (norm, residual add, RoPE, SiLU-mul) in every CTA at the start of the consumer interval (schedule.py:1389-1404), Mirage rmsnorm_linear style. The results still go through global memory/L2 workspace (memory.py planner); no smem or DSMEM residency between phases; no clusters in table launches (cluster shape 1).",
+      "notes": "Recompute removes barriers but not the global round trip (~0.5-1 us per dependent load on the critical path, per Hazy's B200 breakdown). RMSNorm in the GEMM prologue reading the 4 KB hidden state once into smem, and SiLU-mul/residual in the GEMM epilogue (ROADMAP.md:79), are the next steps. The epilogue fusions alone are not megakernel-exclusive."
+    },
+    {
+      "idea": "8. Fused sampling/argmax, next-step embedding, multi-step decode loop",
+      "status": "missing",
+      "evidence": "The kernel ends at logits. Sampling and the next input id are produced by the host (fx_handler/hf_attention.py:187 returns .logits). One token per launch; CUDA Graph capture is rejected (runtime.py:304-305). Embedding is in-kernel as a generic gather phase. Host costs: MegaBake ~360 us plus Dynamo guards ~290 us per call (ROADMAP.md:142); complete call minus kernel = 636 us (135M) and 337 us (1.7B) in the 2026-10-18 reports.",
+      "notes": "The device call counter and 64-entry address ring (ROADMAP.md:142) already allow back-to-back launches without host sync ('pipelined' 1506 us vs 2138 us complete on 135M). So the host cost is hidden only when the caller does not need the token before issuing the next step, which is false for real autoregressive generation unless argmax and next embedding are on device."
+    },
+    {
+      "idea": "9. In-kernel speculative decoding",
+      "status": "missing",
+      "evidence": "No speculative code in src/megabake (grep 'speculat' finds nothing).",
+      "notes": "This depends on idea 8 (device-side token handling) and on a multi-token decode bucket (swapAB up to 64 rows already exists for the verify pass, bodies/gemm.py:1893)."
+    },
+    {
+      "idea": "10. Cross-layer software pipelining / kernel looping",
+      "status": "missing",
+      "evidence": "The phase table is fully unrolled per layer (1,000+ phases, ROADMAP.md:13); no loop structure over layers; no weight stream crossing layer boundaries.",
+      "notes": "A generic compiler can detect repeated layer subgraphs (same FX structure, parameter-indexed) and emit one loop body plus per-layer address rows. That shrinks the table and makes the next layer's prefetch a uniform rule."
+    },
+    {
+      "idea": "11. In-kernel communication overlap",
+      "status": "not_applicable",
+      "evidence": "MegaBake targets one GPU / MIG slice (README.md, ARCHITECTURE.md).",
+      "notes": "This would matter only for a future TP backend."
+    },
+    {
+      "idea": "12. Device-resident state updates and runtime shapes",
+      "status": "partial",
+      "evidence": "Device call counter and epoch ordinal (codegen.py:1403-1415); deferred KV valid-length publish by block 0 after the closing barrier (codegen.py:1432-1446); static shapes with size buckets that pad (ROADMAP.md:186-225, 'a runtime token count inside the kernel (Mirage's approach) would remove that').",
+      "notes": "Runtime token counts would let one decode kernel serve 1..64 rows and remove bucket padding waste and multi-bucket compile time."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "A. Issue the next GEMM's weight loads before the dependency wait (L2 prefetch now; smem stages later)",
+      "why_graph_cannot": "PDL lets kernel N+1 run a preamble before cudaGridDependencySynchronize, so a kernel graph can in principle prefetch weights early. In practice: (1) the secondary's CTAs need free SM resources, and with a 200+ KB-smem GEMM at one CTA/SM they become resident only as primary CTAs exit, so the overlap covers just the tail; (2) PDL chains only adjacent kernels in one stream, so it cannot prefetch two ops ahead across a norm and an attention kernel; (3) the trigger is opportunistic and the NVIDIA docs warn against relying on concurrency. A persistent CTA idle at a barrier, or one of the 28 SMs with no tile in a 32-tile projection, can stream any future op's weights into L2 or its own smem with no residency constraint.",
+      "nearest_multikernel_substitute": "PDL preamble prefetch plus cudaGraph; L2 persistence windows (cudaAccessPolicyWindow) for small models. These recover part of the tail of the immediately next kernel, and only when SMs free up."
+    },
+    {
+      "opportunity": "B. Tile-granular dependencies (event counters) replacing grid barriers",
+      "why_graph_cannot": "A kernel boundary is an all-to-all dependency: consumer block j waits for every producer block, and with PDL cudaGridDependencySynchronize waits for full primary completion and flush. Partial dependencies (down-proj K-chunk j needs only gate/up tiles of chunk j; attention head h needs only q/k/v tiles of head h; split-context merge needs only its row's chunks) cannot be expressed between kernels.",
+      "nearest_multikernel_substitute": "Fusing the pair into one kernel (FlashInfer-style fused ops, ClusterFusion) or multi-stream concurrency for fully independent ops. Both are coarse."
+    },
+    {
+      "opportunity": "C. Using SMs idled by narrow ops (wave quantization) for other ready work or prefetch",
+      "why_graph_cannot": "In decode, o-proj and down-proj of a 2048-wide model have 32 64-row tiles, which leaves 28 of 60 SMs idle. Two kernels can co-run only if launched on different streams with no dependency, and in a serial decoder chain nothing is independent except prefetch and other layers' weight streaming. Only a persistent kernel can give an idle SM 'future' work (weight prefetch, KV prefetch for attention, next independent phase) without a dependency.",
+      "nearest_multikernel_substitute": "Split-K or stream-K inside the GEMM (MegaBake measured no gain from split-K on 60 SMs); multi-stream fork/join in the graph."
+    },
+    {
+      "opportunity": "D. Persistent pipeline state across ops (no mbarrier re-init, no producer drain, warm TMA descriptors)",
+      "why_graph_cannot": "Every kernel begins with an empty smem pipeline, mbarrier init, descriptor prefetch and register allocation, and ends with producer_tail/drain. These are per-launch by construction. A megakernel can keep the producer warp running into the next phase's stages (Hazy TP: 3.4 vs 10.2 us gap between matmul stages).",
+      "nearest_multikernel_substitute": "None beyond PDL preamble (descriptor prefetch, smem init), which still waits for SM residency."
+    },
+    {
+      "opportunity": "E. On-device argmax/sampling + embedding + multi-step loop (and speculative verify) in one launch",
+      "why_graph_cannot": "CUDA graph conditional nodes (while/if, CUDA 12.4+) can loop a graph on device, so this is only partly exclusive. A graph loop still pays ~0.8-1.3 us per kernel node per step and cannot keep a kernel resident to poll host request rings (MPK online-pinned mode). For MegaBake the real comparison is its own host path: ~0.3-0.64 ms per token outside the kernel, plus Dynamo guards.",
+      "nearest_multikernel_substitute": "CUDA graph with conditional while-node and a device argmax kernel; vLLM/SGLang multi-step scheduling (amortizes host work over N steps)."
+    },
+    {
+      "opportunity": "F. Activation residency and redundant recompute without global round trips",
+      "why_graph_cannot": "Between kernels, every intermediate must go through global memory; a kernel cannot leave state in smem or registers for its successor. A megakernel can keep the 1-4 KB normalized hidden state in each CTA's smem from the norm through QKV, or in a cluster's DSMEM across QKV, attention and O-proj, and recompute instead of reloading.",
+      "nearest_multikernel_substitute": "Hand-fused kernels (rmsnorm+linear, ClusterFusion block kernel). These are per-pattern fusion, not general."
+    },
+    {
+      "opportunity": "G. Cross-layer weight streaming (one continuous HBM stream over all layers)",
+      "why_graph_cannot": "The weight stream breaks at every kernel boundary and every non-GEMM op. Only a persistent producer or an idle-SM prefetcher can keep HBM busy through norms, RoPE and attention, as the TPU bank ring does.",
+      "nearest_multikernel_substitute": "L2 prefetch in PDL preambles (one kernel ahead at most)."
+    },
+    {
+      "opportunity": "H. Not exclusive (flagged so effort is not misattributed)",
+      "why_graph_cannot": "Epilogue/prologue fusions (RMSNorm+linear, linear+residual, SiLU-mul in epilogue, fused QKV/gate-up weights, bias epilogue), swapAB small-M GEMM and split-context attention all exist in kernel-graph systems (vLLM fusion passes, cuBLAS/nvjet, FlashInfer). They are needed for parity with Inductor, but they are not reasons the megakernel can win.",
+      "nearest_multikernel_substitute": "These are the multi-kernel solution."
+    }
+  ],
+  "measured_or_reported_gains": [
+    "Hazy Llama-3.2-1B batch-1 bf16: <1 ms per forward pass on H100 (~78% of HBM bandwidth), ~2.5x vLLM and >1.5x SGLang; B200 ~600-680 us, >3.5x vLLM, >1.5x SGLang. B200 breakdown: ~250 us activation store/ready-check/load, ~200 us matvec+norm, ~30 us waiting on weights, ~40 us warp sync, ~80 us setup. Launch cost of a dummy kernel ~2.1 us on a stream, ~1.3 us in a CUDA graph (H100).",
+    "Hazy TP Llama-70B throughput megakernel on 8xH100 in Tokasaurus: 23,468 vs 19,170 tok/s vs SGLang (+22%) on 65,536 ShareGPT prompts. Ablations: cross-instruction pipelining +2.5-6.6% (gap between matmul stages 3.4 us vs 10.2 us without it); dynamic global queue +14.2% at bs 8192 but -1.9% at bs 1024; op interleaving +6.4% at bs 8192.",
+    "MPK (arXiv 2512.22219): single-GPU 1.0-1.7x vs SGLang/vLLM (largest on small models and newer GPUs); Qwen3-8B A100 bs1 14.5 -> 12.5 ms/token (bandwidth bound ~10 ms); cross-task pipelining 1.2-1.3x on Qwen3-8B final linear (B200); 293 kernels/token cost ~1.1 ms eager and ~0.2 ms with CUDA graphs (0.8 us per launch); in-kernel scheduler 0.28% of runtime; 32-47 tasks per operator.",
+    "Event Tensor Compiler (arXiv 2604.13327, 8xB200): Qwen3-30B-A3B bs1 TPOT 1.48x vLLM / 1.20x SGLang; Qwen3-32B bs1 up to 1.15x vLLM; raw kernel Qwen3-32B TP1 up to 1.13x (avg ~7%) vs vLLM. Static vs dynamic ablation (vs barrier megakernel): dense TP4 static 1.06-1.09x, dynamic 0.82-0.89x; MoE dynamic up to 1.08x. Warmup 35 s vs vLLM 123 s / SGLang 583 s.",
+    "ClusterFusion (H100): 1.61x average end-to-end decode latency vs state-of-the-art frameworks, from DSMEM fusion of QKV+attention+O-proj [uncertain: baseline mix and batch not verified].",
+    "Kernel Looping (SambaNova SN40L, not GPU): 1.6x geomean, up to 90% of peak bandwidth; vendor-reported.",
+    "ForgeMegakernel: 50.5-85.9% MBU, 1.21x geomean over SGLang 0.5.18, 1.54x over 'a megakernel compiler' [uncertain: GPU and batch not stated in abstract].",
+    "TileRT: up to 500 tok/s GLM-5-FP8 and 600 tok/s DeepSeek-V3.2 [uncertain: project-reported, conditions not given].",
+    "MegaBake's own measurements (2026-10-18, H200 MIG 3g.71gb): decode kernel 135M 1502 us vs Inductor 1382 us; 1.7B 2974 vs 2425 us; Qwen2-0.5B 1578 vs 1650 us. Complete decode call 2138 / 3311 / ~2282 us vs Inductor 11925 / 10323 / ~10178 us (Inductor's decode does not use CUDA graphs because KV caches are mutated inputs). Barrier 0.70 us; 1.7B GEMMs ~1.92 ms at ~1.78 TB/s, weight floor ~1.5 ms."
+  ],
+  "expected_impact_on_megabake": {
+    "baseline_breakdown": "SmolLM-1.7B decode kernel 2.97 ms: GEMMs ~1.92 ms (~1.78 TB/s); weight floor ~1.55 ms (3.4 GB bf16 / 2.2 TB/s); non-GEMM ~1.05 ms, of which 49 RMSNorm x 2.8 us = 0.14 ms, 24 decode attentions x ~10 us = 0.24 ms, ~150 barrier intervals x 0.7 us = ~0.1 ms, and the rest pointwise phases plus per-interval cold start and stragglers. SmolLM-135M decode kernel 1.50 ms against a 0.12 ms weight floor: almost all latency, ~183 barrier intervals (~6 per layer x 30 layers), i.e. ~8 us per interval on average. Host outside the kernel: 0.64 ms (135M) and 0.34 ms (1.7B) per synchronous call.",
+    "ranked_estimates": [
+      {
+        "rank": 1,
+        "item": "Event counters in the table launch + tile-granular dependencies (B, D partially)",
+        "decode_gain": "135M: -0.25 to -0.45 ms (17-30%); 1.7B: -0.15 to -0.3 ms (5-10%)",
+        "reasoning": "135M spends ~8 us per barrier interval for sub-microsecond work. The 0.7 us barrier is the smaller part; the straggler wait and cold start dominate. Events let independent CTAs run ahead, and the measured ETC static-event gain over a barrier megakernel is 6-9% on a bandwidth-bound dense model. On a latency-bound tiny model it is larger. Uncertain until measured with tools/phase_profile.py.",
+        "prefill_gain": "small at <=64 tokens (<5%); prefill >64 tokens is body-bound, not sync-bound"
+      },
+      {
+        "rank": 2,
+        "item": "Cross-phase weight prefetch to L2 by idle/waiting CTAs, then persistent producer into smem (A, C, G)",
+        "decode_gain": "1.7B: -0.25 to -0.45 ms (8-15%); 135M: -0.05 to -0.1 ms",
+        "reasoning": "On 1.7B, HBM is idle during ~1 ms of non-GEMM work per token and during each GEMM's pipeline fill. At 2.2 TB/s, 10 us of idle time can bring 22 MB into L2, enough for the next o-proj (8 MB) or the first half of gate/up (2 x 16 MB) within 29 MiB L2 (the MIG slice's effective L2 share is uncertain). If GEMMs reach the ~1.9-2.0 TB/s of the ROADMAP step-9 exit criterion and their cold starts disappear, GEMM time drops from 1.92 to ~1.6-1.7 ms and part of the non-GEMM time overlaps. 135M weights per layer are ~9 MB, so a whole layer fits in L2, but its kernel is latency-bound and gains little.",
+        "prefill_gain": "at 4-64 tokens similar to decode; above 64 tokens negligible until prefill GEMM/attention bodies are fixed"
+      },
+      {
+        "rank": 3,
+        "item": "On-device argmax/sampling + next-token embedding + N-step decode loop in one launch (E)",
+        "decode_gain": "End-to-end per token: 135M -0.5 to -0.64 ms (25-30% of the 2.14 ms call); 1.7B -0.3 ms (~10%). Kernel GPU time unchanged (+~5 us for argmax over the 49k vocab).",
+        "reasoning": "The pipelined vs complete-call gap (1.51 vs 2.14 ms on 135M; 2.84 vs 3.31 ms on 1.7B) is the host cost that becomes hideable only when the next token is produced on device. This is also the lever with the largest end-to-end effect against any kernel-graph baseline whose host path is slow.",
+        "prefill_gain": "first token only: ~0.3-0.6 ms off TTFT"
+      },
+      {
+        "rank": 4,
+        "item": "Persistent GEMM pipeline across phases: no mbarrier re-init or producer_tail drain; smem page handoff (D, 3)",
+        "decode_gain": "1.7B: -0.1 to -0.2 ms; 135M: -0.05 to -0.1 ms",
+        "reasoning": "There are ~5 serial GEMM intervals per layer (qkv, o, gate/up, down, plus the LM head once), i.e. ~120 cold starts on 1.7B at ~1-1.5 us each (HBM latency plus fill of 8 stages). Hazy TP measured a 3x larger inter-matmul gap without cross-instruction pipelining. This overlaps with item 2: if L2 prefetch is done, the remaining cold start is L2 latency (~0.3-0.5 us), so the incremental gain is at the low end.",
+        "prefill_gain": "few % at small buckets"
+      },
+      {
+        "rank": 5,
+        "item": "Activation residency / prologue-epilogue fusion (F, H)",
+        "decode_gain": "1.7B: -0.1 to -0.2 ms (removes ~49 RMSNorm intervals x (2.8 + 0.7) us, residual and SiLU-mul phases); 135M: -0.1 to -0.2 ms",
+        "reasoning": "Partly done via recompute folding. The remaining gain comes from avoiding global round trips and phases, not from the megakernel itself; Inductor and vLLM fuse the same ops. Required for parity.",
+        "prefill_gain": "moderate at large token counts (fewer passes over [T, hidden])"
+      },
+      {
+        "rank": 6,
+        "item": "Cross-layer looping (10)",
+        "decode_gain": "~0 direct; enables uniform prefetch rule, smaller table, faster compile",
+        "reasoning": "Value is generality and compile time (1.7B 512-token bucket takes 41 min), not runtime.",
+        "prefill_gain": "compile-time only"
+      },
+      {
+        "rank": 7,
+        "item": "Dynamic scheduling / work stealing (5)",
+        "decode_gain": "~0 or negative at batch 1 on 60 SMs",
+        "reasoning": "ETC dense: dynamic 0.82-0.89x; Hazy TP -1.9% at small batch. Shared/noisy MIG clocks could favor stealing, but that is unmeasured.",
+        "prefill_gain": "possibly positive for large prefill or MoE"
+      },
+      {
+        "rank": 8,
+        "item": "In-kernel speculative decoding (9)",
+        "decode_gain": "Model/draft dependent: 1.5-2.5x tokens per step for accepted drafts [uncertain]; needs items 3 and multi-row decode",
+        "reasoning": "Out of scope until device-side token handling exists.",
+        "prefill_gain": "n/a"
+      }
+    ],
+    "combined_target": "Items 1-5 together plausibly bring the 1.7B decode kernel from 2.97 ms to ~2.0-2.3 ms, below Inductor's 2.42 ms and near the ROADMAP step-11 target of 2.0 ms, and 135M from 1.50 ms to ~0.8-1.0 ms. These are analytical estimates with wide error bars; the noisy shared clocks (345-1980 MHz) add 10-15% measurement noise."
+  },
+  "generality_and_overfitting_risk": {
+    "idea_generality": [
+      "Weight prefetch (A/G): model-generic. Weights are graph parameters with known addresses and the consumer order is known from the phase table. How far ahead to prefetch must come from L2 size and bandwidth, not a fixed bank count; the TPU ring's BANK_COUNT=12 (decode_megakernel.py:27, env QWEN_NB) is a hand-tuned per-model constant to avoid copying.",
+      "Event counters (B): fully generic. Dependencies come from the region graph MegaBake already computes (schedule.prerequisites_for).",
+      "Multi-step/argmax (E): generic for greedy decoding of any causal LM. Sampling with temperature/top-p needs an RNG and a sort/threshold primitive; MPK and TileRT implement these as model-agnostic tasks.",
+      "Cross-layer looping: generic if repeated subgraphs are detected structurally (FX isomorphism) rather than by layer names.",
+      "Dynamic vs static scheduling: workload-dependent. The literature shows the crossover depends on batch and op irregularity, so it should be a cost-model or autotune choice."
+    ],
+    "megabake_flags": [
+      "src/megabake/bodies/gemm.py:1893-1896 SWAP_AB_MAX_ROWS=64 and SWAP_AB_ROW_TILES=(16,32,64): chosen from 60-SM measurements on the tested models; should come from WGMMA N legality plus a bandwidth/occupancy cost model or compile-time autotune per GPU.",
+      "src/megabake/bodies/gemm.py:1903-1905 SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2, and compiler.py:422 split-K off unless MEGABAKE_SPLIT_K=1: disabled because it showed 'no gain on the 60-SM slice' (ROADMAP.md:149). This is a hardware-specific conclusion baked in as a global default; on a full 132-SM H100/H200 with 32-tile projections, split-K or stream-K is likely needed. It should be decided per GEMM from tiles vs SM count and K depth.",
+      "src/megabake/bodies/gemm.py:1711 TABLE_GEMM_SHARED_BYTES fixed at 8 stages of 64x64x64 + 4 epilogue stages: tuned for SM90's 227 KB smem; forces one CTA/SM for all bodies; must derive from TargetFacts.max_shared_memory_per_cta.",
+      "src/megabake/schedule.py:1383-1386 _FOLD_FAMILIES and _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6: thresholds that trade barrier cost (0.7 us here) against redundant per-CTA work; the break-even depends on the barrier latency and SM count of the target, so they should come from a measured barrier cost and a per-CTA round cost.",
+      "src/megabake/bodies/attention.py:422-423 DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64: split-context limits likely tuned on 60 SMs and the tested head counts; should scale with SM count / (heads x rows).",
+      "src/megabake/bodies/interface.py:13-21 TargetFacts has no L2 size, HBM bandwidth, clock or barrier latency. Any prefetch-distance or fold heuristic will otherwise end up as a hard-coded constant tuned on the MIG slice. Add these (cudaDeviceProp.l2CacheSize, persistingL2CacheMaxSize, memoryBusWidth/clock, or a one-time microbenchmark cached per device).",
+      "src/megabake/plan.py:287-289 max_plans=8, max_compilations=8, timing_samples=8: the search budget is small and measurement is noisy on shared clocks; selections may differ run to run and favor the tested models' shapes.",
+      "Positive: worker counts come from target.multiprocessor_count (plan.py:503, schedule.py:336, 1378), not from a hard-coded 60."
+    ],
+    "how_references_avoid_it": "MPK derives the task count per operator from the SM count (~1 task per SM, 32-47 tasks per op) and hard-codes worker/scheduler splits per GPU (Table 1: 128+4 on H100, 144+4 on B200). That is hardware tables, not model tuning, but its builders are per model. ETC samples representative shapes at compile time and reuses the next-larger shape's queue. Hazy and TPU kernels are hand-tuned per model and GPU, so they are not a generality reference. Inductor's template heuristics key off device properties and autotune. Recommended for MegaBake: a small analytical cost model (bytes / bandwidth + phases x barrier latency + cold-start latency) with constants measured once per device by microbenchmarks, plus compile-time autotune over a few tile/split choices per distinct GEMM shape rather than per model."
+  },
+  "hardware_portability": {
+    "sm90": "Current target. TMA (cp.async.bulk.tensor) for weight stages; cp.async.bulk.prefetch.L2.global for L2 prefetch (also on SM90); WGMMA swapAB; setmaxnreg for warp specialization; thread-block clusters and DSMEM available for ClusterFusion-style residency but unused in table launches; TMA multicast across a cluster could share activation tiles.",
+    "sm100": "Same event/prefetch/multi-step design carries over. GEMM bodies change to tcgen05.mma with TMEM accumulators (MegaBake bodies/blackwell.py started), 2-CTA MMA, larger smem/L2. Cluster Launch Control gives hardware-assisted dynamic persistent scheduling (try_cancel), which could replace a software global queue if dynamic scheduling is ever wanted. Hazy notes tensor cores help batch-1 matvec on Blackwell but CUDA cores are better on Hopper, so the body choice for small-M GEMMs is per-target.",
+    "sm80": "No TMA, no WGMMA, no clusters, no PDL. Events, multi-step loops, argmax fusion and L2 prefetch (via prefetch.global.L2 or cp.async with an L2 cache hint) still work. Smem paging works with cp.async. Weight prefetch to smem must be done by producer warps with cp.async instead of TMA. MPK supports A100 (104 workers + 4 scheduler SMs).",
+    "design_rule": "Keep the runtime mechanisms (events, page allocator, prefetch issue points, device-side token loop) target-independent in the phase table and codegen. Put only the copy primitive (TMA vs cp.async vs L2 prefetch) and the MMA body behind the body-provider interface. Drive prefetch distance, fold thresholds and split decisions from TargetFacts extended with L2 size, bandwidth and barrier latency."
+  },
+  "recommended_actions": [
+    {
+      "action": "Event counters in the table launch (ROADMAP step 10): add a per-phase completion counter column to phase_table; each CTA waits only on its phase's producer counters (red.release add / ld.acquire poll, as in runtime.py publish_event/wait_for_event) instead of counting_grid_barrier; keep the static assignment and CTA rotation",
+      "expected_gain": "135M decode kernel -17 to -30%; 1.7B -5 to -10%",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/codegen.py (_emit_table_module, loop at 1417-1449), src/megabake/runtime.py, src/megabake/schedule.py (dependency levels -> per-phase producer sets), src/megabake/memory.py (workspace lifetimes can no longer end at barriers; use last-consumer counters)",
+      "prerequisite": "Workspace reuse rules that do not assume an interval-ending barrier; teacher-forced verification (exists) to catch races"
+    },
+    {
+      "action": "Cross-phase L2 weight prefetch (ROADMAP step 9): at each phase boundary, and in CTAs with no tiles in the current phase, issue cp.async.bulk.prefetch.L2 for the next K GEMM phases' weight tiles owned by this CTA, with distance chosen so the in-flight bytes stay below a fraction of L2 size",
+      "expected_gain": "1.7B decode -8 to -15% (GEMMs toward 1.9-2.0 TB/s plus overlap of non-GEMM time); 135M -3 to -7%",
+      "effort": "S-M",
+      "generality": "generic (distance hw-derived)",
+      "files_to_touch": "src/megabake/codegen.py (prefetch emission before counting_grid_barrier / event wait), src/megabake/bodies/gemm.py (expose per-CTA weight tile ranges given rotation), src/megabake/bodies/interface.py (add l2_bytes, hbm_bandwidth to TargetFacts)",
+      "prerequisite": "None for barrier-based version; it is more effective after events"
+    },
+    {
+      "action": "Device-side greedy argmax + embedding of the next token + N-step decode loop in one launch (static N, early exit on EOS); expose as megabake.generate(); later add temperature/top-p sampling task",
+      "expected_gain": "End-to-end -25 to -30% per token on 135M, ~-10% on 1.7B (host path off the critical path); enables speculative decoding later",
+      "effort": "M",
+      "generality": "generic (any causal LM via declared decode op and HF AttentionInterface)",
+      "files_to_touch": "src/megabake/fx_handler/hf_attention.py and transformers.py (DecodeStep emits argmax and loops), src/megabake/lowering.py (argmax reduction family), src/megabake/codegen.py (outer step loop over the phase table with per-step KV publish), src/megabake/runtime.py",
+      "prerequisite": "Reduction-with-index lowering (argmax); KV capacity checks on device"
+    },
+    {
+      "action": "Persistent GEMM producer across phases: initialize mbarriers once, keep phase-continuous pipeline state, let the load warp issue the next GEMM phase's weight stages before the dependency wait and the activation stage after it; add a monotonic smem page allocator so non-GEMM bodies release pages early",
+      "expected_gain": "1.7B -3 to -7%; 135M -3 to -7% (removes ~120-150 pipeline cold starts per token)",
+      "effort": "L",
+      "generality": "generic (hw-specific copy primitive behind body interface)",
+      "files_to_touch": "src/megabake/bodies/gemm.py (715-1066 pipeline lifetime, split A/B barriers so weight bytes and activation bytes complete separately), src/megabake/codegen.py (_scratch_prelude 2014, page table), src/megabake/bodies/generic.py, src/megabake/bodies/attention.py",
+      "prerequisite": "Events (step 10); otherwise the barrier still serializes"
+    },
+    {
+      "action": "RMSNorm in GEMM prologue (hidden state loaded once into smem per CTA) and residual add / SiLU-mul in GEMM epilogues (ROADMAP 4.2.3)",
+      "expected_gain": "1.7B -4 to -7%; 135M -7 to -13%",
+      "effort": "M",
+      "generality": "generic if expressed as prologue/epilogue programs from lowering, not as RMSNorm-specific matchers",
+      "files_to_touch": "src/megabake/bodies/gemm.py (epilogue program like _bias_epilogue_rejection generalized), src/megabake/regions.py, src/megabake/schedule.py",
+      "prerequisite": "None"
+    },
+    {
+      "action": "Extend TargetFacts with L2 size, HBM bandwidth, measured barrier/event latency and per-CTA round latency (one-time microbenchmark cached per device UUID/MIG profile); replace _FOLD_* thresholds, split-K on/off, DECODE_MAX_CHUNKS and swapAB cutoffs with a cost-model decision",
+      "expected_gain": "No direct gain on the slice; prevents regressions on full H100/H200/B200 (e.g. split-K needed at 132 SMs)",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/interface.py, schedule.py:1383-1386, bodies/gemm.py:1893-1905, bodies/attention.py:422-423, compiler.py:422, plan.py",
+      "prerequisite": "None"
+    },
+    {
+      "action": "Detect repeated layer subgraphs and emit a looped phase table (one body per layer kind plus per-layer address rows)",
+      "expected_gain": "Compile-time and table size; makes the prefetch rule uniform across layers; ~0 runtime",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/schedule.py, codegen.py, planner.py",
+      "prerequisite": "None"
+    },
+    {
+      "action": "Do not build a dynamic global work queue for batch-1 decode; keep it as an option evaluated by the cost model for prefill/MoE (and CLC on SM100)",
+      "expected_gain": "Avoids a 10-18% regression seen in ETC/Hazy at small batch",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "none now",
+      "prerequisite": "Events"
+    }
+  ],
+  "open_questions": [
+    "How the 1.7B/135M decode time splits inside each barrier interval between the 0.7 us barrier, straggler wait, and GEMM cold start. Settle it by extending tools/phase_profile.py to stamp per-CTA start and finish times of each phase (not only block 0 after barriers) and computing per-interval max-min skew.",
+    "Effective L2 capacity and prefetch bandwidth on the MIG 3g.71gb slice (29 MiB reported; how much is usable while other tenants run): microbenchmark cp.async.bulk.prefetch.L2 of N MB followed by timed TMA reads, sweeping N.",
+    "Whether L2 prefetch issued by idle CTAs steals HBM bandwidth from the running GEMM enough to cancel the gain: A/B test on 1.7B decode with prefetch distance 1 vs 2 phases, back to back in one process after the clock ramp.",
+    "Cold-start cost of one GEMM phase (mbarrier init + first TMA round trip + producer_tail): time a sequence of N identical tiny GEMM phases with and without a barrier in a standalone table launch.",
+    "Whether event-based waiting increases memory traffic or polling contention at 60 CTAs: compare counter polling with __nanosleep backoff vs tight acquire loops.",
+    "Whether CUDA graph conditional while-nodes over Inductor kernels would erase MegaBake's end-to-end lead once a capture-safe decode baseline exists (PERFORMANCE_REPORT.md next step 5): build the baseline before claiming multi-step looping as exclusive.",
+    "Whether split-K becomes beneficial on a full 132-SM GPU (where 32-tile projections fill only 24% of SMs): rerun the split-K A/B on a non-MIG H100/H200.",
+    "Exact MPK mechanism for overlapping a task's pre-load before its dependency event fires: the paper does not say whether pre-load starts before the event; read the hopper linear task and the worker loop in more detail."
+  ],
+  "uncertain": [
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake"
+  ]
+}

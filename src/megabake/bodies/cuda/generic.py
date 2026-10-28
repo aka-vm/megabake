@@ -3,11 +3,12 @@ from __future__ import annotations
 import re
 
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import prod
 from typing import Any, Mapping, Sequence
 
-from ..lowering import (
+from ...graph import DTYPE_BYTES
+from ...lowering import (
     AxisAffine,
     AxisIndex,
     DataIndex,
@@ -22,7 +23,7 @@ from ..lowering import (
     Unary,
     Where,
 )
-from .interface import BodyConfig, validate_body_config
+from ..interface import BodyConfig, validate_body_config
 
 
 @dataclass(frozen=True)
@@ -58,14 +59,6 @@ class GeneratedReductionBody:
     work_iterator_encoding: str = "one flat output index per CTA"
     scratch_encoding: str = "scratch[block, warp] holds one accumulator partial per warp"
     phases: tuple[str, ...] = ("thread_partial", "warp_partial", "cta_merge", "epilogue")
-    phase_descriptions: Mapping[str, str] = field(
-        default_factory=lambda: {
-            "thread_partial": "each thread accumulates bounded reduction strips",
-            "warp_partial": "lane zero stores one deterministic warp partial",
-            "cta_merge": "all threads merge warp partials in warp order",
-            "epilogue": "thread zero applies the post expression and stores",
-        }
-    )
     arguments: tuple[str, ...] = (
         "work_iterator",
         "tensor_bindings",
@@ -92,16 +85,6 @@ class GeneratedContractionBody:
         "output_tile",
         "bounded_reduction",
         "epilogue",
-    )
-    phase_descriptions: Mapping[str, str] = field(
-        default_factory=lambda: {
-            "output_tile": "each thread owns one predicated output coordinate",
-            "bounded_reduction": (
-                "the owning thread accumulates indexed products over "
-                "fixed-size reduction chunks with a tail predicate"
-            ),
-            "epilogue": "the post expression applies the final cast and store",
-        }
     )
     arguments: tuple[str, ...] = (
         "work_iterator",
@@ -239,7 +222,7 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
         "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
     trap_import = (
-        "from cutlass._mlir.dialects import llvm\n" if index_load_ids else ""
+        "from megabake.runtime import trap_if\n" if index_load_ids else ""
     )
     source = f'''import cutlass
 import cutlass.cute as cute
@@ -1068,7 +1051,8 @@ def _emit_expression(
             expression.dtype,
         )
     if isinstance(expression, Accumulator):
-        return _TypedExpression("accumulator", expression.dtype)
+        name = "accumulator" if expression.index == 0 else f"accumulator_{expression.index}"
+        return _TypedExpression(name, expression.dtype)
     if isinstance(expression, AxisIndex):
         coordinate = axis_coordinates.get(expression.axis)
         if coordinate is None:
@@ -1159,18 +1143,14 @@ def _emit_expression(
 def _gather_bounds_lines(load: Any, hoisted_names: Mapping[str, str]) -> str:
     # Out-of-range gathers trap inside the workload kernel, matching the
     # device-side assert of the eager source instead of a per-call host check.
+    # The index is per lane, so the warp votes first (see trap_if).
     lines = ""
     for position, axis in enumerate(load.axes):
         if not isinstance(axis, DataIndex) or load.source_shape is None:
             continue
         index = hoisted_names[axis.load_id]
         size = load.source_shape[position]
-        lines += (
-            f"            if {index} < 0:\n"
-            "                llvm.intr_trap()\n"
-            f"            if {index} >= {size}:\n"
-            "                llvm.intr_trap()\n"
-        )
+        lines += f"            trap_if({index} < 0 or {index} >= {size})\n"
     return lines
 
 
@@ -1339,22 +1319,8 @@ def _larger_integer(left: str, right: str) -> str:
     return left if _integer_rank(left) > _integer_rank(right) else right
 
 
-_DTYPE_BYTES = {
-    "torch.bool": 1,
-    "torch.uint8": 1,
-    "torch.int8": 1,
-    "torch.int16": 2,
-    "torch.int32": 4,
-    "torch.int64": 8,
-    "torch.float16": 2,
-    "torch.bfloat16": 2,
-    "torch.float32": 4,
-    "torch.float64": 8,
-}
-
-
 def _dtype_bytes(dtype: str) -> int:
     try:
-        return _DTYPE_BYTES[dtype]
+        return DTYPE_BYTES[dtype]
     except KeyError as error:
         raise UnsupportedReductionBody(f"unsupported dtype {dtype}") from error
