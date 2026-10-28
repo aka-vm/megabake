@@ -30,9 +30,7 @@ from megabake.runtime import (
 )
 from megabake.schedule import WorkerAssignment
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
 @cute.jit
@@ -113,6 +111,7 @@ def _launch(
 
 def _target() -> TargetFacts:
     from megabake.compiler import _target_facts
+
     return _target_facts(torch.device("cuda"))
 
 
@@ -126,9 +125,7 @@ def _plan(workers: int):
     value = torch.randn(2, 3)
     exported = torch.export.export(Model(), (value,))
     prepared = prepare_fx_graph(exported.graph_module, (value,))
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target())
     schedule = make_phase_schedule(selection, derive_dependencies(selection))
     plan = assign_storage(schedule)
@@ -144,9 +141,7 @@ def _plan(workers: int):
             ),
             barrier=None
             if phase.barrier is None
-            else replace(
-                phase.barrier, participating_workers=tuple(range(workers))
-            ),
+            else replace(phase.barrier, participating_workers=tuple(range(workers))),
         )
         for phase in plan.phases
     )
@@ -174,9 +169,7 @@ def _plan(workers: int):
 
 
 def _flat(tensor):
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
+    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
 
 
 def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
@@ -239,6 +232,8 @@ def test_phase_runtime_rejects_cuda_graph_capture():
     capture_stream = torch.cuda.Stream()
     with torch.cuda.stream(capture_stream):
         graph = torch.cuda.CUDAGraph()
-        with pytest.raises(Exception, match="CUDA Graph capture is not supported"):
-            with torch.cuda.graph(graph, stream=capture_stream):
-                execute_phase_plan(plan, kernel, capture_stream)
+        with (
+            pytest.raises(Exception, match="CUDA Graph capture is not supported"),
+            torch.cuda.graph(graph, stream=capture_stream),
+        ):
+            execute_phase_plan(plan, kernel, capture_stream)

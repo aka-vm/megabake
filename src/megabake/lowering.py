@@ -119,16 +119,7 @@ class Cast:
     rounding: str
 
 
-ScalarExpression = (
-    Constant
-    | Load
-    | Accumulator
-    | Unary
-    | AxisIndex
-    | Binary
-    | Where
-    | Cast
-)
+ScalarExpression = Constant | Load | Accumulator | Unary | AxisIndex | Binary | Where | Cast
 
 AxisExpression = str | int | AxisAffine | DataIndex
 
@@ -203,9 +194,7 @@ class UnsupportedLowering(ValueError):
     pass
 
 
-LoweringRule = Callable[
-    [torch.fx.Node, Op, ComputeGraph], TensorProgram | CanonicalProgram
-]
+LoweringRule = Callable[[torch.fx.Node, Op, ComputeGraph], TensorProgram | CanonicalProgram]
 
 
 @torch.library.custom_op(
@@ -226,8 +215,7 @@ def kv_attention(
     end = start + source.shape[1]
     if start < 0 or end > key_cache.shape[1]:
         raise RuntimeError(
-            f"KV cache length {start} plus {source.shape[1]} exceeds capacity "
-            f"{key_cache.shape[1]}"
+            f"KV cache length {start} plus {source.shape[1]} exceeds capacity {key_cache.shape[1]}"
         )
     key_cache[:, start:end].copy_(key)
     value_cache[:, start:end].copy_(value)
@@ -414,9 +402,7 @@ def _zero(dtype: str) -> Constant:
     return Constant(value=0, dtype=dtype, weak_type=False)
 
 
-def _expression_argument(
-    argument: Any, load: Load | None
-) -> ScalarExpression:
+def _expression_argument(argument: Any, load: Load | None) -> ScalarExpression:
     if isinstance(argument, torch.fx.Node):
         if load is None:
             raise UnsupportedLowering("missing tensor load for FX node argument")
@@ -460,9 +446,7 @@ def _elementwise_program(
         combine=expression,
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(domains),
     )
 
@@ -538,9 +522,7 @@ def _indexed_program(
         combine=expression,
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(domains),
     )
 
@@ -582,7 +564,10 @@ def _slice_scatter_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> 
     inside = _within(axes[dim], start, end)
     if step != 1:
         offset = Binary(
-            "sub", AxisIndex(axes[dim], "torch.int64"), Constant(start, "torch.int64"), "torch.int64"
+            "sub",
+            AxisIndex(axes[dim], "torch.int64"),
+            Constant(start, "torch.int64"),
+            "torch.int64",
         )
         on_step = Binary(
             "eq",
@@ -642,7 +627,9 @@ def _constant_pad_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> T
     expression: ScalarExpression = _value_load(load)
     if fill != 0 and inside is not None:
         # Loads outside the source read zero; other fill values need a select.
-        expression = Where(inside, expression, _typed_constant(fill, result.dtype or ""), result.dtype or "")
+        expression = Where(
+            inside, expression, _typed_constant(fill, result.dtype or ""), result.dtype or ""
+        )
     return _indexed_program(node, op, graph, (load,), expression, "shifted load with fill")
 
 
@@ -769,9 +756,7 @@ def _copy_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorPro
             raise UnsupportedLowering("copy has no tensor operand")
         return loads[0]
 
-    return _elementwise_program(
-        node, op, graph, "copy", build, "materializing copy"
-    )
+    return _elementwise_program(node, op, graph, "copy", build, "materializing copy")
 
 
 def _typed_constant(value: Any, dtype: str) -> Constant:
@@ -797,16 +782,12 @@ def _constant_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> Tenso
         combine=_typed_constant(value, result.dtype or ""),
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(domains),
     )
 
 
-def _attribute_constant_program(
-    node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> TensorProgram:
+def _attribute_constant_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     result = _result_value(op, graph)
     value = node.meta.get("val")
     scalar = value.item() if isinstance(value, torch.Tensor) else None
@@ -832,9 +813,7 @@ def _attribute_constant_program(
         combine=_typed_constant(scalar, result.dtype or ""),
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(domains),
     )
 
@@ -861,16 +840,12 @@ def _iota_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorPro
         ),
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(domains),
     )
 
 
-def _tuple_projection_program(
-    node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> TensorProgram:
+def _tuple_projection_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     result = _result_value(op, graph)
     result_index = node.args[1]
     if not isinstance(result_index, int) or not 0 <= result_index < len(op.operands):
@@ -906,6 +881,8 @@ def _tuple_projection_program(
         ),
         predicates=_predicates(domains),
     )
+
+
 def _dtype_value(dtype_name: str) -> torch.dtype:
     dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
     if not isinstance(dtype, torch.dtype):
@@ -1014,9 +991,7 @@ def _contraction_program(
         combine=combine,
         post=post,
         accumulator_dtype=accumulator_dtype,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates((*output_domains, *reduction_domains)),
     )
 
@@ -1134,14 +1109,10 @@ def _bmm_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProg
         reduction_axes=("r0",),
         loads=(left_load, right_load),
         init=_zero(accumulator_dtype),
-        combine=Binary(
-            "add", Accumulator(accumulator_dtype), product, accumulator_dtype
-        ),
+        combine=Binary("add", Accumulator(accumulator_dtype), product, accumulator_dtype),
         post=_contraction_post(accumulator_dtype, result.dtype or "", None),
         accumulator_dtype=accumulator_dtype,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates((*output_domains, reduction_domain)),
     )
 
@@ -1153,9 +1124,7 @@ def _normalized_dimension(dimension: int, rank: int) -> int:
     return normalized
 
 
-def _concat_program(
-    node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> TensorProgram:
+def _concat_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     result = _result_value(op, graph)
     if result.shape is None:
         raise UnsupportedLowering("concat result lacks a shape")
@@ -1230,9 +1199,7 @@ def _concat_program(
         combine=expression,
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(domains),
     )
 
@@ -1283,9 +1250,9 @@ def _indexed_gather_program(
         )
         for index, index_value in enumerate(index_values)
     )
-    data_axes: tuple[str | int | AxisAffine | DataIndex, ...] = tuple(
-        DataIndex(load.id) for load in index_loads
-    ) + output_axes[len(index_shape) :]
+    data_axes: tuple[str | int | AxisAffine | DataIndex, ...] = (
+        tuple(DataIndex(load.id) for load in index_loads) + output_axes[len(index_shape) :]
+    )
     data_load = IndexedLoad(
         id="gather:data",
         value_id=data.id,
@@ -1294,9 +1261,7 @@ def _indexed_gather_program(
         dtype=data.dtype or "",
         source_shape=data.shape,
     )
-    domains = tuple(
-        IterationDomain(axis, size) for axis, size in zip(output_axes, result.shape)
-    )
+    domains = tuple(IterationDomain(axis, size) for axis, size in zip(output_axes, result.shape))
     return TensorProgram(
         family="gather",
         source_target=str(node.target),
@@ -1308,16 +1273,12 @@ def _indexed_gather_program(
         combine=Load(data_load.id, data_load.dtype),
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(domains),
     )
 
 
-def _embedding_program(
-    node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> TensorProgram:
+def _embedding_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     weight = _node_value(node.args[0], graph)
     indices = _node_value(node.args[1], graph)
     return _indexed_gather_program(node, op, graph, weight, (indices,))
@@ -1347,8 +1308,7 @@ def _softmax_statistics_program(
     for result_id in op.results:
         result = graph.values[result_id]
         expected_shape = tuple(
-            1 if dimension == axis else size
-            for dimension, size in enumerate(source.shape)
+            1 if dimension == axis else size for dimension, size in enumerate(source.shape)
         )
         if result.shape != expected_shape:
             raise UnsupportedLowering("online softmax result shape does not match its axis")
@@ -1423,8 +1383,7 @@ def _reduction_program(
                 output_dimension += 1
     if keepdim:
         expected_output_shape = tuple(
-            1 if dimension in dims else size
-            for dimension, size in enumerate(source.shape)
+            1 if dimension in dims else size for dimension, size in enumerate(source.shape)
         )
     else:
         expected_output_shape = tuple(
@@ -1482,9 +1441,7 @@ def _reduction_program(
         combine=combine,
         post=post,
         accumulator_dtype=accumulator_dtype,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates((*output_domains, *reduction_domains)),
     )
 
@@ -1537,9 +1494,7 @@ def _int_tuple(value: Any, name: str, length: int, minimum: int = 1) -> tuple[in
     return values
 
 
-def _convolution_program(
-    node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> TensorProgram:
+def _convolution_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     if len(node.args) != 9:
         raise UnsupportedLowering("convolution must have nine arguments")
     input_value = _node_value(node.args[0], graph)
@@ -1639,24 +1594,18 @@ def _convolution_program(
         _cast_load(Load(weight_load.id, weight_load.dtype), accumulator_dtype),
         accumulator_dtype,
     )
-    combine = Binary(
-        "add", Accumulator(accumulator_dtype), product, accumulator_dtype
-    )
+    combine = Binary("add", Accumulator(accumulator_dtype), product, accumulator_dtype)
     post = _contraction_post(
         accumulator_dtype,
         result.dtype or "",
         bias_load,
     )
     output_domains = _domains("o", result.shape)
-    reduction_domains = (
-        IterationDomain("r0", channels_per_group * kernel_extent),
-    )
+    reduction_domains = (IterationDomain("r0", channels_per_group * kernel_extent),)
     return TensorProgram(
         family="contraction",
         source_target=str(node.target),
-        decomposition=(
-            "indexed multiply-accumulate with padding, stride, dilation, and groups"
-        ),
+        decomposition=("indexed multiply-accumulate with padding, stride, dilation, and groups"),
         iteration_domains=(*output_domains, *reduction_domains),
         reduction_axes=("r0",),
         loads=tuple(loads),
@@ -1664,9 +1613,7 @@ def _convolution_program(
         combine=combine,
         post=post,
         accumulator_dtype=accumulator_dtype,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates((*output_domains, *reduction_domains)),
     )
 
@@ -1693,9 +1640,7 @@ def _conv2d_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorP
     return _convolution_program(convolution_node, op, graph)
 
 
-def _avg_pool2d_program(
-    node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> TensorProgram:
+def _avg_pool2d_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     if not 2 <= len(node.args) <= 7:
         raise UnsupportedLowering("avg_pool2d must have two to seven arguments")
     args = list(node.args)
@@ -1773,9 +1718,7 @@ def _avg_pool2d_program(
         combine=combine,
         post=post,
         accumulator_dtype=accumulator_dtype,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates((*output_domains, *reduction_domains)),
     )
 
@@ -1817,9 +1760,7 @@ def _gather_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorP
         combine=Load(source_load.id, source_load.dtype),
         post=None,
         accumulator_dtype=None,
-        store=TensorStore(
-            result.id, result.shape, result.dtype or "", result.strides, True
-        ),
+        store=TensorStore(result.id, result.shape, result.dtype or "", result.strides, True),
         predicates=_predicates(_domains("o", result.shape)),
     )
 
@@ -1871,33 +1812,55 @@ def _kv_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> T
 
     batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
     query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine(
-        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
-    )
+    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
     loads = (
         IndexedLoad(
-            "attention:q", source.id, (batch_head, "s", query_head, "d"),
-            source.strides, source.dtype, source.shape,
+            "attention:q",
+            source.id,
+            (batch_head, "s", query_head, "d"),
+            source.strides,
+            source.dtype,
+            source.shape,
         ),
         IndexedLoad(
-            "attention:new_k", new_key.id, (batch_head, 0, kv_head, "d"),
-            new_key.strides, new_key.dtype, new_key.shape,
+            "attention:new_k",
+            new_key.id,
+            (batch_head, 0, kv_head, "d"),
+            new_key.strides,
+            new_key.dtype,
+            new_key.shape,
         ),
         IndexedLoad(
-            "attention:new_v", new_value.id, (batch_head, 0, kv_head, "d"),
-            new_value.strides, new_value.dtype, new_value.shape,
+            "attention:new_v",
+            new_value.id,
+            (batch_head, 0, kv_head, "d"),
+            new_value.strides,
+            new_value.dtype,
+            new_value.shape,
         ),
         IndexedLoad(
-            "attention:k", key_cache.id, (batch_head, "k", kv_head, "d"),
-            key_cache.strides, key_cache.dtype, key_cache.shape,
+            "attention:k",
+            key_cache.id,
+            (batch_head, "k", kv_head, "d"),
+            key_cache.strides,
+            key_cache.dtype,
+            key_cache.shape,
         ),
         IndexedLoad(
-            "attention:v", value_cache.id, (batch_head, "k", kv_head, "d"),
-            value_cache.strides, value_cache.dtype, value_cache.shape,
+            "attention:v",
+            value_cache.id,
+            (batch_head, "k", kv_head, "d"),
+            value_cache.strides,
+            value_cache.dtype,
+            value_cache.shape,
         ),
         IndexedLoad(
-            "attention:valid_length", valid_length.id, (0,),
-            valid_length.strides, valid_length.dtype, valid_length.shape,
+            "attention:valid_length",
+            valid_length.id,
+            (0,),
+            valid_length.strides,
+            valid_length.dtype,
+            valid_length.shape,
         ),
     )
     zero = Constant(0.0, "torch.float32")
@@ -1913,9 +1876,7 @@ def _kv_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> T
         capacity=capacity,
         query_length=query_length,
         key_layout=KVCacheLayout(key_cache.shape, key_cache.strides, key_cache.dtype),
-        value_layout=KVCacheLayout(
-            value_cache.shape, value_cache.strides, value_cache.dtype
-        ),
+        value_layout=KVCacheLayout(value_cache.shape, value_cache.strides, value_cache.dtype),
         storage_identity=(key_cache.id, value_cache.id),
     )
     return TensorProgram(
@@ -1934,9 +1895,7 @@ def _kv_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> T
         combine=zero,
         post=zero,
         accumulator_dtype="torch.float32",
-        store=TensorStore(
-            output.id, output.shape, output.dtype, output.strides, True
-        ),
+        store=TensorStore(output.id, output.shape, output.dtype, output.strides, True),
         predicates=(
             AxisPredicate("bh", batch * query_heads),
             AxisPredicate("s", query_length),
@@ -1981,9 +1940,7 @@ def attention_tensor_program(
     group_size = query_heads // kv_heads
     batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
     query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine(
-        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
-    )
+    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
 
     loads = (
         IndexedLoad(
@@ -2124,7 +2081,9 @@ LOWERERS: dict[Any, LoweringRule] = {
         node, op, graph, "logical_not"
     ),
     torch.ops.aten.abs.default: lambda node, op, graph: _unary_program(node, op, graph, "abs"),
-    torch.ops.aten.sigmoid.default: lambda node, op, graph: _unary_program(node, op, graph, "sigmoid"),
+    torch.ops.aten.sigmoid.default: lambda node, op, graph: _unary_program(
+        node, op, graph, "sigmoid"
+    ),
     torch.ops.aten.tanh.default: lambda node, op, graph: _unary_program(node, op, graph, "tanh"),
     torch.ops.aten.rsqrt.default: lambda node, op, graph: _unary_program(node, op, graph, "rsqrt"),
     torch.ops.aten.exp.default: lambda node, op, graph: _unary_program(node, op, graph, "exp"),
@@ -2134,8 +2093,17 @@ LOWERERS: dict[Any, LoweringRule] = {
             lambda node, op, graph, name=name: _unary_program(node, op, graph, name)
         )
         for name in (
-            "sqrt", "reciprocal", "exp2", "expm1", "log", "log1p", "log2",
-            "erf", "floor", "ceil", "trunc",
+            "sqrt",
+            "reciprocal",
+            "exp2",
+            "expm1",
+            "log",
+            "log1p",
+            "log2",
+            "erf",
+            "floor",
+            "ceil",
+            "trunc",
         )
     },
     **{
@@ -2194,7 +2162,9 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.conv2d.default: _conv2d_program,
     torch.ops.aten.avg_pool2d.default: _avg_pool2d_program,
     torch.ops.aten.gather.default: _gather_program,
-    torch.ops.aten.sum.dim_IntList: lambda node, op, graph: _reduction_program(node, op, graph, False),
+    torch.ops.aten.sum.dim_IntList: lambda node, op, graph: _reduction_program(
+        node, op, graph, False
+    ),
     torch.ops.aten.mean.dim: lambda node, op, graph: _reduction_program(node, op, graph, True),
     torch.ops.aten.sum.default: lambda node, op, graph: _reduction_program(node, op, graph, False),
     torch.ops.aten.mean.default: lambda node, op, graph: _reduction_program(node, op, graph, True),
@@ -2239,7 +2209,9 @@ def _expression_has_accumulator(expression: ScalarExpression) -> bool:
     if isinstance(expression, Unary):
         return _expression_has_accumulator(expression.operand)
     if isinstance(expression, Binary):
-        return _expression_has_accumulator(expression.lhs) or _expression_has_accumulator(expression.rhs)
+        return _expression_has_accumulator(expression.lhs) or _expression_has_accumulator(
+            expression.rhs
+        )
     if isinstance(expression, Where):
         return any(
             _expression_has_accumulator(value)
@@ -2291,9 +2263,7 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
         for axis, stride in zip(load.axes, load.strides):
             if isinstance(axis, DataIndex):
                 if axis.load_id not in load_ids:
-                    raise UnsupportedLowering(
-                        f"load {load.id} uses an unknown data index"
-                    )
+                    raise UnsupportedLowering(f"load {load.id} uses an unknown data index")
                 continue
             if isinstance(axis, AxisAffine):
                 if set(axis_references(axis)) - set(axes):
@@ -2310,11 +2280,7 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
         source_extent = 1
         for size, stride in zip(source.shape or (), source.strides or ()):
             source_extent += max(size - 1, 0) * abs(stride)
-        if (
-            program.family != "concat"
-            and source_extent
-            and maximum_address >= source_extent
-        ):
+        if program.family != "concat" and source_extent and maximum_address >= source_extent:
             raise UnsupportedLowering(f"load {load.id} may read outside its source storage")
     if _expression_loads(program.combine) - load_ids:
         raise UnsupportedLowering("combine expression uses an unknown load")
@@ -2394,20 +2360,14 @@ def _verify_state_accesses(
             raise UnsupportedLowering("KV valid-length load is bound to the wrong value")
 
 
-def _verify_canonical_program(
-    program: CanonicalProgram, op: Op, graph: ComputeGraph
-) -> None:
+def _verify_canonical_program(program: CanonicalProgram, op: Op, graph: ComputeGraph) -> None:
     if len(program.result_roles) != len(op.results):
         raise UnsupportedLowering("canonical result roles do not match results")
     if len(set(program.result_roles)) != len(program.result_roles):
         raise UnsupportedLowering("canonical program has duplicate result roles")
     if program.family == "concat":
         operands = program.semantics.get("operands")
-        if (
-            not isinstance(operands, tuple)
-            or not operands
-            or not set(operands) <= set(op.operands)
-        ):
+        if not isinstance(operands, tuple) or not operands or not set(operands) <= set(op.operands):
             raise UnsupportedLowering("concat semantics do not match its operands")
     elif program.family == "gather":
         operand_ids = set(op.operands)
@@ -2430,9 +2390,7 @@ def _verify_canonical_program(
         raise UnsupportedLowering(f"unknown canonical family {program.family}")
 
 
-def _verify_program(
-    program: TensorProgram | CanonicalProgram, op: Op, graph: ComputeGraph
-) -> None:
+def _verify_program(program: TensorProgram | CanonicalProgram, op: Op, graph: ComputeGraph) -> None:
     if isinstance(program, TensorProgram):
         _verify_tensor_program(program, op, graph)
     else:
@@ -2475,8 +2433,7 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
             except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
                 tensor_program = None
                 reason = (
-                    f"lowering rule failed for FX target {target}: "
-                    f"{type(error).__name__}: {error}"
+                    f"lowering rule failed for FX target {target}: {type(error).__name__}: {error}"
                 )
         known = tensor_program is not None
         lowered_ops[op_id] = replace(
@@ -2540,9 +2497,7 @@ def canonicalize_semantics(graph: ComputeGraph) -> ComputeGraph:
             "canonical": canonical,
             "result_roles": result_roles,
         }
-        canonical_ops[op_id] = replace(
-            operation, numerical_rules=numerical_rules
-        )
+        canonical_ops[op_id] = replace(operation, numerical_rules=numerical_rules)
     canonicalized = replace(lowered, ops=canonical_ops)
     from .graph import verify_compute_graph
 
@@ -2552,8 +2507,7 @@ def canonicalize_semantics(graph: ComputeGraph) -> ComputeGraph:
 
 def semantic_coverage(graph: ComputeGraph) -> dict[str, int]:
     canonical = sum(
-        bool(operation.numerical_rules.get("canonical"))
-        for operation in graph.ops.values()
+        bool(operation.numerical_rules.get("canonical")) for operation in graph.ops.values()
     )
     known = sum(operation.tensor_program is not None for operation in graph.ops.values())
     return {
@@ -2568,11 +2522,13 @@ def dump_lowering_graph(graph: ComputeGraph, path: str | Path) -> Path:
     known = coverage["canonical"] + coverage["generic"]
     lines = [
         "# LoweringGraph",
-        f"values={len(graph.values)} operations={len(graph.ops)} "
-        f"known={known} unknown={len(graph.ops) - known} "
-        f"canonical={coverage['canonical']} generic={coverage['generic']} "
-        f"unresolved={coverage['unresolved']} "
-        f"inputs={len(graph.inputs)} outputs={len(graph.outputs)}",
+        (
+            f"values={len(graph.values)} operations={len(graph.ops)} "
+            f"known={known} unknown={len(graph.ops) - known} "
+            f"canonical={coverage['canonical']} generic={coverage['generic']} "
+            f"unresolved={coverage['unresolved']} "
+            f"inputs={len(graph.inputs)} outputs={len(graph.outputs)}"
+        ),
         "",
         "## Operations",
     ]

@@ -70,15 +70,15 @@ def form_regions(graph: ComputeGraph) -> ComputeGraph:
 
 def dump_region_graph(graph: ComputeGraph, path: str | Path) -> Path:
     operation_regions = {
-        operation_id: region
-        for region in graph.regions
-        for operation_id in region.source_op_ids
+        operation_id: region for region in graph.regions for operation_id in region.source_op_ids
     }
     lines = [
         "# RegionGraph",
-        f"values={len(graph.values)} operations={len(graph.ops)} "
-        f"regions={len(graph.regions)} inputs={len(graph.inputs)} "
-        f"outputs={len(graph.outputs)}",
+        (
+            f"values={len(graph.values)} operations={len(graph.ops)} "
+            f"regions={len(graph.regions)} inputs={len(graph.inputs)} "
+            f"outputs={len(graph.outputs)}"
+        ),
         "",
         "## Regions",
     ]
@@ -189,9 +189,7 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
     return {tail: tuple(values) for tail, values in candidates.items()}
 
 
-def _declared_attention_candidate(
-    operation: Op, graph: ComputeGraph
-) -> RegionCandidate | None:
+def _declared_attention_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | None:
     """``megabake::attention``: the model declares its attention, so the
     region needs no pattern matching and no layout inference."""
     if not _matches_target(operation, "megabake.attention.default"):
@@ -254,9 +252,7 @@ def _declared_attention_candidate(
     )
 
 
-def _stateful_attention_candidate(
-    operation: Op, graph: ComputeGraph
-) -> RegionCandidate | None:
+def _stateful_attention_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | None:
     if not _matches_target(operation, "megabake.kv_attention.default"):
         return None
     program = operation.tensor_program
@@ -292,8 +288,7 @@ def _stateful_attention_candidate(
                 "query_heads": loads["attention:q"].source_shape[2],
                 "kv_heads": loads["attention:k"].source_shape[2],
                 "group_size": (
-                    loads["attention:q"].source_shape[2]
-                    // loads["attention:k"].source_shape[2]
+                    loads["attention:q"].source_shape[2] // loads["attention:k"].source_shape[2]
                 ),
                 "head_dim": loads["attention:q"].source_shape[3],
             },
@@ -352,23 +347,21 @@ def _scalar_fusion_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
         rejections.append("source effects do not fit a vector-chain body")
     if any(
         operation.results[0] in graph.outputs
-        or any(
-            user not in operation_ids
-            for user in graph.values[operation.results[0]].users
-        )
+        or any(user not in operation_ids for user in graph.values[operation.results[0]].users)
         for operation in operations[:-1]
     ):
         rejections.append("an intermediate value has an external use")
     if not all(
-        _same_chain_layout(operation.results[0], tail.results[0], graph)
-        for operation in operations
+        _same_chain_layout(operation.results[0], tail.results[0], graph) for operation in operations
     ):
         rejections.append("source ownership or broadcast contract changes")
 
     fused_program = _compose_scalar_chain(operations, graph)
-    external_inputs = tuple(
-        load.value_id for load in fused_program.loads
-    ) if fused_program is not None else _external_inputs(operations, graph)
+    external_inputs = (
+        tuple(load.value_id for load in fused_program.loads)
+        if fused_program is not None
+        else _external_inputs(operations, graph)
+    )
     return RegionCandidate(
         id=f"region:{tail.id.removeprefix('op:')}:fused",
         source_op_ids=tuple(operation.id for operation in operations),
@@ -383,8 +376,7 @@ def _scalar_fusion_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
             "conversion_cost_bytes": 0,
         },
         cost_bytes=sum(
-            _value_bytes(operation.results[0], graph) * 2
-            for operation in operations[:-1]
+            _value_bytes(operation.results[0], graph) * 2 for operation in operations[:-1]
         ),
         rejections=tuple(rejections),
     )
@@ -422,9 +414,7 @@ def _is_scalar_operation(operation: Op) -> bool:
     }
 
 
-def _compose_scalar_chain(
-    chain: tuple[Op, ...], graph: ComputeGraph
-) -> TensorProgram | None:
+def _compose_scalar_chain(chain: tuple[Op, ...], graph: ComputeGraph) -> TensorProgram | None:
     tail = chain[-1]
     tail_program = tail.tensor_program
     if not isinstance(tail_program, TensorProgram):
@@ -457,9 +447,7 @@ def _compose_scalar_chain(
                 )
                 leaf_ids[load.value_id] = leaf_id
             replacements[load.id] = Load(leaf_id, load.dtype)
-        expressions[operation.results[0]] = _substitute_loads(
-            program.combine, replacements
-        )
+        expressions[operation.results[0]] = _substitute_loads(program.combine, replacements)
 
     return replace(
         tail_program,
@@ -529,8 +517,7 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
         return None
 
     output_domains = tuple(
-        IterationDomain(f"o{index}", size)
-        for index, size in enumerate(tail_value.shape)
+        IterationDomain(f"o{index}", size) for index, size in enumerate(tail_value.shape)
     )
     reduction_domain = IterationDomain("r0", x_value.shape[-1])
     output_axes = tuple(domain.axis for domain in output_domains)
@@ -549,16 +536,12 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
         leaf_loads.append(load)
         return Load(load.id, load.dtype)
 
-    x_reduction_load = leaf_load(
-        x_id, (*output_axes[:-1], reduction_domain.axis)
-    )
+    x_reduction_load = leaf_load(x_id, (*output_axes[:-1], reduction_domain.axis))
     x_post_load = leaf_load(x_id, output_axes)
     weight_reduction_load = (
         leaf_load(weight_id, (reduction_domain.axis,)) if weight_id is not None else None
     )
-    weight_post_load = (
-        leaf_load(weight_id, output_axes[-1:]) if weight_id is not None else None
-    )
+    weight_post_load = leaf_load(weight_id, output_axes[-1:]) if weight_id is not None else None
     residual_id = None
     if (
         tail.tensor_program is not None
@@ -568,11 +551,7 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
         for operand_id in tail.operands:
             if operand_id != operations[-2].results[0]:
                 residual_id = operand_id
-    residual_load = (
-        leaf_load(residual_id, output_axes)
-        if residual_id is not None
-        else None
-    )
+    residual_load = leaf_load(residual_id, output_axes) if residual_id is not None else None
 
     expressions: dict[str, ScalarExpression] = {}
     post_expressions: dict[str, ScalarExpression] = {}
@@ -607,17 +586,13 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
                 if load.value_id in x_expression_ids:
                     expression = x_post_load if after_mean else x_reduction_load
                 elif weight_reduction_load is not None and load.value_id == weight_id:
-                    expression = (
-                        weight_post_load if after_mean else weight_reduction_load
-                    )
+                    expression = weight_post_load if after_mean else weight_reduction_load
                 elif residual_load is not None and load.value_id == residual_id:
                     expression = residual_load
                 else:
                     return None
             replacements[load.id] = expression
-        target_expressions[operation.results[0]] = _substitute_loads(
-            program.combine, replacements
-        )
+        target_expressions[operation.results[0]] = _substitute_loads(program.combine, replacements)
 
     program = TensorProgram(
         family="reduction",
@@ -674,10 +649,7 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
             "residual": residual_id,
             "source_casts": source_casts,
         },
-        cost_bytes=sum(
-            _value_bytes(operation.results[0], graph)
-            for operation in operations[:-1]
-        ),
+        cost_bytes=sum(_value_bytes(operation.results[0], graph) for operation in operations[:-1]),
         rejections=tuple(rejections),
     )
 
@@ -691,9 +663,7 @@ def _rms_norm_chain(
     if len(mean_program.reduction_axes) != 1:
         return None
     pow_operation = _producer(mean.operands[0], graph)
-    if pow_operation is None or not _matches_target(
-        pow_operation, "aten.pow.Tensor_Scalar"
-    ):
+    if pow_operation is None or not _matches_target(pow_operation, "aten.pow.Tensor_Scalar"):
         return None
     cast_operation = _producer(pow_operation.operands[0], graph)
     if cast_operation is not None and _matches_target(
@@ -706,8 +676,7 @@ def _rms_norm_chain(
 
     add = _sole_user(mean, graph)
     if add is None or not (
-        _matches_target(add, "aten.add.Scalar")
-        or _matches_target(add, "aten.add.Tensor")
+        _matches_target(add, "aten.add.Scalar") or _matches_target(add, "aten.add.Tensor")
     ):
         return None
     rsqrt = _sole_user(add, graph)
@@ -725,8 +694,7 @@ def _rms_norm_chain(
         if (
             user is not None
             and _matches_target(user, "prims.convert_element_type.default")
-            and graph.values[user.operands[0]].dtype
-            != graph.values[user.results[0]].dtype
+            and graph.values[user.operands[0]].dtype != graph.values[user.results[0]].dtype
         ):
             return user
         return None
@@ -775,9 +743,7 @@ def _rms_norm_chain(
         residual = None
     else:
         residual_id = next(
-            operand_id
-            for operand_id in residual.operands
-            if operand_id != tail.results[0]
+            operand_id for operand_id in residual.operands if operand_id != tail.results[0]
         )
         if (
             residual_id not in graph.inputs
@@ -892,7 +858,11 @@ def _rotate_half_rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandid
         return None
     if any(
         len(program.iteration_domains) != rank
-        for program in (x_multiply.tensor_program, rotate_multiply.tensor_program, add.tensor_program)
+        for program in (
+            x_multiply.tensor_program,
+            rotate_multiply.tensor_program,
+            add.tensor_program,
+        )
     ):
         return None
 
@@ -908,7 +878,9 @@ def _rotate_half_rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandid
     leaf_loads: list[IndexedLoad] = []
     leaf_ids: dict[tuple[str, tuple[Any, ...]], str] = {}
 
-    def leaf(value_id: str, axes: tuple[Any, ...], strides: tuple[int, ...], dtype: str, shape) -> Load:
+    def leaf(
+        value_id: str, axes: tuple[Any, ...], strides: tuple[int, ...], dtype: str, shape
+    ) -> Load:
         key = (value_id, axes)
         if key not in leaf_ids:
             leaf_ids[key] = f"load:{len(leaf_loads)}"
@@ -931,7 +903,11 @@ def _rotate_half_rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandid
                 axis in output_axes or isinstance(axis, int) for axis in load.axes
             ):
                 replacements[load.id] = leaf(
-                    load.value_id, tuple(load.axes), tuple(load.strides), load.dtype, load.source_shape
+                    load.value_id,
+                    tuple(load.axes),
+                    tuple(load.strides),
+                    load.dtype,
+                    load.source_shape,
                 )
             else:
                 return None
@@ -1013,11 +989,7 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
     if not isinstance(program, TensorProgram):
         return None
     concat_axis = next(
-        (
-            index
-            for index, axis in enumerate(program.loads[0].axes)
-            if isinstance(axis, AxisAffine)
-        ),
+        (index for index, axis in enumerate(program.loads[0].axes) if isinstance(axis, AxisAffine)),
         None,
     )
     if concat_axis != len(graph.values[concat.results[0]].shape or ()) - 1:
@@ -1057,9 +1029,7 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
     trig_ids = tuple(value_id for value_id, count in roots.items() if count == 2)
     cos_id, sin_id = trig_ids
     if any(
-        (
-            producer := _producer(root_id, graph)
-        ) is not None
+        (producer := _producer(root_id, graph)) is not None
         and _matches_target(producer, "prims.convert_element_type.default")
         for root_id in roots
     ):
@@ -1090,10 +1060,7 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
     rank = len(output.shape)
     rotary_width = cos.shape[-1]
     half_width = rotary_width // 2
-    if any(
-        cos.shape[index] != output.shape[index]
-        for index in range(len(cos.shape) - 1)
-    ):
+    if any(cos.shape[index] != output.shape[index] for index in range(len(cos.shape) - 1)):
         return None
 
     output_axes = tuple(f"o{index}" for index in range(rank))
@@ -1119,11 +1086,7 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
         key = (root_id, offset)
         if key not in load_ids:
             load_ids[key] = f"load:{len(loads_list)}"
-            axis = (
-                final_axis
-                if offset == 0
-                else AxisAffine((AxisTerm(final_axis),), offset=offset)
-            )
+            axis = final_axis if offset == 0 else AxisAffine((AxisTerm(final_axis),), offset=offset)
             loads_list.append(
                 IndexedLoad(
                     load_ids[key],
@@ -1138,9 +1101,7 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
 
     branch_loads = []
     for multiply, branch_start in zip(multiplies, (0, 0, half_width, half_width)):
-        operands = tuple(
-            operand_load(operand_id, branch_start) for operand_id in multiply.operands
-        )
+        operands = tuple(operand_load(operand_id, branch_start) for operand_id in multiply.operands)
         if any(operand is None for operand in operands):
             return None
         branch_loads.append(operands)
@@ -1256,9 +1217,7 @@ def _attention_head_axes(value: Any) -> tuple[int, ...]:
         return ()
     head_stride = value.shape[3] * value.strides[3]
     return tuple(
-        axis
-        for axis in (2, 1)
-        if value.strides[axis] == head_stride or value.shape[axis] == 1
+        axis for axis in (2, 1) if value.strides[axis] == head_stride or value.shape[axis] == 1
     )
 
 
@@ -1328,9 +1287,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
         or len(score_program.loads) != 2
     ):
         return None
-    softmax_input = (
-        score_add.results[0] if score_add is not None else scale_operation.results[0]
-    )
+    softmax_input = score_add.results[0] if score_add is not None else scale_operation.results[0]
     softmax_input_cast = _producer(score_value, graph)
     if (
         softmax_input_cast is not None
@@ -1370,9 +1327,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     group_size = query_heads // kv_heads
     batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
     query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine(
-        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
-    )
+    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
     q_load = IndexedLoad(
         "attention:q",
         q_root,
@@ -1422,9 +1377,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     probability_path = _producer_path(value_program.loads[0].value_id, division, graph)
     if probability_path is None:
         return None
-    boundary_output, output_path = _boundary_output_path(
-        value_bmm.results[0], graph
-    )
+    boundary_output, output_path = _boundary_output_path(value_bmm.results[0], graph)
     operations = _ordered_operations(
         (
             *q_path,
@@ -1543,11 +1496,7 @@ def _producer_until(
 def _cache_effects(key_root: str, value_root: str, graph: ComputeGraph) -> dict[str, object]:
     key_state, key_append = _cache_access(key_root, graph)
     value_state, value_append = _cache_access(value_root, graph)
-    updates = tuple(
-        value_id
-        for value_id in (key_root, value_root)
-        if value_id in graph.outputs
-    )
+    updates = tuple(value_id for value_id in (key_root, value_root) if value_id in graph.outputs)
     if updates:
         policy = "functional_append"
     elif _in_place_cache_update((key_state, value_state, key_root, value_root), graph):
@@ -1557,9 +1506,7 @@ def _cache_effects(key_root: str, value_root: str, graph: ComputeGraph) -> dict[
     return {
         "reads": (key_state, value_state),
         "appends": tuple(
-            value_id
-            for value_id in (key_append, value_append)
-            if value_id is not None
+            value_id for value_id in (key_append, value_append) if value_id is not None
         ),
         "updates": updates,
         "policy": policy,
@@ -1626,11 +1573,7 @@ def _softmax_operations(
     if not _matches_target(division, "aten.div.Tensor") or len(division.operands) != 2:
         return None
     exponential = _producer(division.operands[0], graph)
-    subtraction = (
-        _producer(exponential.operands[0], graph)
-        if exponential is not None
-        else None
-    )
+    subtraction = _producer(exponential.operands[0], graph) if exponential is not None else None
     if (
         exponential is None
         or subtraction is None
@@ -1647,15 +1590,18 @@ def _softmax_operations(
         and exponential.operands == (subtraction.results[0],)
         and _producer(division.operands[1], graph) is not None
         and _matches_target(_producer(division.operands[1], graph), "aten.sum.dim_IntList")
-        and _producer(_producer(division.operands[1], graph).operands[0], graph)
-        is exponential
+        and _producer(_producer(division.operands[1], graph).operands[0], graph) is exponential
     ):
-        return "stable_softmax", subtraction.operands[0], (
-            maximum,
-            subtraction,
-            exponential,
-            _producer(division.operands[1], graph),
-            division,
+        return (
+            "stable_softmax",
+            subtraction.operands[0],
+            (
+                maximum,
+                subtraction,
+                exponential,
+                _producer(division.operands[1], graph),
+                division,
+            ),
         )
 
     maximum_projection = _producer(subtraction.operands[1], graph)
@@ -1679,13 +1625,17 @@ def _softmax_operations(
         or exponential.operands != (subtraction.results[0],)
     ):
         return None
-    return "online_softmax", subtraction.operands[0], (
-        statistics,
-        maximum_projection,
-        sum_projection,
-        subtraction,
-        exponential,
-        division,
+    return (
+        "online_softmax",
+        subtraction.operands[0],
+        (
+            statistics,
+            maximum_projection,
+            sum_projection,
+            subtraction,
+            exponential,
+            division,
+        ),
     )
 
 
@@ -1751,9 +1701,7 @@ def _producer_path_until(
     return None
 
 
-def _boundary_output_path(
-    value_id: str, graph: ComputeGraph
-) -> tuple[str, tuple[Op, ...]]:
+def _boundary_output_path(value_id: str, graph: ComputeGraph) -> tuple[str, tuple[Op, ...]]:
     operations: list[Op] = []
     current = value_id
     while current not in graph.outputs:
@@ -1810,15 +1758,10 @@ def _value_root(value_id: str, graph: ComputeGraph) -> str:
         value_id = operation.operands[0]
 
 
-def _value_root_path(
-    value_id: str, graph: ComputeGraph
-) -> tuple[str, tuple[Op, ...]]:
+def _value_root_path(value_id: str, graph: ComputeGraph) -> tuple[str, tuple[Op, ...]]:
     operations: list[Op] = []
     current = value_id
-    while (
-        graph.values[current].shape is None
-        or len(graph.values[current].shape) != 4
-    ):
+    while graph.values[current].shape is None or len(graph.values[current].shape) != 4:
         operation = _producer(current, graph)
         program = operation.tensor_program if operation is not None else None
         if (
@@ -1866,9 +1809,7 @@ def _score_expression(
         Cast(Load(k_load.id, k_load.dtype), dtype, rounding),
         dtype,
     )
-    scaled = Binary(
-        "mul", product, Constant(_scalar_operand(scale_operation, 1), dtype), dtype
-    )
+    scaled = Binary("mul", product, Constant(_scalar_operand(scale_operation, 1), dtype), dtype)
     if mask_value is None:
         return scaled
     mask = _mask_semantics(mask_value, dtype, graph)
@@ -1878,9 +1819,7 @@ def _score_expression(
     return Binary("add", scaled, Cast(mask_expression, dtype, rounding), dtype)
 
 
-def _mask_semantics(
-    value_id: str, dtype: str, graph: ComputeGraph
-) -> dict[str, object]:
+def _mask_semantics(value_id: str, dtype: str, graph: ComputeGraph) -> dict[str, object]:
     operation = _producer(value_id, graph)
     if operation is not None and _matches_target(operation, "aten.where.self"):
         program = operation.tensor_program
@@ -2015,8 +1954,7 @@ def _comparison_offset(condition: Op, graph: ComputeGraph) -> int | None:
         return None
     offset = _producer(program.loads[1].value_id, graph)
     if offset is None or not (
-        _matches_target(offset, "aten.add.Tensor")
-        or _matches_target(offset, "aten.sub.Tensor")
+        _matches_target(offset, "aten.add.Tensor") or _matches_target(offset, "aten.sub.Tensor")
     ):
         return None
     value = _scalar_operand(offset, 1)
@@ -2041,9 +1979,7 @@ def _cast_rounding_for(dtype: str) -> str:
 def _ordered_operations(operations: tuple[Op, ...], graph: ComputeGraph) -> tuple[Op, ...]:
     by_id = {operation.id: operation for operation in operations}
     return tuple(
-        operation
-        for operation_id, operation in graph.ops.items()
-        if operation_id in by_id
+        operation for operation_id, operation in graph.ops.items() if operation_id in by_id
     )
 
 
@@ -2077,9 +2013,7 @@ def _transitive_operations(operation: Op, graph: ComputeGraph) -> tuple[Op, ...]
             continue
         operation_ids.add(producer.id)
         frontier.extend(producer.operands)
-    return tuple(
-        candidate for candidate in graph.ops.values() if candidate.id in operation_ids
-    )
+    return tuple(candidate for candidate in graph.ops.values() if candidate.id in operation_ids)
 
 
 def _rope_operations(
@@ -2097,9 +2031,7 @@ def _rope_operations(
             continue
         operation_ids.add(producer.id)
         frontier.extend(producer.operands)
-    return tuple(
-        candidate for candidate in graph.ops.values() if candidate.id in operation_ids
-    )
+    return tuple(candidate for candidate in graph.ops.values() if candidate.id in operation_ids)
 
 
 def _last_axis_slice(value_id: str, graph: ComputeGraph) -> tuple[str, int] | None:
@@ -2124,7 +2056,7 @@ def _last_axis_slice(value_id: str, graph: ComputeGraph) -> tuple[str, int] | No
             arguments = tuple(producer.attributes.get("fx_args", ()))
             dimension, slice_start, _, step = (
                 *arguments[1:5],
-                *(0, 0, None, 1)[len(arguments[1:5]):],
+                *(0, 0, None, 1)[len(arguments[1:5]) :],
             )
             slice_start = 0 if slice_start is None else slice_start
             if (
@@ -2163,7 +2095,10 @@ def _gated_mlp_candidate(graph: ComputeGraph) -> RegionCandidate | None:
         if not isinstance(program.combine, Binary) or program.combine.operator != "mul":
             continue
         value_by_load = {load.id: load.value_id for load in program.loads}
-        operands = [value_by_load.get(_load_id(program.combine.lhs)), value_by_load.get(_load_id(program.combine.rhs))]
+        operands = [
+            value_by_load.get(_load_id(program.combine.lhs)),
+            value_by_load.get(_load_id(program.combine.rhs)),
+        ]
         if any(operand is None for operand in operands):
             continue
         activation_id = None
@@ -2201,11 +2136,7 @@ def _gated_mlp_candidate(graph: ComputeGraph) -> RegionCandidate | None:
         if gate_producer_id is None:
             continue
         gate = graph.ops[gate_producer_id]
-        if (
-            not activation_operations
-            or not _is_contraction(gate)
-            or not _is_contraction(up)
-        ):
+        if not activation_operations or not _is_contraction(gate) or not _is_contraction(up):
             continue
         gate_program = gate.tensor_program
         up_program = up.tensor_program
@@ -2245,9 +2176,7 @@ def _gated_mlp_candidate(graph: ComputeGraph) -> RegionCandidate | None:
         paired_output_bytes = 0 if not external_outputs else separate_output_bytes
         packing_cost_bytes = output_elements * element_bytes
         conversion_cost_bytes = (
-            0
-            if _same_strides(gate.results[0], up.results[0], graph)
-            else separate_output_bytes
+            0 if _same_strides(gate.results[0], up.results[0], graph) else separate_output_bytes
         )
         scalar_saved_bytes = sum(
             _value_bytes(operation.results[0], graph) * 2
@@ -2258,9 +2187,7 @@ def _gated_mlp_candidate(graph: ComputeGraph) -> RegionCandidate | None:
             id=f"region:{multiply.id.removeprefix('op:')}:gated_mlp",
             source_op_ids=source_op_ids,
             external_inputs=_external_inputs(operations, graph),
-            live_outputs=tuple(
-                dict.fromkeys((multiply.results[0], *external_outputs))
-            ),
+            live_outputs=tuple(dict.fromkeys((multiply.results[0], *external_outputs))),
             tensor_program=None,
             semantic_facts={
                 "family": "gated_mlp",
@@ -2270,11 +2197,11 @@ def _gated_mlp_candidate(graph: ComputeGraph) -> RegionCandidate | None:
                 "activation": activation.id,
                 "combine": multiply.id,
                 "secondary_outputs": external_outputs,
-                "effects": tuple(
-                    (operation.id, operation.effects) for operation in operations
-                ),
+                "effects": tuple((operation.id, operation.effects) for operation in operations),
                 "separate_work_bytes": separate_output_bytes + scalar_saved_bytes,
-                "paired_work_bytes": paired_output_bytes + packing_cost_bytes + conversion_cost_bytes,
+                "paired_work_bytes": paired_output_bytes
+                + packing_cost_bytes
+                + conversion_cost_bytes,
                 "packing_cost_bytes": packing_cost_bytes,
                 "conversion_cost_bytes": conversion_cost_bytes,
                 "scalar_fusion_saved_bytes": scalar_saved_bytes,
@@ -2335,14 +2262,14 @@ def _matches_operation(operation: Op, name_prefix: str, family: str) -> bool:
 
 
 def _has_illegal_effects(operation: Op) -> bool:
-    return bool(
-        operation.effects.get("unknown")
-        or operation.effects.get("mutates_inputs")
-    )
+    return bool(operation.effects.get("unknown") or operation.effects.get("mutates_inputs"))
 
 
 def _is_contraction(operation: Op) -> bool:
-    return isinstance(operation.tensor_program, TensorProgram) and operation.tensor_program.family == "contraction"
+    return (
+        isinstance(operation.tensor_program, TensorProgram)
+        and operation.tensor_program.family == "contraction"
+    )
 
 
 def _external_outputs(operations: tuple[Op, ...], graph: ComputeGraph) -> tuple[str, ...]:
@@ -2406,9 +2333,7 @@ def _semantic_facts(operation: Op, graph: ComputeGraph) -> dict[str, object]:
             "view_source": view_load.value_id,
             "contraction_index_map": contraction_map,
             "view_index_map": view_map,
-            "composed_index_map": _compose_index_maps(
-                load.axes, view_load.axes, view_load.strides
-            ),
+            "composed_index_map": _compose_index_maps(load.axes, view_load.axes, view_load.strides),
             "materialization": "none",
             "alias": True,
         }
@@ -2432,9 +2357,7 @@ def _producing_view(value_id: str, graph: ComputeGraph) -> Op | None:
     return operation
 
 
-def _index_map(
-    axes: tuple[str | int, ...], strides: tuple[int, ...]
-) -> dict[str, object]:
+def _index_map(axes: tuple[str | int, ...], strides: tuple[int, ...]) -> dict[str, object]:
     return {
         "terms": tuple(
             {"axis": axis, "stride": stride}
@@ -2442,9 +2365,7 @@ def _index_map(
             if not isinstance(axis, int) or axis != 0
         ),
         "offset": sum(
-            axis * stride
-            for axis, stride in zip(axes, strides)
-            if isinstance(axis, int)
+            axis * stride for axis, stride in zip(axes, strides) if isinstance(axis, int)
         ),
     }
 
@@ -2483,14 +2404,10 @@ def _verify_regions(graph: ComputeGraph) -> None:
         raise ValueError("Regions do not cover every source operation exactly once")
 
     operation_regions = {
-        operation_id: region
-        for region in graph.regions
-        for operation_id in region.source_op_ids
+        operation_id: region for region in graph.regions for operation_id in region.source_op_ids
     }
     candidate_ids = [
-        candidate.id
-        for region in graph.regions
-        for candidate in region.fusion_candidates
+        candidate.id for region in graph.regions for candidate in region.fusion_candidates
     ]
     if len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("Fusion candidate IDs are not unique")
@@ -2501,8 +2418,7 @@ def _verify_regions(graph: ComputeGraph) -> None:
             if not set(candidate.source_op_ids).issubset(graph.ops):
                 raise ValueError(f"Candidate {candidate.id} references an unknown operation")
             if any(
-                operation_id not in region.source_op_ids
-                for operation_id in candidate.source_op_ids
+                operation_id not in region.source_op_ids for operation_id in candidate.source_op_ids
             ):
                 if candidate.source_op_ids[-1] not in region.source_op_ids:
                     raise ValueError(f"Candidate {candidate.id} is not attached to its tail region")
@@ -2519,7 +2435,10 @@ def _verify_regions(graph: ComputeGraph) -> None:
                 for value_id in candidate.external_inputs
             ):
                 raise ValueError(f"Candidate {candidate.id} marks an internal value external")
-            if candidate.tensor_program is not None and candidate.tensor_program.store.value_id not in candidate.live_outputs:
+            if (
+                candidate.tensor_program is not None
+                and candidate.tensor_program.store.value_id not in candidate.live_outputs
+            ):
                 raise ValueError(f"Candidate {candidate.id} does not output its program result")
     for region in graph.regions:
         operations = tuple(graph.ops[operation_id] for operation_id in region.source_op_ids)

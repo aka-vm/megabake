@@ -139,14 +139,8 @@ def _tensor_metadata(value: Any) -> dict[str, Any]:
 
 
 def _spec_metadata(spec: Any) -> dict[str, Any]:
-    shape = (
-        _static_dimensions(spec.shape, "input shape") if spec.shape is not None else None
-    )
-    strides = (
-        _static_dimensions(spec.stride, "input strides")
-        if spec.stride is not None
-        else None
-    )
+    shape = _static_dimensions(spec.shape, "input shape") if spec.shape is not None else None
+    strides = _static_dimensions(spec.stride, "input strides") if spec.stride is not None else None
     return {
         "shape": shape,
         "dtype": spec.dtype,
@@ -214,9 +208,7 @@ def _schema_alias_sources(
         if not operand_nodes:
             continue
         operand_values = tuple(
-            value_id
-            for operand_node in operand_nodes
-            for value_id in node_values[operand_node]
+            value_id for operand_node in operand_nodes for value_id in node_values[operand_node]
         )
         sources.append((frozenset(argument.alias_info.before_set), operand_values))
     return sources
@@ -245,9 +237,7 @@ def _storage_relation(
             for operand_node in _nodes_in((node.args, node.kwargs))
             for value_id in node_values[operand_node]
         )
-        return StorageRelation(
-            storage_id=None, aliases=operand_ids, unknown=True
-        )
+        return StorageRelation(storage_id=None, aliases=operand_ids, unknown=True)
     if result_index >= len(schema.returns):
         return StorageRelation(storage_id=value_id)
     return_alias = schema.returns[result_index].alias_info
@@ -266,9 +256,7 @@ def _storage_relation(
     if len(aliases) == 1:
         source = values[aliases[0]].storage_relation
         if source.unknown:
-            return StorageRelation(
-                storage_id=None, aliases=aliases, unknown=True
-            )
+            return StorageRelation(storage_id=None, aliases=aliases, unknown=True)
         return StorageRelation(
             storage_id=source.storage_id or aliases[0],
             aliases=aliases,
@@ -360,11 +348,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
             metadata = _placeholder_metadata(node, graph, spec)
             kind = getattr(spec, "kind", None) or "runtime"
             value_id = _value_id(node, 0, 1)
-            binding_name = (
-                input_order[input_index]
-                if input_index < len(input_order)
-                else node.name
-            )
+            binding_name = input_order[input_index] if input_index < len(input_order) else node.name
             value = Value(
                 id=value_id,
                 name=node.name,
@@ -395,10 +379,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
         metadata = _metadata(node, graph, None)
         result_leaves, result_spec = tree_flatten(metadata)
         result_count = len(result_leaves)
-        result_ids = tuple(
-            _value_id(node, index, result_count)
-            for index in range(result_count)
-        )
+        result_ids = tuple(_value_id(node, index, result_count) for index in range(result_count))
         result_reconstruction = tree_unflatten(result_ids, result_spec)
         node_values[node] = result_ids
         operand_ids = _operand_ids(node, node_values)
@@ -413,9 +394,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
                 dtype=result_metadata["dtype"],
                 device=result_metadata["device"],
                 strides=result_metadata["strides"],
-                storage_relation=_storage_relation(
-                    node, index, values, node_values, value_id
-                ),
+                storage_relation=_storage_relation(node, index, values, node_values, value_id),
                 kind="attribute" if node.op == "get_attr" else "result",
                 binding_name=node.target if node.op == "get_attr" else None,
                 type_name=result_metadata["type_name"],
@@ -442,9 +421,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
         )
         for operand_id in operand_ids:
             operand = values[operand_id]
-            values[operand_id] = replace(
-                operand, users=(*operand.users, op_id)
-            )
+            values[operand_id] = replace(operand, users=(*operand.users, op_id))
 
     output_node = next(node for node in graph.graph.nodes if node.op == "output")
     output_leaves, source_output_spec = tree_flatten(output_node.args[0])
@@ -463,9 +440,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
         for value_id, strides in zip(outputs, flat_strides):
             value = values[value_id]
             if strides is not None and value.shape is not None:
-                values[value_id] = replace(
-                    value, strides=tuple(int(stride) for stride in strides)
-                )
+                values[value_id] = replace(value, strides=tuple(int(stride) for stride in strides))
 
     result = ComputeGraph(
         values=values,
@@ -485,8 +460,10 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
 def dump_compute_graph(graph: ComputeGraph, path: str | Path) -> Path:
     lines = [
         "# ComputeGraph",
-        f"values={len(graph.values)} operations={len(graph.ops)} "
-        f"inputs={len(graph.inputs)} outputs={len(graph.outputs)}",
+        (
+            f"values={len(graph.values)} operations={len(graph.ops)} "
+            f"inputs={len(graph.inputs)} outputs={len(graph.outputs)}"
+        ),
         "",
         "## Values",
     ]
@@ -610,15 +587,11 @@ def verify_compute_graph(graph: ComputeGraph) -> None:
     if reconstructed != graph.output_reconstruction:
         raise ValueError("Output reconstruction does not match flattened outputs")
 
-    input_bindings = tuple(
-        graph.values[input_id].binding_name for input_id in graph.inputs
-    )
+    input_bindings = tuple(graph.values[input_id].binding_name for input_id in graph.inputs)
     if input_bindings != tuple(getattr(graph.runtime_context, "input_order", ())):
         raise ValueError("Input order does not match the capture context")
     operation_source_ids = {
-        source_id
-        for op in graph.ops.values()
-        for source_id in op.source_fx_ids
+        source_id for op in graph.ops.values() for source_id in op.source_fx_ids
     }
     for source_id, node in graph.source_nodes.items():
         if node.op in {"get_attr", "call_function", "call_method", "call_module"}:

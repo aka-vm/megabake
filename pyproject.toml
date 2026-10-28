@@ -43,18 +43,13 @@ megabake = "megabake.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.ruff]
+line-length = 100
+
 [tool.ruff.lint]
 extend-ignore = [
-    # Generated CUDA source and diagnostics intentionally concatenate string fragments.
-    "ISC001",
     # Nested guards separate CuTe compile-time conditions from device conditions.
     "SIM102",
-    # Keep nested context managers readable, especially CUDA capture/error scopes.
-    "SIM117",
-    # Allow 'l' as dimension variable in GEMM/tensor coordinates (M, N, K, L)
-    "E741",
-    # Allow delayed imports for circular dependency breaking
-    "E402",
 ]
 
 [tool.pytest.ini_options]
