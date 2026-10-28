@@ -31,7 +31,7 @@ The compilation path is:
 Complete Hugging Face decoders compile into one cooperative CuTe kernel, in prefill and stateful decode: SmolLM-135M and 1.7B, Qwen2-0.5B, the DeepSeek-V3 0.6B draft, the Beam DFlash2 draft, gemma-2b, Gemma-3-270M, and Qwen3.5-0.8B (decode only; its prefill needs `cumsum`). The kernel covers the embedding, every layer, the final norm, the vocabulary projection, and the KV-cache updates.
 
 - **Projections:** the Hopper TMA/WGMMA GEMM. Launches whose GEMMs have at most 64 rows use swapAB; `addmm` biases are added in the epilogue.
-- **Attention:** declared through transformers' `AttentionInterface` (`megabake::attention`, `megabake::kv_attention`). Decode splits each row's context across CTAs.
+- **Attention:** declared through transformers' `AttentionInterface` (`megabake::attention`, `megabake::kv_attention`). Decode is flash decoding: each row's context splits across CTAs, and at long contexts a row packs the query heads that share a KV head, so each cached key and value is read once.
 - **Small operators** (norms, RoPE, residual adds, gated activations) run generated bodies and, at decode sizes, fold into their consumer's barrier interval.
 - **Synchronization:** a counting grid barrier (~0.7 µs at 60 CTAs). Full models do not use events yet.
 
@@ -42,6 +42,7 @@ Limits: SM90 and bf16 only; static shapes served through size buckets; decode KV
 On a 60-SM H200 MIG slice, bf16 (full table in [ROADMAP.md](ROADMAP.md#measured-state-2026-10-21)):
 
 - **Decode, pipelined calls:** 5–55% faster than a CUDA-graphed Inductor decode on 6 of 8 models; 1.3x slower on Gemma 3 and 2.2x slower on Qwen3.5.
+- **Long-context decode** (2026-10-27, flash-decoding attention): 6–29% faster than before at 4,096 cached keys on the head_dim-64 models. There SmolLM-135M, Qwen2-0.5B and the DeepSeek draft run 1.8–2.1x faster than graphed Inductor; SmolLM-1.7B is still 1.5x slower ([ROADMAP.md](ROADMAP.md#done-part-of-step-11-flash-decoding-attention-2026-10-27)).
 - **Decode, synchronized calls:** roughly ties graphed Inductor; ~600 µs of host work per call loses four models.
 - **Prefill** is slower than Inductor + CUDA graphs on every model, and 3–21x slower at 128–300 tokens.
 

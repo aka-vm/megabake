@@ -1,15 +1,43 @@
 # MegaBake roadmap
 
-**Updated 2026-10-23; steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the [2026-10-18 megakernel gap report](docs/research/2026-10-18-megakernel-gap/report.md); the 2026-10-20/21 measurements below supersede the report's estimates where they disagree. Steps R0–R3 come from the [2026-10-22 HazyResearch comparison](docs/research/2026-10-22-hazy-megakernels/report.md) (updated 2026-10-22). The external Llama-3.2-1B comparison (2026-10-23) follows step 3.**
+**Updated 2026-10-27 (flash-decoding attention, part of step 11); steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the [2026-10-18 megakernel gap report](docs/research/2026-10-18-megakernel-gap/report.md); the 2026-10-20/21 measurements below supersede the report's estimates where they disagree. Steps R0–R3 come from the [2026-10-22 HazyResearch comparison](docs/research/2026-10-22-hazy-megakernels/report.md) (updated 2026-10-22). The external Llama-3.2-1B comparison (2026-10-23) follows step 3.**
 
 Where we are, in three lines:
 
 - Against a real CUDA-graphed Inductor decode, MegaBake wins on 6 of 8 models when calls are pipelined (5–55%), and roughly ties when each call synchronizes. The old "1.2–5x" wins came from host syncs in the ungraphed baseline.
 - Decode is bound by fixed per-phase latency, not by grid barriers: barrier release is ~11% of the 135M kernel. Gemma 3 (1.3x) and Qwen3.5 (1.9x) decode still lose to graphed Inductor. Prefill calls lose on every model except DeepSeek draft (a tie).
 - Cross-GEMM fusion is built (step 1): residual adds and SiLU·mul run in GEMM epilogues, gate/up as one paired GEMM, RoPE inside decode attention.
+- Decode attention is flash decoding (2026-10-27, part of step 11): one statistics exchange per chunk, and rows that pack a KV group at long contexts. At 4,096 cached keys decode is 6–29% faster on the head_dim-64 models and up to 1% faster on the head_dim-256 ones; no model is slower beyond run-to-run spread.
 - Weight streaming into shared memory across phases is built and off (step 3): the preloads themselves change decode by −0.7% to +1.5%. Weights still stream only inside GEMM phases by default.
 - HazyResearch's megakernels suggest a different reading of what step 3, L2 prefetch and the events estimate each measured. Cross-op overlap needs three things together: fixed warp roles with a producer warp that never joins consumer syncs, shared-memory pages handed from op to op, and fine-grained counters. Megabake has tried each piece alone. The next runtime experiment is the role split (R1), not another streaming variant.
 - On an external H100 benchmark (Llama-3.2-1B, 2026-10-23), MegaBake runs 1.8x slower than both hand-written CUDA graphs + PDL and Hazy's megakernel. The causes are per-call host time, decode attention that splits short contexts across CTAs (~330 µs of a ~1,850 µs kernel at position 100), GEMMs whose tile counts do not fill the SMs, and barrier intervals that carry only RoPE. The LM head runs near peak. Graphed Inductor on the 60-SM slice hid all of it, and a wrong RoPE in the test reference hid that the Llama reference itself produced gibberish.
+
+## Done: part of step 11, flash-decoding attention (2026-10-27)
+
+The split-context decode body (`bodies/attention.py`) keeps the captured rounding points (BF16 scores, FP32 statistics, BF16 normalized probabilities, FP32 value sum) and changes how work is split:
+
+- [x] **One statistics exchange per chunk instead of two.** Each chunk publishes its max and its exponential sum against that max; the row denominator follows from the chunk statistics. Probabilities are normalized once per key into scratch instead of in every lane of the value sum.
+- [x] **Rows that pack a KV group.** A row is one query head at short contexts. From `DECODE_PACKED_KEYS_PER_HEAD` (128) visible keys per packed head it is the query heads of a KV group that fit `DECODE_PACKED_FLOATS` (512) query elements, so each cached key and value is read once for all of them. Both variants are in one body and every CTA takes the same one, because all read the same valid length. Packing a whole group at short contexts was measured slower (Qwen2-0.5B +11%, gemma-2b +24%): too few items to fill the SMs.
+- [x] **Single-head rows keep their query in registers** across the key loop (as before). Grouped rows reload theirs from shared scratch per key; a key pass per head measured 3x slower on Qwen2-0.5B.
+- [x] **Correctness.** Bit-exact with one chunk (existing table-launch test at capacity 4); new `test_split_context_decode_matches_eager_at_long_contexts` runs both variants at 0–1,000 keys against fp32. On all 7 checkpoints at 0–4,000 keys with random caches, error against fp32 equals the old body's at 33 of 40 points, is within 9% at the others, and argmax never changes. The phase-scratch fallback for scores was run forced.
+- [ ] **head_dim 256 keeps one head per row** (`DECODE_PACKED_HEAD_DIM`). Packing gemma-2b took 4,096-key decode from −0.6% to −17.6%, but a second variant pushed Qwen3.5-0.8B's register-saturated kernel into more spills (+1.4% at every context). Revisit with per-role register budgets (R1).
+- [ ] Still open from step 11: the online softmax (removes the FP32 score row and the 8,192-key cap), and a cost model for the 64-key chunks, the one-wave cap and the packing thresholds.
+
+Pipelined decode, 60-SM H200 slice, MegaBake old → new (graphed calls move the same way; generated prefill kernels are byte-identical):
+
+| Model (KV group × head_dim) | 128-key cache | 512 keys | 2,048 keys | 4,096 keys |
+| --- | ---: | ---: | ---: | ---: |
+| SmolLM-135M (3 × 64) | 1,137 → 1,066 (−6.3%) | 1,299 → 1,200 (−7.6%) | 1,662 → 1,304 (−21.5%) | 2,110 → 1,492 (−29.3%) |
+| SmolLM-1.7B (1 × 64) | 2,419 → 2,378 (−1.7%) | 2,982 → 2,903 (−2.6%) | 4,149 → 3,945 (−4.9%) | 5,686 → 5,323 (−6.4%) |
+| Qwen2-0.5B (7 × 64) | 1,358 → 1,338 (−1.5%) | 1,523 → 1,478 (−2.9%) | 2,002 → 1,706 (−14.8%) | 2,620 → 1,883 (−28.1%) |
+| DeepSeek-V3 draft 0.6B (7 × 64) | 1,383 → 1,369 (−1.1%) | 1,555 → 1,499 (−3.6%) | 2,049 → 1,759 (−14.2%) | 2,672 → 1,946 (−27.2%) |
+| gemma-2b (8 × 256, one head per row) | 3,441 → 3,318 (−3.6%) | 3,514 → 3,518 (+0.1%) | 4,132 → 4,126 (−0.1%) | 4,886 → 4,857 (−0.6%) |
+| Gemma-3-270M (4 × 256, one head per row) | 1,801 → 1,765 (−2.0%) | 1,883 → 1,848 (−1.8%) at 400 keys | — (512-key window) | — |
+| Qwen3.5-0.8B (4 × 256, one head per row; 2 interleaved rounds) | 4,622 → 4,595 (−0.6%) | 4,672 → 4,635 (−0.8%) | — | 5,125 → 5,086 (−0.8%) |
+
+The gemma rows are one round and Gemma 3 cannot cache past its sliding window. gemma-2b's +0.1% at 512 keys is within run-to-run spread (its graphed call there is −2.9%).
+
+On the reproduction workload of PR #8 (SmolLM-135M random checkpoint, prefill 128, continuous greedy decode, SGLang 0.5.22 with CUDA graphs on the same GPU), MegaBake goes from 1.195 / 1.269 / 1.630 to 1.093 / 1.142 / 1.257 ms per token at 128 / 1,024 / 4,096 output tokens; SGLang runs 0.992 / 1.028 / 1.053. The remaining gap is mostly attention, which grows with context faster than SGLang's FlashAttention-3 decode, and two more GEMM phases per layer (separate Q/K/V).
 
 ## Done: step 0, honest baselines (2026-10-20)
 
@@ -146,7 +174,7 @@ Effort: S small, M medium, L large. Gains are estimates unless marked measured.
 | 8 | CI generality guard: a tiny-model zoo (LayerNorm, GELU, MQA, head_dim 256, sliding window, MoE, gated delta) against synthetic targets (60/108/132/148 SMs; sm80/90/100/120); fail on any silent generic-body fallback; keep held-out models | Prevents regressions | M | Runs in CI |
 | 9 | Split-K for projections with fewer tiles than workers (built, off: no gain on the 60-SM slice) | Narrow projections | S | Re-measured after 1 and 7 |
 | 10 | Event counters in the table launch, only on edges a running-ahead producer can use (GEMM→GEMM activation subsets, attention chunks, KV append with last-block-only wait); targets derived from tile overlap with RAW/WAR lists; `>=` waits on epoch targets | ≤ barrier release share (~11% measured) plus overlap R1–R2 unlock | M | Only after R1–R2, if the profile shows producer stalls a finer counter removes; 135M decode kernel ≤ 0.9 ms |
-| 11 | Derive fold limits, attention chunking and tolerances from cost, dtype and depth. Decode attention: split along KV heads and value columns before keys; split keys only when the bytes pay for the exchange, with items ≤ workers; one CTA serves all query heads of a KV head; an online softmax over key tiles removes the FP32 score row and with it the 8,192-key cap. Fold RoPE and the KV write into the QKV epilogue or attention prologue for every wrapper, so no barrier interval carries only elementwise work | Llama-1B: ~330 µs per token at position 100 from attention, ~115 µs from the RoPE intervals (measured on the slice); runs the external protocol | M | No fitted constant left in `schedule.py`/`attention.py`; KV capacity 16,384 compiles; Llama-1B attention interval ≤ 5 µs at 159 keys; no interval with < 8 tiles stands alone |
+| 11 | Derive fold limits, attention chunking and tolerances from cost, dtype and depth. Decode attention: split along KV heads and value columns before keys; split keys only when the bytes pay for the exchange, with items ≤ workers; one CTA serves all query heads of a KV head; an online softmax over key tiles removes the FP32 score row and with it the 8,192-key cap. Fold RoPE and the KV write into the QKV epilogue or attention prologue for every wrapper, so no barrier interval carries only elementwise work. *Built 2026-10-27: one exchange per chunk and KV-group rows at long contexts (section above)* | Llama-1B: ~330 µs per token at position 100 from attention, ~115 µs from the RoPE intervals (measured on the slice); runs the external protocol | M | No fitted constant left in `schedule.py`/`attention.py`; KV capacity 16,384 compiles; Llama-1B attention interval ≤ 5 µs at 159 keys; no interval with < 8 tiles stands alone |
 | 12 | Per-sequence KV lengths → paged KV → ragged mixed prefill/decode step | ~12–15x tokens/s at batch 16 | S → L | Batch 16 with different lengths |
 | 13 | Prefill: tensor-core attention, >64-row GEMM path; optional Inductor fallback above a measured crossover | 3–21x at 128–300 tokens | L | Prefill ≤ Inductor + graphs at 128 tokens |
 | 14 | Multi-step decode loop with on-device argmax (both external baselines time 127 steps as one graph replay); then speculative verify | −10–25% per token; 2–4x with speculation | L | — |
@@ -179,7 +207,7 @@ Effort: S small, M medium, L large. Gains are estimates unless marked measured.
 | swapAB small-M GEMM (16/32/64), register direct store, bias epilogue | Done, one configuration per launch | 7 |
 | Interval folding (recompute instead of barrier), idle-phase skipping | Done | 11 (limits) |
 | Counting grid barrier (~0.7 µs), constant kernel arguments | Done | — |
-| Split-context decode attention | Done | — |
+| Split-context decode attention: one statistics exchange, KV-group rows at long contexts (head_dim ≤ 128) | Done (2026-10-27) | 11 (online softmax, cost model) |
 | Graphed decode baseline, per-CTA profile | Done | — |
 | GEMM epilogue expressions, paired gate/up GEMM, one body per GEMM shape | Done (swapAB launches) | 1 |
 | Common-subexpression elimination on the captured graph | Done | 1 |

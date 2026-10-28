@@ -135,6 +135,70 @@ def test_table_launch_runs_tuned_gemms_in_stateful_decode(tmp_path, table_launch
     )
 
 
+def test_split_context_decode_matches_eager_at_long_contexts(tmp_path, table_launch):
+    """Decode at contexts that use one, several and a full wave of key chunks
+    per row, with one query head per row and, at the longest context, the
+    whole KV group per row: logits and the appended entries are as close to
+    fp32 as eager bf16 is (bit-exact with one chunk), other entries are
+    untouched and lengths advance by one."""
+    import copy
+
+    from megabake import make_backend
+    from megabake.bodies.attention import (
+        DECODE_PACKED_KEYS_PER_HEAD,
+        decode_chunks,
+        decode_packed_heads,
+    )
+
+    torch.manual_seed(11)
+    model = StatefulSmolLMArchitecture(layers=LAYERS, device="cuda", dtype=torch.bfloat16)
+    exact_model = copy.deepcopy(model).float()
+    capacity = 1100
+    caches = [
+        torch.randn(1, capacity, 3, 64, device="cuda", dtype=torch.bfloat16)
+        for _ in range(2 * LAYERS)
+    ]
+    backend = make_backend(
+        mode="decode", compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase"
+    )
+    optimized = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+
+    def relative(actual, expected):
+        return (actual.float() - expected.float()).norm().item() / expected.float().norm().item()
+
+    with torch.no_grad():
+        for context in (0, 63, 200, 1000):
+            lengths = [
+                torch.full((1,), context, device="cuda", dtype=torch.int32) for _ in range(LAYERS)
+            ]
+            actual_state = [tensor.clone() for tensor in (*caches, *lengths)]
+            reference_state = [tensor.clone() for tensor in (*caches, *lengths)]
+            exact_state = [*(cache.float() for cache in caches), *(length.clone() for length in lengths)]
+            token_ids = torch.tensor([[5]], device="cuda")
+            position_ids = torch.tensor([[context]], device="cuda")
+            actual = optimized(token_ids, position_ids, *actual_state)
+            expected = model(token_ids, position_ids, *reference_state)
+            exact = exact_model(token_ids, position_ids, *exact_state)
+            if context < 64:
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert relative(actual, exact) <= 1.25 * relative(expected, exact) + 1e-3
+            for cache, actual_cache, reference_cache, exact_cache in zip(
+                caches, actual_state, reference_state, exact_state
+            ):
+                assert torch.equal(actual_cache[:, :context], cache[:, :context])
+                assert torch.equal(actual_cache[:, context + 1 :], cache[:, context + 1 :])
+                row = slice(context, context + 1)
+                assert relative(actual_cache[:, row], exact_cache[:, row]) <= (
+                    1.25 * relative(reference_cache[:, row], exact_cache[:, row]) + 1e-3
+                )
+            assert all(int(length.item()) == context + 1 for length in actual_state[2 * LAYERS :])
+    # The longest context splits each row over several chunks, and the
+    # contexts run both the one-head and the packed rows.
+    assert decode_chunks(3, backend.megabake_last_compiled.plan.launch.grid_size) > 1
+    packed = decode_packed_heads(3, 64)
+    assert packed == 3 and 200 < DECODE_PACKED_KEYS_PER_HEAD * packed <= 1000
+
+
 def test_table_launch_streams_weights_in_stateful_decode(tmp_path, table_launch, monkeypatch):
     import megabake.codegen as codegen
 
