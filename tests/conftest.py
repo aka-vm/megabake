@@ -25,18 +25,5 @@ def pytest_ignore_collect(collection_path: Path, *args, **kwargs) -> bool | None
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         path_str = str(item.fspath)
-        if "/unit/" in path_str:
-            item.add_marker(pytest.mark.unit)
-            item.add_marker(pytest.mark.cpu)
-        elif "/integration/" in path_str:
-            item.add_marker(pytest.mark.integration)
-            if "sm90" in item.name.lower() or "sm90" in path_str.lower():
-                item.add_marker(pytest.mark.sm90)
-            else:
-                item.add_marker(pytest.mark.cpu)
-        elif "/gpu/" in path_str:
+        if "/gpu/" in path_str:
             item.add_marker(pytest.mark.gpu)
-            if "blackwell" in path_str.lower() or "blackwell" in item.name.lower():
-                item.add_marker(pytest.mark.blackwell)
-            elif "sm90" in path_str.lower() or "hopper" in path_str.lower():
-                item.add_marker(pytest.mark.sm90)

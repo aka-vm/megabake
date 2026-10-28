@@ -62,10 +62,5 @@ pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "--import-mode=importlib"
 markers = [
-    "unit: Unit tests (CPU/graph analysis, lowering, memory, scheduling)",
-    "integration: End-to-end integration and compiler pipeline tests",
-    "gpu: GPU-dependent kernel execution tests",
-    "cpu: Tests runnable in non-CUDA/CPU environments",
-    "sm90: Tests requiring an NVIDIA Hopper (SM90) GPU",
-    "blackwell: Tests requiring an NVIDIA Blackwell (SM100/SM120) GPU",
+    "gpu: tests requiring an NVIDIA CUDA GPU",
 ]
