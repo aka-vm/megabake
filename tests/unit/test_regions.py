@@ -11,7 +11,19 @@ from megabake import (
     prepare_fx_graph,
 )
 from megabake.graph import import_fx
-from megabake.lowering import Accumulator, Binary, Cast, Load, TensorStore
+from megabake.ir import Accumulator, Binary, Cast, Load, TensorStore
+from megabake.ops import (
+    HF_EAGER_NUMERICS,
+    Attention,
+    CacheEffects,
+    GemmEpilogue,
+    HeadGrouping,
+    Mask,
+    RMSNorm,
+    Rope,
+    ScalarChain,
+    ViewPlusGemm,
+)
 
 
 def _context(graph: torch.fx.GraphModule, *values: torch.Tensor) -> SimpleNamespace:
@@ -88,7 +100,7 @@ def test_form_regions_builds_executable_vector_chain_candidate_and_keeps_baselin
     assert candidate.executable
     assert candidate.cost_bytes == 2 * 3 * 4 * 4
     assert candidate.tensor_program.loads[0].value_id == "value:arg0_1"
-    assert candidate.semantic_facts["source_casts"] == "preserved"
+    assert candidate.semantics == ScalarChain(saved_bytes=2 * 3 * 4 * 4)
 
 
 def test_form_regions_builds_executable_scalar_dag_candidate():
@@ -135,7 +147,7 @@ def _epilogue_candidates(graph):
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts["family"] == "gemm_epilogue"
+        if isinstance(candidate.semantics, GemmEpilogue)
     ]
 
 
@@ -155,7 +167,7 @@ def test_form_regions_pairs_gate_and_up_gemms_with_their_activation():
     candidate = next(
         candidate
         for candidate in _epilogue_candidates(graph)
-        if candidate.semantic_facts["paired"]
+        if candidate.semantics.paired
     )
     assert candidate.source_op_ids == (
         "op:mm",
@@ -198,7 +210,7 @@ def test_form_regions_does_not_pair_gemms_whose_results_escape():
     graph = form_regions(_import(Model(), source, gate_weight, up_weight))
 
     assert not any(
-        candidate.semantic_facts["paired"] for candidate in _epilogue_candidates(graph)
+        candidate.semantics.paired for candidate in _epilogue_candidates(graph)
     )
 
 
@@ -229,7 +241,7 @@ def test_form_regions_fuses_residual_add_into_gemm_epilogue():
     )
 
 
-def test_form_regions_matches_view_plus_gemm_and_preserves_alias_index_map():
+def test_form_regions_matches_view_plus_gemm():
     class Model(torch.nn.Module):
         def forward(self, x, weight, bias):
             return torch.nn.functional.linear(x, weight, bias)
@@ -243,19 +255,7 @@ def test_form_regions_matches_view_plus_gemm_and_preserves_alias_index_map():
     gemm_region = next(
         region for region in graph.regions if region.id == "region:addmm"
     )
-    facts = gemm_region.semantic_facts
-    assert facts["family"] == "view_plus_gemm"
-    assert facts["view"] == "op:permute"
-    assert facts["view_source"] == "value:arg1_1"
-    assert facts["materialization"] == "none"
-    assert facts["alias"] is True
-    assert facts["composed_index_map"] == {
-        "terms": (
-            {"axis": "r0", "view_axis": "o0", "stride": 1},
-            {"axis": "o1", "view_axis": "o1", "stride": 3},
-        ),
-        "offset": 0,
-    }
+    assert gemm_region.semantics == ViewPlusGemm(view="op:permute", source="value:arg1_1")
 
 
 def test_dump_region_graph_reports_regions_dependencies_and_outputs(tmp_path):
@@ -307,7 +307,7 @@ def test_form_regions_keeps_unfamiliar_operations_representable():
 
     unknown_region = graph.regions[0]
     assert unknown_region.source_op_ids == (unknown_operation_id,)
-    assert unknown_region.semantic_facts == {}
+    assert unknown_region.semantics is None
     assert graph.ops[unknown_operation_id].tensor_program is None
     assert len(graph.regions) == len(graph.ops)
 
@@ -332,17 +332,11 @@ def test_form_regions_matches_exact_rms_norm_with_residual_and_casts():
     candidate = next(
         candidate
         for candidate in tail.fusion_candidates
-        if candidate.semantic_facts["family"] == "rms_norm"
+        if isinstance(candidate.semantics, RMSNorm)
     )
-    assert candidate.semantic_facts == {
-        "family": "rms_norm",
-        "reduction_axis": 1,
-        "width": 7,
-        "epsilon": 1e-5,
-        "affine": "value:arg1_1",
-        "residual": "value:arg2_1",
-        "source_casts": ("torch.bfloat16->torch.float32", "torch.float32->torch.bfloat16"),
-    }
+    assert candidate.semantics == RMSNorm(
+        width=7, epsilon=1e-5, weight="value:arg1_1", residual="value:arg2_1"
+    )
     program = candidate.tensor_program
     assert program is not None
     assert program.source_target == "rms_norm"
@@ -379,17 +373,9 @@ def test_form_regions_matches_exact_rope_and_keeps_unfamiliar_variants_generic()
     candidate = next(
         candidate
         for candidate in tail.fusion_candidates
-        if candidate.semantic_facts["family"] == "rope"
+        if isinstance(candidate.semantics, Rope)
     )
-    assert candidate.semantic_facts == {
-        "family": "rope",
-        "axis": 1,
-        "width": 6,
-        "rotary_width": 6,
-        "rotation": "i <-> i + rotary_width / 2",
-        "pass_through": 0,
-        "source_casts": (),
-    }
+    assert candidate.semantics == Rope(width=6, rotary_width=6, form="split_halves")
     program = candidate.tensor_program
     assert program is not None
     assert program.source_target == "rope"
@@ -406,7 +392,7 @@ def test_form_regions_matches_exact_rope_and_keeps_unfamiliar_variants_generic()
 
     cast_graph = form_regions(_import(CastModel(), source, cosine, sine))
     assert not any(
-        candidate.semantic_facts.get("family") == "rope"
+        isinstance(candidate.semantics, Rope)
         for region in cast_graph.regions
         for candidate in region.fusion_candidates
     )
@@ -420,7 +406,7 @@ def test_form_regions_matches_exact_rope_and_keeps_unfamiliar_variants_generic()
         )
     )
     assert not any(
-        candidate.semantic_facts.get("family") == "rope"
+        isinstance(candidate.semantics, Rope)
         for region in half_graph.regions
         for candidate in region.fusion_candidates
     )
@@ -457,7 +443,7 @@ def test_task25_matches_grouped_attention_access_mask_and_outputs():
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     )
     assert candidate.executable
     assert candidate.rejections == ()
@@ -467,32 +453,19 @@ def test_task25_matches_grouped_attention_access_mask_and_outputs():
         "value:arg2_1",
         "value:arg3_1",
     )
-    assert candidate.semantic_facts["algorithm"] == "stable_softmax"
-    assert candidate.semantic_facts["head_grouping"] == {
-        "batch": 2,
-        "query_heads": 4,
-        "kv_heads": 2,
-        "group_size": 2,
-        "head_dim": 8,
-    }
-    assert candidate.semantic_facts["q_access"].value_id == "value:arg0_1"
-    assert candidate.semantic_facts["k_access"].value_id == "value:arg1_1"
-    assert candidate.semantic_facts["v_access"].value_id == "value:arg2_1"
-    assert candidate.semantic_facts["mask"]["kind"] == "additive_tensor"
-    assert candidate.semantic_facts["mask"]["block_skip_proof"] == "none"
-    assert candidate.semantic_facts["numerical_policy"] == {
-        "score_dtype": "torch.bfloat16",
-        "statistics_dtype": "torch.float32",
-        "probability_dtype": "torch.bfloat16",
-        "accumulator_dtype": "torch.float32",
-    }
-    assert "value:add" in candidate.semantic_facts["requested_outputs"]
-    assert candidate.semantic_facts["cache_effects"] == {
-        "reads": ("value:arg1_1", "value:arg2_1"),
-        "appends": (),
-        "updates": (),
-        "policy": "read_only",
-    }
+    attention = candidate.semantics
+    assert attention.algorithm == "stable_softmax"
+    assert attention.grouping == HeadGrouping(batch=2, query_heads=4, kv_heads=2, head_dim=8)
+    assert attention.grouping.group_size == 2
+    assert attention.q.value_id == "value:arg0_1"
+    assert attention.k.value_id == "value:arg1_1"
+    assert attention.v.value_id == "value:arg2_1"
+    assert attention.mask == Mask("additive_tensor")
+    assert attention.numerics == HF_EAGER_NUMERICS
+    assert "value:add" in attention.outputs
+    assert attention.cache == CacheEffects(
+        "read_only", reads=("value:arg1_1", "value:arg2_1")
+    )
 
 
 def test_task25_matches_typed_causal_mask_with_offset():
@@ -513,14 +486,12 @@ def test_task25_matches_typed_causal_mask_with_offset():
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     )
-    mask = candidate.semantic_facts["mask"]
-    assert mask["kind"] == "typed_where"
-    assert mask["expression"].condition.load_id == "load:0"
-    assert mask["condition_expression"].operator == "le"
-    assert mask["causal_offset"] == 2
-    assert mask["block_skip_proof"] == "none"
+    mask = candidate.semantics.mask
+    assert mask.kind == "typed_where"
+    assert mask.causal_offset == 2
+    assert mask.window_offsets is None
 
 
 def test_task25_matches_window_mask_bounds():
@@ -542,13 +513,12 @@ def test_task25_matches_window_mask_bounds():
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     )
-    mask = candidate.semantic_facts["mask"]
-    assert mask["kind"] == "typed_where"
-    assert mask["condition_expression"].operator == "bitwise_and"
-    assert mask["window_offsets"] == (-1, 2)
-    assert mask["block_skip_proof"] == "none"
+    mask = candidate.semantics.mask
+    assert mask.kind == "typed_where"
+    assert mask.causal_offset is None
+    assert mask.window_offsets == (-1, 2)
 
 
 def test_task25_preserves_functional_kv_cache_append_effects():
@@ -576,16 +546,15 @@ def test_task25_preserves_functional_kv_cache_append_effects():
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     )
-    key_access = candidate.semantic_facts["k_access"]
-    value_access = candidate.semantic_facts["v_access"]
-    assert candidate.semantic_facts["cache_effects"] == {
-        "reads": ("value:arg1_1", "value:arg3_1"),
-        "appends": ("value:arg2_1", "value:arg4_1"),
-        "updates": (key_access.value_id, value_access.value_id),
-        "policy": "functional_append",
-    }
+    attention = candidate.semantics
+    assert attention.cache == CacheEffects(
+        "functional_append",
+        reads=("value:arg1_1", "value:arg3_1"),
+        appends=("value:arg2_1", "value:arg4_1"),
+        updates=(attention.k.value_id, attention.v.value_id),
+    )
 
 
 def test_task25_soft_cap_and_row_dependent_hooks_miss_but_preserve_source():
@@ -603,7 +572,7 @@ def test_task25_soft_cap_and_row_dependent_hooks_miss_but_preserve_source():
     graph = form_regions(_import(Model(), source, key, value))
 
     assert not any(
-        candidate.semantic_facts.get("family") == "attention"
+        isinstance(candidate.semantics, Attention)
         for region in graph.regions
         for candidate in region.fusion_candidates
     )
@@ -629,7 +598,7 @@ def test_task25_rejects_row_dependent_score_hook_and_preserves_source():
     graph = form_regions(_import(Model(), source, key, value))
 
     assert not any(
-        candidate.semantic_facts.get("family") == "attention"
+        isinstance(candidate.semantics, Attention)
         for region in graph.regions
         for candidate in region.fusion_candidates
     )
@@ -659,7 +628,7 @@ def test_form_regions_rope_reads_each_half_at_its_source_slices():
         candidate.tensor_program
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "rope"
+        if isinstance(candidate.semantics, Rope)
     )
 
     def offset(load):
@@ -700,11 +669,10 @@ def test_task25_feature_axis_cat_is_not_a_cache_append():
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     )
-    effects = candidate.semantic_facts["cache_effects"]
-    assert effects["policy"] == "read_only"
-    assert effects["appends"] == ()
+    assert candidate.semantics.cache.policy == "read_only"
+    assert candidate.semantics.cache.appends == ()
 
 
 def test_attention_matches_a_single_kv_head():
@@ -732,12 +700,8 @@ def test_attention_matches_a_single_kv_head():
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     )
-    assert candidate.semantic_facts["head_grouping"] == {
-        "batch": 1,
-        "query_heads": 4,
-        "kv_heads": 1,
-        "group_size": 4,
-        "head_dim": 8,
-    }
+    assert candidate.semantics.grouping == HeadGrouping(
+        batch=1, query_heads=4, kv_heads=1, head_dim=8
+    )

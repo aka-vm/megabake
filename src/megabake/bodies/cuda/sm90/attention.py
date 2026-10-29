@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import textwrap
 from functools import cache
 from typing import Any, Mapping
 
 from ....graph import Region
+from ....ops import HF_EAGER_NUMERICS, Attention, HeadGrouping, Prologue
 from ...interface import (
     BodyConfig,
     CandidateSet,
@@ -21,6 +22,8 @@ from ...interface import (
     TargetFacts,
     TensorLayout,
     TileContract,
+    access_effects,
+    widened_participants,
 )
 
 
@@ -73,6 +76,8 @@ class GeneratedAttentionBody:
     function_name: str = "run"
     threads_per_cta: int = 128
     tile_count: int = 1
+    # Work-iterator stride between tiles (``GeneratedBody.work_step``).
+    work_step: int = 1
     work_iterator_dtype: str = "torch.int64"
     work_iterator_encoding: str = "one row-block base per CTA tile"
     # Phase scratch (FP32 elements, Int32 counters) the body takes as its
@@ -83,6 +88,32 @@ class GeneratedAttentionBody:
 
 class AttentionBodyProvider:
     provider_name = "attention"
+
+    def emit(
+        self,
+        program: Any,
+        config: BodyConfig,
+        *,
+        defer_length_publish: bool = False,
+        workers: int | None = None,
+    ) -> GeneratedAttentionBody:
+        return emit_attention_body(
+            program, config, defer_length_publish=defer_length_publish, workers=workers
+        )
+
+    def widen(self, program: Any, config: BodyConfig, threads: int) -> BodyConfig:
+        # Decode attention keeps a statistic and a head-dim row of value
+        # partials per warp in its shared scratch.
+        head_dim = config.tiles.cta_shape[-1]
+        added_warps = (threads - config.participants.participating_threads) // 32
+        return replace(
+            config,
+            participants=widened_participants(config, threads),
+            scratch=replace(
+                config.scratch,
+                size_bytes=config.scratch.size_bytes + added_warps * (1 + head_dim) * 4,
+            ),
+        )
 
     def get_candidates(
         self, region: Region, target: TargetFacts, policy: SelectionPolicy
@@ -98,34 +129,27 @@ class AttentionBodyProvider:
         program = region.tensor_programs[0]
         if program.family != "attention":
             return reject("provider supports attention only")
-        facts = region.semantic_facts
-        if facts.get("family") != "attention":
+        attention = region.semantics
+        if not isinstance(attention, Attention):
             return reject("region semantics are not attention")
 
-        numerical_policy = facts.get("numerical_policy", {})
-        if facts.get("algorithm") not in {"stable_softmax", "online_softmax"}:
-            return reject("provider supports stable or online softmax only")
-        if numerical_policy != {
-            "score_dtype": "torch.bfloat16",
-            "statistics_dtype": "torch.float32",
-            "probability_dtype": "torch.bfloat16",
-            "accumulator_dtype": "torch.float32",
-        }:
+        if attention.numerics != HF_EAGER_NUMERICS:
             return reject("provider preserves only the captured BF16/float32 policy")
         if program.accumulator_dtype != "torch.float32":
             return reject("attention accumulator must be float32")
         if program.store.dtype != "torch.bfloat16":
             return reject("attention output must be BF16")
-        requested_outputs = tuple(facts.get("requested_outputs", ()))
-        boundary_output = facts.get("boundary_output")
         allowed_outputs = {
             (program.store.value_id,),
         }
-        if isinstance(boundary_output, str):
+        if attention.boundary_output is not None:
             allowed_outputs.update(
-                ((boundary_output,), (program.store.value_id, boundary_output))
+                (
+                    (attention.boundary_output,),
+                    (program.store.value_id, attention.boundary_output),
+                )
             )
-        if requested_outputs not in allowed_outputs:
+        if attention.outputs not in allowed_outputs:
             return reject("materialized scores and extra attention outputs are unsupported")
 
         loads = {load.id: load for load in program.loads}
@@ -137,23 +161,14 @@ class AttentionBodyProvider:
         ):
             return reject("provider supports BF16 Q/K/V only")
 
-        grouping = facts.get("head_grouping", {})
-        if not isinstance(grouping, Mapping):
-            return reject("attention head grouping is invalid")
-        batch = grouping.get("batch")
-        query_heads = grouping.get("query_heads")
-        kv_heads = grouping.get("kv_heads")
-        group_size = grouping.get("group_size")
-        head_dim = grouping.get("head_dim")
-        if (
-            not all(isinstance(value, int) for value in (batch, query_heads, kv_heads, group_size, head_dim))
-            or batch <= 0
-            or query_heads <= 0
-            or kv_heads <= 0
-            or group_size <= 0
-            or query_heads != kv_heads * group_size
-            or head_dim <= 0
-        ):
+        grouping = attention.grouping
+        batch, query_heads, kv_heads, head_dim = (
+            grouping.batch,
+            grouping.query_heads,
+            grouping.kv_heads,
+            grouping.head_dim,
+        )
+        if min(batch, query_heads, kv_heads, head_dim) <= 0 or query_heads % kv_heads:
             return reject("attention head grouping is invalid")
 
         q_load = loads["attention:q"]
@@ -178,43 +193,37 @@ class AttentionBodyProvider:
         ):
             return reject("attention shapes do not match the captured access maps")
 
-        mask = facts.get("mask", {})
-        if not isinstance(mask, Mapping):
-            return reject("attention mask semantics are invalid")
-        if mask.get("kind") == "additive_tensor":
+        mask = attention.mask
+        if mask.kind == "additive_tensor":
             if "attention:mask" not in loads:
                 return reject("additive mask is not bound")
-        elif mask.get("kind") == "stateful_causal":
+        elif mask.kind == "stateful_causal":
             if not program.state_accesses:
                 return reject("stateful causal mask has no KV state contract")
-        elif mask.get("kind") == "none":
-            pass
-        elif mask.get("kind") == "typed_where":
-            if (
-                mask.get("window_offsets") is not None
-                or not isinstance(mask.get("false_value"), (int, float))
+        elif mask.kind == "typed_where":
+            if mask.window_offsets is not None or not isinstance(
+                mask.false_value, (int, float)
             ):
                 return reject("provider supports additive tensors and causal masks only")
-            if mask.get("causal_offset") is None and (
-                "attention:mask" not in loads or mask.get("true_value") not in (0, 0.0)
+            if mask.causal_offset is None and (
+                "attention:mask" not in loads or mask.true_value not in (0, 0.0)
             ):
                 return reject("typed mask lacks a bound boolean condition and zero true value")
-        else:
+        elif mask.kind != "none":
             return reject("unsupported attention mask hook")
 
-        cache_effects = facts.get("cache_effects", {})
+        cache = attention.cache
         stateful = bool(program.state_accesses)
         if (
-            not isinstance(cache_effects, Mapping)
-            or cache_effects.get("policy") != ("stateful" if stateful else "read_only")
-            or (stateful and cache_effects.get("updates") == ())
-            or (not stateful and cache_effects.get("appends") != ())
-            or (not stateful and cache_effects.get("updates") != ())
+            cache.policy != ("stateful" if stateful else "read_only")
+            or (stateful and cache.updates == ())
+            or (not stateful and cache.appends != ())
+            or (not stateful and cache.updates != ())
         ):
             return reject("provider supports read-only or bounded stateful KV caches only")
         if stateful and query_length != 1:
             return reject("stateful KV attention supports one-token decode only")
-        if facts.get("prologues") and not (
+        if attention.prologues and not (
             stateful and policy.table_launch and head_dim % 32 == 0
         ):
             # Only the table launch's split-context decode body computes them.
@@ -268,8 +277,8 @@ def _attention_config(
 ) -> BodyConfig:
     """``split`` sizes the scratch for the table launch's split-context decode
     body, which ``workers`` CTAs run."""
-    facts = region.semantic_facts
-    stateful = region.semantic_facts.get("kv_state") is not None
+    attention = region.semantics
+    stateful = attention.kv_state is not None
     threads = 128
     warp_roles = ("one query row at a time: lanes split keys, then head dimensions",) * 4
     kv_capacity = next(
@@ -285,12 +294,12 @@ def _attention_config(
         # chunk's scores when ``workers`` CTAs run it (see _DecodeScratch).
         scratch_bytes = max(
             scratch_bytes,
-            decode_scratch_bytes(facts["head_grouping"], kv_capacity, threads, workers),
+            decode_scratch_bytes(attention.grouping, kv_capacity, threads, workers),
         )
     elif stateful:
-        head_dim = facts["head_grouping"]["head_dim"]
+        head_dim = attention.grouping.head_dim
         warps = threads // 32
-        rows = 2 if facts.get("prologues") else 0
+        rows = 2 if attention.prologues else 0
         scratch_bytes = max(
             scratch_bytes, (warps + warps * head_dim + kv_capacity + rows * head_dim) * 4
         )
@@ -319,18 +328,8 @@ def _attention_config(
             source_op_ids=region.source_op_ids,
             numerical_policy="source_semantics",
             expression_hooks=("score", "mask"),
-            access_effects={
-                "q": facts["q_access"],
-                "k": facts["k_access"],
-                "v": facts["v_access"],
-                "mask": facts["mask"],
-                "head_grouping": facts["head_grouping"],
-                "scale": facts["scale"],
-                "numerical_policy": facts["numerical_policy"],
-                "cache_effects": facts["cache_effects"],
-                "kv_state": facts.get("kv_state"),
-                "prologues": facts.get("prologues"),
-            },
+            access_effects=access_effects(program),
+            semantics=attention,
         ),
         layouts=LayoutContract(layouts, {program.store.value_id: layouts[program.store.value_id]}),
         tiles=TileContract(
@@ -444,16 +443,17 @@ def emit_attention_body(
     """
     if program.family != "attention":
         raise UnsupportedAttentionBody("program is not attention")
-    facts = config.semantic.access_effects
-    grouping = facts.get("head_grouping")
-    if not isinstance(grouping, Mapping):
-        raise UnsupportedAttentionBody("attention body lacks head grouping")
-    batch = grouping.get("batch")
-    query_heads = grouping.get("query_heads")
-    group_size = grouping.get("group_size")
-    head_dim = grouping.get("head_dim")
-    if not all(isinstance(value, int) for value in (batch, query_heads, group_size, head_dim)):
-        raise UnsupportedAttentionBody("attention body has invalid head grouping")
+    attention = config.semantic.semantics
+    if not isinstance(attention, Attention):
+        raise UnsupportedAttentionBody("attention body lacks its attention semantics")
+    grouping = attention.grouping
+    batch, query_heads, group_size, head_dim = (
+        grouping.batch,
+        grouping.query_heads,
+        grouping.group_size,
+        grouping.head_dim,
+    )
+    scale = attention.scale
 
     loads = {load.id: index for index, load in enumerate(program.loads)}
     required_loads = ("attention:q", "attention:k", "attention:v")
@@ -479,7 +479,6 @@ def emit_attention_body(
             raise UnsupportedAttentionBody("stateful attention supports one-token decode only")
         threads = config.participants.participating_threads
         row_count = batch * query_heads
-        scale = facts.get("scale")
         if not isinstance(scale, (int, float)):
             raise UnsupportedAttentionBody("attention scale must be static")
         warps = min(threads // 32, config.scratch.size_bytes // (kv_length * 4))
@@ -487,7 +486,7 @@ def emit_attention_body(
             raise UnsupportedAttentionBody(
                 "stateful attention scratch must hold one score row per warp"
             )
-        prologues = facts.get("prologues") or {}
+        prologues = attention.prologues
         if defer_length_publish and workers is not None and head_dim % 32 == 0:
             return _split_decode_attention_body(
                 program, loads, batch, query_heads // group_size, group_size, head_dim,
@@ -615,10 +614,8 @@ def run(
             work_iterator_encoding="one stateful query-row block base per CTA tile",
         )
 
-    mask = facts.get("mask")
-    if not isinstance(mask, Mapping):
-        raise UnsupportedAttentionBody("attention body lacks mask semantics")
-    if mask.get("kind") == "additive_tensor":
+    mask = attention.mask
+    if mask.kind == "additive_tensor":
         if "attention:mask" not in loads:
             raise UnsupportedAttentionBody("additive mask is not bound")
         mask_load = next(load for load in program.loads if load.id == "attention:mask")
@@ -631,9 +628,9 @@ def run(
             else f"tensor_bindings[{loads['attention:mask']}][b, h, s, key]"
         )
         mask_code = f"score = (score.to(cutlass.Float32) + ({mask_access}).to(cutlass.Float32)).to(cutlass.BFloat16)"
-    elif mask.get("kind") == "typed_where":
-        causal_offset = mask.get("causal_offset")
-        masked_value = mask.get("false_value")
+    elif mask.kind == "typed_where":
+        causal_offset = mask.causal_offset
+        masked_value = mask.false_value
         if not isinstance(masked_value, (int, float)):
             raise UnsupportedAttentionBody("attention mask lacks a fill value")
         if isinstance(causal_offset, int):
@@ -652,14 +649,13 @@ def run(
             mask_code = (
                 f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if not {mask_access} else score"
             )
-    elif mask.get("kind") == "none":
+    elif mask.kind == "none":
         mask_code = "pass"
     else:
         raise UnsupportedAttentionBody("unsupported attention mask hook")
 
     threads = config.participants.participating_threads
     row_count = batch * query_heads * query_length
-    scale = facts.get("scale")
     if not isinstance(scale, (int, float)):
         raise UnsupportedAttentionBody("attention scale must be static")
     output_type = "cutlass.BFloat16"
@@ -743,7 +739,7 @@ def run(
 
 
 def _prologue_lines(
-    prologue: Mapping[str, Any], program: Any, head: str, target: str, name: str
+    prologue: Prologue, program: Any, head: str, target: str, name: str
 ) -> str:
     """Lines storing to ``target`` (as FP32) an elementwise producer of a
     (batch, sequence, head, dim) attention operand evaluated at (b,
@@ -752,7 +748,7 @@ def _prologue_lines(
     from ..generic import _HOISTED_LOADS, _cast_expression, _emit_expression, _load_access
 
     bindings = {load.value_id: index for index, load in enumerate(program.loads)}
-    loads = tuple(prologue["loads"])
+    loads = prologue.loads
     indices = {load.id: bindings[load.value_id] for load in loads}
     coordinates = {"o0": "b", "o1": "sequence", "o2": head, "o3": "d"}
     indent = "                    "
@@ -766,8 +762,8 @@ def _prologue_lines(
     token = _HOISTED_LOADS.set(hoisted)
     try:
         value = _cast_expression(
-            _emit_expression(prologue["combine"], indices, coordinates, loads),
-            prologue["dtype"],
+            _emit_expression(prologue.combine, indices, coordinates, loads),
+            prologue.dtype,
         )
     finally:
         _HOISTED_LOADS.reset(token)
@@ -859,16 +855,16 @@ def decode_packed_heads(group_size: int, head_dim: int) -> int:
 
 
 def decode_scratch_bytes(
-    head_grouping: Mapping[str, int], kv_length: int, threads: int, workers: int
+    head_grouping: HeadGrouping, kv_length: int, threads: int, workers: int
 ) -> int:
     """Shared scratch the split-context decode body needs to keep a chunk's
     scores in shared memory when ``workers`` CTAs run it."""
-    packed = decode_packed_heads(head_grouping["group_size"], head_grouping["head_dim"])
+    packed = decode_packed_heads(head_grouping.group_size, head_grouping.head_dim)
     sizes = []
     for heads in dict.fromkeys((1, packed)):
-        rows = head_grouping["batch"] * head_grouping["query_heads"] // heads
+        rows = head_grouping.batch * head_grouping.query_heads // heads
         chunks = decode_chunks(rows, workers)
-        layout = _DecodeScratch(threads // 32, heads, head_grouping["head_dim"])
+        layout = _DecodeScratch(threads // 32, heads, head_grouping.head_dim)
         sizes.append(layout.bytes(_chunk_capacity(kv_length, chunks, max(1, workers // rows))))
     return max(sizes)
 
@@ -893,7 +889,7 @@ def _split_decode_attention_body(
     threads: int,
     workers: int,
     scratch_bytes: int = 0,
-    prologues: Mapping[str, Mapping[str, Any]] | None = None,
+    prologues: Mapping[str, Prologue] | None = None,
 ) -> GeneratedAttentionBody:
     """One-token decode with each row's visible keys split into chunks that
     run on different CTAs (flash decoding), keeping the captured rounding
@@ -970,7 +966,7 @@ def _decode_variant(
     threads: int,
     workers: int,
     scratch_bytes: int,
-    prologues: Mapping[str, Mapping[str, Any]],
+    prologues: Mapping[str, Prologue],
     heads_per_item: int,
 ) -> _DecodeVariant:
     """The item loop of split-context decode with ``heads_per_item`` query

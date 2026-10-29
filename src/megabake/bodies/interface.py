@@ -1,10 +1,22 @@
+"""The contract between the planner, codegen and device bodies.
+
+A body provider proposes ``BodyConfig``s for a region and emits the device
+code of the one the planner selects. Providers are grouped by GPU
+generation (``Generation``); ``catalog`` offers a target the generic
+providers plus its generation's.
+"""
+
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
-from typing import Any
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, Protocol
 
-from ..lowering import AxisAffine, DataIndex
+from ..ir import AxisAffine, DataIndex, TensorProgram
+
+if TYPE_CHECKING:
+    from ..graph import ComputeGraph, Region
+    from ..ops import Semantics
 
 AxisExpression = str | int | AxisAffine | DataIndex
 
@@ -26,20 +38,14 @@ class SelectionPolicy:
     mode: str = "prefill"
     allow_generic: bool = True
     allow_tuned: bool = True
-    allow_tma_gemm: bool = True
     # Large graphs use a table-driven launch: tensors come from a device
     # address table and TMA GEMM descriptors are written per phase in the
     # kernel prologue, so bodies must share one GEMM shared-memory layout.
     table_launch: bool = False
-    # Table-launched GEMMs with at most 16 rows put the weight on WGMMA's M
-    # side (Mirage's swapAB). One orientation serves the whole launch because
-    # its GEMMs share one shared-memory layout.
-    table_gemm_swap_ab: bool = False
-    # The token tile (WGMMA N) of swapAB launches: 16, 32, or 64 rows.
-    table_gemm_swap_ab_rows: int = 16
-    # Split the K range of swapAB table GEMMs that have fewer weight tiles
-    # than SMs (see bodies.cuda.sm90.gemm.split_k_count).
-    table_gemm_split_k: bool = False
+    # Launch-wide choices of the target generation's providers, made once
+    # per graph (``Generation.launch_options``); each generation defines its
+    # own type, and None means its defaults.
+    target_options: Any = None
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
 
@@ -69,6 +75,8 @@ class SemanticContract:
     numerical_policy: str
     expression_hooks: tuple[str, ...]
     access_effects: Mapping[str, Any]
+    # The region's descriptor (an ``ops`` family) when the body implements one.
+    semantics: Semantics | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +168,75 @@ class ProviderRejection:
 class CandidateSet:
     configurations: tuple[BodyConfig, ...]
     rejections: tuple[ProviderRejection, ...]
+
+
+class GeneratedBody(Protocol):
+    """Device source of one body variant and how its work is iterated."""
+
+    source: str
+    threads_per_cta: int
+    tile_count: int
+    # The difference between consecutive work-iterator entries: tile base
+    # indices step by the elements or rows one tile covers, tile indices by 1.
+    work_step: int
+    work_iterator_encoding: str
+
+
+class BodyProvider(Protocol):
+    provider_name: str
+
+    def get_candidates(
+        self, region: Region, target: TargetFacts, policy: SelectionPolicy
+    ) -> CandidateSet:
+        """Legal configs for the region, or rejections saying why none fit."""
+
+    def emit(
+        self,
+        program: TensorProgram,
+        config: BodyConfig,
+        *,
+        defer_length_publish: bool = False,
+        workers: int | None = None,
+    ) -> GeneratedBody:
+        """The device body of a selected config. ``workers`` is given for
+        table launches, whose bodies may split work across CTAs; with
+        ``defer_length_publish`` a stateful body leaves its KV-length
+        increment to the kernel (see ``emit_attention_body``)."""
+
+    def widen(self, program: TensorProgram, config: BodyConfig, threads: int) -> BodyConfig:
+        """The config run by CTAs of ``threads`` threads, so every phase of a
+        launch shares one block size."""
+
+
+@dataclass(frozen=True)
+class Generation:
+    """The providers a GPU generation adds to the generic ones."""
+
+    architectures: frozenset[str]
+    providers: tuple[BodyProvider, ...]
+    # The ``SelectionPolicy.target_options`` of a graph: (graph, table_launch).
+    launch_options: Callable[[ComputeGraph, bool], Any] | None = None
+
+
+def widened_participants(config: BodyConfig, threads: int) -> ParticipantContract:
+    """``config``'s participants repeated to fill ``threads`` threads."""
+    current = config.participants.participating_threads
+    if threads % current:
+        raise InvalidBodyConfig(f"body uses {current} threads; cannot share {threads}")
+    return replace(
+        config.participants,
+        participating_threads=threads,
+        warp_roles=config.participants.warp_roles * (threads // current),
+    )
+
+
+def access_effects(program: TensorProgram) -> dict[str, Any]:
+    """The values a body reads and writes for ``program``."""
+    return {
+        "reads": tuple(load.value_id for load in program.loads),
+        "writes": (program.store.value_id,),
+        "owns_storage": program.store.owns_storage,
+    }
 
 
 class InvalidBodyConfig(ValueError):

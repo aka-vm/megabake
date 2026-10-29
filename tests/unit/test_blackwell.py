@@ -7,7 +7,7 @@ import torch
 from megabake.bodies.cuda.sm100.gemm import BlackwellGemmProvider
 from megabake.bodies import SelectionPolicy, validate_body_config
 from megabake.bodies.catalog import get_candidates
-from megabake.lowering import Constant
+from megabake.ir import Constant
 from tests.unit.test_bodies import _regions, _target
 from benchmarks.isolated import _graph_ordered_inputs
 

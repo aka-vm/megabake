@@ -11,11 +11,11 @@ from .graph import ComputeGraph, import_fx
 from .lowering import (
     canonicalize_semantics,
     dump_lowering_graph,
-    KVCacheAccess,
-    kv_attention,
     lower_semantics,
     semantic_coverage,
 )
+from .ir import KVCacheAccess
+from .ops.attention import kv_attention
 from .regions import dump_region_graph, form_regions
 from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
 from .plan import (

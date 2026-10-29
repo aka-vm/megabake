@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import copy
 import functools
-import os
 from dataclasses import dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
 from statistics import median
@@ -22,19 +21,15 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.cuda.sm90.gemm import (
-    TABLE_DESCRIPTORS_PER_GEMM,
-    cute_gemm_tensors,
-    is_swap_ab,
-    swap_ab_rows,
-    wants_swap_ab,
-)
+from .bodies.catalog import launch_options
+from .bodies.cuda.sm90.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
-from .lowering import DataIndex, TensorProgram, canonicalize_semantics, semantic_coverage
+from .ir import DataIndex, TensorProgram
+from .lowering import canonicalize_semantics, semantic_coverage
 from .memory import distinct_workspace, verify_plan
 from .plan import (
     BodySelectionPlan,
@@ -203,15 +198,6 @@ def _uses_table_launch(graph: ComputeGraph) -> bool:
     return parameter_bytes > _TABLE_LAUNCH_PARAMETER_BYTES
 
 
-def _gemm_shapes(graph: ComputeGraph) -> tuple[tuple[int, int], ...]:
-    """Output ``(rows, columns)`` of every two-dimensional contraction."""
-    return tuple(
-        tuple(operation.tensor_program.store.shape)
-        for operation in graph.ops.values()
-        if isinstance(operation.tensor_program, TensorProgram)
-        and operation.tensor_program.family == "contraction"
-        and len(operation.tensor_program.store.shape) == 2
-    )
 # A measured candidate must match the captured reference within this
 # relative L2 error before it can be selected. Deep table-launched graphs
 # accumulate bf16 rounding differences: on the 30-layer pinned SmolLM the
@@ -392,14 +378,10 @@ def compile_post_grad(
         )
     if policy is None:
         table_launch = _uses_table_launch(graph)
-        shapes = _gemm_shapes(graph)
-        swap_ab = table_launch and wants_swap_ab(shapes)
         policy = SelectionPolicy(
             mode=prepared.context.mode,
             table_launch=table_launch,
-            table_gemm_swap_ab=swap_ab,
-            table_gemm_swap_ab_rows=swap_ab_rows(shapes) if swap_ab else 16,
-            table_gemm_split_k=swap_ab and os.environ.get("MEGABAKE_SPLIT_K") == "1",
+            target_options=launch_options(graph, selected_target, table_launch),
         )
     if isinstance(search_budget, int):
         if search_budget < 1:

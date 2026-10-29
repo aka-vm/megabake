@@ -20,7 +20,7 @@ from typing import Any
 import torch
 from transformers.cache_utils import Cache, CacheLayerMixin
 
-from ..lowering import attention
+from ..ops.attention import attention
 
 ATTENTION_IMPLEMENTATION = "megabake"
 
