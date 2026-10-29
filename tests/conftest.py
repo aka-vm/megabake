@@ -7,6 +7,7 @@ import pytest
 import torch
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+GPU_TESTS = Path(__file__).resolve().parent / "gpu"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
@@ -14,8 +15,7 @@ from megabake.platform import HAS_CUDA, HAS_CUTLASS
 
 
 def pytest_ignore_collect(collection_path: Path, *args, **kwargs) -> bool | None:
-    path_str = str(collection_path)
-    if "/tests/gpu" in path_str and (
+    if collection_path.is_relative_to(GPU_TESTS) and (
         not HAS_CUDA or not HAS_CUTLASS or not torch.cuda.is_available()
     ):
         return True
@@ -24,6 +24,5 @@ def pytest_ignore_collect(collection_path: Path, *args, **kwargs) -> bool | None
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
-        path_str = str(item.fspath)
-        if "/gpu/" in path_str:
+        if Path(str(item.path)).is_relative_to(GPU_TESTS):
             item.add_marker(pytest.mark.gpu)

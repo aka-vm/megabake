@@ -465,7 +465,7 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cuda'", specifier = "==4.8.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.17.3" },
     { name = "safetensors", specifier = ">=0.8.0" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.14" },
     { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.14", index = "https://download.pytorch.org/whl/cu130" },

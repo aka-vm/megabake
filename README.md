@@ -84,7 +84,7 @@ python src/main.py export --callable module:callable --arg '[[1.0, 2.0]]'
 
 ## Environment setup
 
-Use Python 3.12–3.14, an NVIDIA GPU and driver compatible with PyTorch's CUDA 13.0 build, and the CUDA 13.0 development toolkit. Python dependencies do not install `nvcc`; the CUDA version shown by `nvidia-smi` describes driver support, not the installed toolkit.
+Use Python 3.12–3.14. CPU-only development and tests work on macOS; GPU execution requires an NVIDIA GPU and driver compatible with PyTorch's CUDA 13.0 build plus the CUDA 13.0 development toolkit. Python dependencies do not install `nvcc`; the CUDA version shown by `nvidia-smi` describes driver support, not the installed toolkit.
 
 For development, install [uv](https://docs.astral.sh/uv/getting-started/installation/) and run from your checkout:
 
@@ -96,6 +96,12 @@ python -m pytest tests/unit
 ```
 
 This installs the project in editable mode with development dependencies. `pyproject.toml` defines dependencies; `uv.lock` pins their versions. After changing dependencies, run `uv lock` and commit both files.
+
+For CUDA development, install the optional compiler toolchain as well:
+
+```bash
+uv sync --locked --extra dev --extra cuda --python 3.13
+```
 
 For a library installation with pip, run from the checkout in an active Python environment:
 

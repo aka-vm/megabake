@@ -1,0 +1,2 @@
+uv.lock linguist-generated=true
+src/megabake/bodies/cuda/sm90/cutlass_upstream/** linguist-vendored=true

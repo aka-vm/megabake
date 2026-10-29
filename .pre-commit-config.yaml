@@ -1,3 +1,5 @@
+exclude: ^src/megabake/bodies/cuda/sm90/cutlass_upstream/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
