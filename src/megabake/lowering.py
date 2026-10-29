@@ -4,302 +4,43 @@ import copy
 import math
 import operator
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from .graph import ComputeGraph, Op, Value
-
-
-@dataclass(frozen=True)
-class IterationDomain:
-    axis: str
-    size: int
-
-
-@dataclass(frozen=True)
-class AxisPredicate:
-    axis: str
-    upper_bound: int
-
-
-@dataclass(frozen=True)
-class AxisTerm:
-    axis: str
-    scale: int = 1
-    divisor: int = 1
-    modulus: int = 0
-
-
-@dataclass(frozen=True)
-class AxisAffine:
-    terms: tuple[AxisTerm, ...]
-    offset: int = 0
-
-
-@dataclass(frozen=True)
-class DataIndex:
-    load_id: str
-
-
-@dataclass(frozen=True)
-class IndexedLoad:
-    id: str
-    value_id: str
-    axes: tuple[str | int | AxisAffine | DataIndex, ...]
-    strides: tuple[int, ...]
-    dtype: str
-    source_shape: tuple[int, ...] | None = None
-
-
-@dataclass(frozen=True)
-class TensorStore:
-    value_id: str
-    shape: tuple[int, ...]
-    dtype: str
-    strides: tuple[int, ...]
-    owns_storage: bool
-
-
-@dataclass(frozen=True)
-class Constant:
-    value: int | float | bool
-    dtype: str
-    weak_type: bool = False
-
-
-@dataclass(frozen=True)
-class Load:
-    load_id: str
-    dtype: str
-
-
-@dataclass(frozen=True)
-class Accumulator:
-    dtype: str
-    # Which accumulator of a paired contraction: 0 multiplies the first right
-    # operand (load 1), 1 the second (load 2) with the same left operand.
-    index: int = 0
-
-
-@dataclass(frozen=True)
-class Unary:
-    operator: str
-    operand: ScalarExpression
-    dtype: str
-
-
-@dataclass(frozen=True)
-class AxisIndex:
-    axis: str
-    dtype: str
-    start: int = 0
-    step: int = 1
-
-
-@dataclass(frozen=True)
-class Binary:
-    operator: str
-    lhs: ScalarExpression
-    rhs: ScalarExpression
-    dtype: str
-
-
-@dataclass(frozen=True)
-class Where:
-    condition: ScalarExpression
-    true_value: ScalarExpression
-    false_value: ScalarExpression
-    dtype: str
-
-
-@dataclass(frozen=True)
-class Cast:
-    operand: ScalarExpression
-    dtype: str
-    rounding: str
-
-
-ScalarExpression = Constant | Load | Accumulator | Unary | AxisIndex | Binary | Where | Cast
-
-AxisExpression = str | int | AxisAffine | DataIndex
-
-
-@dataclass(frozen=True)
-class TensorProgram:
-    family: str
-    source_target: str
-    decomposition: str
-    iteration_domains: tuple[IterationDomain, ...]
-    reduction_axes: tuple[str, ...]
-    loads: tuple[IndexedLoad, ...]
-    init: Constant | None
-    combine: ScalarExpression
-    post: ScalarExpression | None
-    accumulator_dtype: str | None
-    store: TensorStore
-    predicates: tuple[AxisPredicate, ...]
-    state_accesses: tuple[KVCacheAccess, ...] = ()
-
-
-@dataclass(frozen=True)
-class KVCacheLayout:
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    dtype: str
-
-
-@dataclass(frozen=True)
-class KVCacheAccess:
-    key_cache_value_id: str
-    value_cache_value_id: str
-    valid_length_value_id: str
-    key_cache_load_id: str
-    value_cache_load_id: str
-    new_key_load_id: str
-    new_value_load_id: str
-    valid_length_load_id: str
-    capacity: int
-    query_length: int
-    key_layout: KVCacheLayout
-    value_layout: KVCacheLayout
-    storage_identity: tuple[str, str]
-    read_range: tuple[int | str, int | str] = (0, "valid_length")
-    write_range: tuple[int | str, int | str] = (
-        "valid_length",
-        "valid_length + query_length",
-    )
-    source_order: tuple[str, ...] = (
-        "read_valid_length",
-        "read_cache_prefix",
-        "read_new_key_value",
-        "write_key_cache",
-        "write_value_cache",
-        "write_valid_length",
-    )
-    storage_class: str = "bounded_contiguous"
-    valid_length_specialized: bool = False
-
-
-@dataclass(frozen=True)
-class CanonicalProgram:
-    family: str
-    source_target: str
-    decomposition: str
-    result_roles: tuple[str, ...]
-    semantics: Mapping[str, Any]
-
-
-class UnsupportedLowering(ValueError):
-    pass
-
+from .ir import (
+    Accumulator,
+    AxisAffine,
+    AxisExpression,
+    AxisIndex,
+    AxisPredicate,
+    AxisTerm,
+    Binary,
+    CanonicalProgram,
+    Cast,
+    Constant,
+    DataIndex,
+    IndexedLoad,
+    IterationDomain,
+    Load,
+    ScalarExpression,
+    TensorProgram,
+    TensorStore,
+    Unary,
+    UnsupportedLowering,
+    Where,
+)
+from .ops.attention import (
+    ATTENTION_OP,
+    KV_ATTENTION_OP,
+    attention_program,
+    kv_attention_program,
+)
 
 LoweringRule = Callable[[torch.fx.Node, Op, ComputeGraph], TensorProgram | CanonicalProgram]
-
-
-@torch.library.custom_op(
-    "megabake::kv_attention",
-    mutates_args=("key_cache", "value_cache", "valid_length"),
-)
-def kv_attention(
-    source: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    valid_length: torch.Tensor,
-) -> torch.Tensor:
-    if source.shape[1] != 1:
-        raise RuntimeError("megabake kv_attention supports one-token decode only")
-    start = int(valid_length.item())
-    end = start + source.shape[1]
-    if start < 0 or end > key_cache.shape[1]:
-        raise RuntimeError(
-            f"KV cache length {start} plus {source.shape[1]} exceeds capacity {key_cache.shape[1]}"
-        )
-    key_cache[:, start:end].copy_(key)
-    value_cache[:, start:end].copy_(value)
-    valid_length.fill_(end)
-    query = source.permute(0, 2, 1, 3)
-    keys = key_cache[:, :end].permute(0, 2, 1, 3)
-    values = value_cache[:, :end].permute(0, 2, 1, 3)
-    if query.shape[1] != keys.shape[1]:
-        group_size = query.shape[1] // keys.shape[1]
-        keys = keys.repeat_interleave(group_size, dim=1)
-        values = values.repeat_interleave(group_size, dim=1)
-    scores = (query @ keys.transpose(-2, -1)).float() * source.shape[-1] ** -0.5
-    probabilities = torch.softmax(scores, dim=-1).to(source.dtype)
-    output = probabilities @ values
-    return output.permute(0, 2, 1, 3).reshape(
-        source.shape[0] * source.shape[2], source.shape[1], source.shape[3]
-    )
-
-
-@kv_attention.register_fake
-def _kv_attention_fake(
-    source: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    valid_length: torch.Tensor,
-) -> torch.Tensor:
-    return torch.empty(
-        (
-            source.shape[0] * source.shape[2],
-            source.shape[1],
-            source.shape[3],
-        ),
-        dtype=source.dtype,
-        device=source.device,
-    )
-
-
-KV_ATTENTION_OP = torch.ops.megabake.kv_attention.default
-
-
-@torch.library.custom_op("megabake::attention", mutates_args=())
-def attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    mask: torch.Tensor | None,
-    scale: float,
-) -> torch.Tensor:
-    """Softmax attention with Hugging Face eager numerics.
-
-    ``query`` is ``[batch, query, heads, dim]``; ``key`` and ``value`` are
-    ``[batch, key, kv_heads, dim]`` with ``heads`` a multiple of ``kv_heads``;
-    ``mask`` is additive and broadcasts to ``[batch, heads, query, key]``.
-    Returns ``[batch * heads, query, dim]``, the layout of ``kv_attention``.
-    """
-    query = query.transpose(1, 2)
-    key = key.transpose(1, 2)
-    value = value.transpose(1, 2)
-    if query.shape[1] != key.shape[1]:
-        group_size = query.shape[1] // key.shape[1]
-        key = key.repeat_interleave(group_size, dim=1)
-        value = value.repeat_interleave(group_size, dim=1)
-    scores = torch.matmul(query, key.transpose(2, 3)) * scale
-    if mask is not None:
-        scores = scores + mask
-    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
-    output = torch.matmul(probabilities, value)
-    return output.reshape(-1, output.shape[2], output.shape[3])
-
-
-@attention.register_fake
-def _attention_fake(query, key, value, mask, scale):
-    return torch.empty(
-        (query.shape[0] * query.shape[2], query.shape[1], query.shape[3]),
-        dtype=query.dtype,
-        device=query.device,
-    )
-
-
-ATTENTION_OP = torch.ops.megabake.attention.default
 
 
 def _node_value(node: torch.fx.Node, graph: ComputeGraph) -> Value:
@@ -1240,7 +981,6 @@ def _indexed_gather_program(
         raise UnsupportedLowering("gather result shape does not match its operands")
 
     output_axes = tuple(f"o{index}" for index in range(len(result.shape)))
-
     index_loads = tuple(
         IndexedLoad(
             id=f"gather:index:{index}",
@@ -1771,250 +1511,8 @@ def _kv_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> T
     del node
     if len(op.operands) != 6:
         raise UnsupportedLowering("KV attention expects source, K, V, two caches, and length")
-    source, new_key, new_value, key_cache, value_cache, valid_length = (
-        graph.values[value_id] for value_id in op.operands
-    )
-    output = _result_value(op, graph)
-    if any(
-        value.shape is None or value.strides is None or value.dtype is None
-        for value in (source, new_key, new_value, key_cache, value_cache, valid_length)
-    ):
-        raise UnsupportedLowering("KV attention operands lack static tensor metadata")
-
-    batch, query_length, query_heads, head_dim = source.shape
-    _, new_length, kv_heads, _ = new_key.shape
-    _, capacity, cache_kv_heads, _ = key_cache.shape
-    group_size = query_heads // kv_heads
-    contiguous_cache = (
-        capacity * kv_heads * head_dim,
-        kv_heads * head_dim,
-        head_dim,
-        1,
-    )
-    if (
-        query_length != 1
-        or new_length != query_length
-        or new_key.shape != new_value.shape
-        or key_cache.shape != value_cache.shape
-        or cache_kv_heads != kv_heads
-        or query_heads % kv_heads
-        or group_size <= 0
-        or key_cache.strides != contiguous_cache
-        or value_cache.strides != contiguous_cache
-        or valid_length.shape != (1,)
-        or valid_length.dtype != "torch.int32"
-        or output.shape != (batch * query_heads, query_length, head_dim)
-        or source.dtype != "torch.bfloat16"
-        or new_key.dtype != "torch.bfloat16"
-        or key_cache.dtype != "torch.bfloat16"
-    ):
-        raise UnsupportedLowering(
-            "KV attention supports one-token decode over two contiguous BF16 caches"
-        )
-
-    batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
-    query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
-    loads = (
-        IndexedLoad(
-            "attention:q",
-            source.id,
-            (batch_head, "s", query_head, "d"),
-            source.strides,
-            source.dtype,
-            source.shape,
-        ),
-        IndexedLoad(
-            "attention:new_k",
-            new_key.id,
-            (batch_head, 0, kv_head, "d"),
-            new_key.strides,
-            new_key.dtype,
-            new_key.shape,
-        ),
-        IndexedLoad(
-            "attention:new_v",
-            new_value.id,
-            (batch_head, 0, kv_head, "d"),
-            new_value.strides,
-            new_value.dtype,
-            new_value.shape,
-        ),
-        IndexedLoad(
-            "attention:k",
-            key_cache.id,
-            (batch_head, "k", kv_head, "d"),
-            key_cache.strides,
-            key_cache.dtype,
-            key_cache.shape,
-        ),
-        IndexedLoad(
-            "attention:v",
-            value_cache.id,
-            (batch_head, "k", kv_head, "d"),
-            value_cache.strides,
-            value_cache.dtype,
-            value_cache.shape,
-        ),
-        IndexedLoad(
-            "attention:valid_length",
-            valid_length.id,
-            (0,),
-            valid_length.strides,
-            valid_length.dtype,
-            valid_length.shape,
-        ),
-    )
-    zero = Constant(0.0, "torch.float32")
-    state_access = KVCacheAccess(
-        key_cache_value_id=key_cache.id,
-        value_cache_value_id=value_cache.id,
-        valid_length_value_id=valid_length.id,
-        key_cache_load_id="attention:k",
-        value_cache_load_id="attention:v",
-        new_key_load_id="attention:new_k",
-        new_value_load_id="attention:new_v",
-        valid_length_load_id="attention:valid_length",
-        capacity=capacity,
-        query_length=query_length,
-        key_layout=KVCacheLayout(key_cache.shape, key_cache.strides, key_cache.dtype),
-        value_layout=KVCacheLayout(value_cache.shape, value_cache.strides, value_cache.dtype),
-        storage_identity=(key_cache.id, value_cache.id),
-    )
-    return TensorProgram(
-        family="attention",
-        source_target="megabake.kv_attention",
-        decomposition="stateful decode attention with bounded contiguous KV cache",
-        iteration_domains=(
-            IterationDomain("bh", batch * query_heads),
-            IterationDomain("s", query_length),
-            IterationDomain("d", head_dim),
-            IterationDomain("k", capacity),
-        ),
-        reduction_axes=("k",),
-        loads=loads,
-        init=zero,
-        combine=zero,
-        post=zero,
-        accumulator_dtype="torch.float32",
-        store=TensorStore(output.id, output.shape, output.dtype, output.strides, True),
-        predicates=(
-            AxisPredicate("bh", batch * query_heads),
-            AxisPredicate("s", query_length),
-            AxisPredicate("d", head_dim),
-        ),
-        state_accesses=(state_access,),
-    )
-
-
-def attention_access_axes(
-    head_axis: int, batch_axis: AxisAffine, head: AxisAffine, sequence_axis: str
-) -> tuple[AxisExpression, ...]:
-    if head_axis == 2:
-        return (batch_axis, sequence_axis, head, "d")
-    return (batch_axis, head, sequence_axis, "d")
-
-
-def attention_tensor_program(
-    output_id: str,
-    q_root: str,
-    k_root: str,
-    v_root: str,
-    q: Any,
-    k: Any,
-    v: Any,
-    axes: tuple[int, int, int],
-    mask_value: str | None,
-    graph: ComputeGraph,
-) -> TensorProgram | None:
-    output = graph.values[output_id]
-    if output.shape is None or output.dtype is None or output.strides is None:
-        return None
-    if q.shape is None or k.shape is None or v.shape is None:
-        return None
-    q_head_axis, k_head_axis, v_head_axis = axes
-    batch = q.shape[0]
-    query_heads = q.shape[q_head_axis]
-    query_length = q.shape[3 - q_head_axis]
-    kv_heads = k.shape[k_head_axis]
-    kv_length = k.shape[3 - k_head_axis]
-    head_dim = q.shape[-1]
-    group_size = query_heads // kv_heads
-    batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
-    query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
-
-    loads = (
-        IndexedLoad(
-            "attention:q",
-            q_root,
-            attention_access_axes(q_head_axis, batch_head, query_head, "s"),
-            q.strides or (),
-            q.dtype or "",
-            q.shape,
-        ),
-        IndexedLoad(
-            "attention:k",
-            k_root,
-            attention_access_axes(k_head_axis, batch_head, kv_head, "k"),
-            k.strides or (),
-            k.dtype or "",
-            k.shape,
-        ),
-        IndexedLoad(
-            "attention:v",
-            v_root,
-            attention_access_axes(v_head_axis, batch_head, kv_head, "k"),
-            v.strides or (),
-            v.dtype or "",
-            v.shape,
-        ),
-    )
-    if mask_value is not None:
-        mask = graph.values[mask_value]
-        if mask.shape is None or mask.strides is None or mask.dtype is None:
-            return None
-        mask_head = 0 if mask.shape[1] == 1 else query_head
-        loads = (
-            *loads,
-            IndexedLoad(
-                "attention:mask",
-                mask_value,
-                (batch_head, mask_head, "s", "k"),
-                mask.strides,
-                mask.dtype,
-                mask.shape,
-            ),
-        )
-    zero = Constant(0.0, "torch.float32")
-    return TensorProgram(
-        family="attention",
-        source_target="megabake.attention",
-        decomposition="stable softmax attention with grouped heads and typed masks",
-        iteration_domains=(
-            IterationDomain("bh", batch * query_heads),
-            IterationDomain("s", query_length),
-            IterationDomain("d", head_dim),
-            IterationDomain("k", kv_length),
-        ),
-        reduction_axes=("k",),
-        loads=loads,
-        init=zero,
-        combine=zero,
-        post=zero,
-        accumulator_dtype="torch.float32",
-        store=TensorStore(
-            output.id,
-            output.shape,
-            output.dtype,
-            output.strides,
-            True,
-        ),
-        predicates=(
-            AxisPredicate("bh", batch * query_heads),
-            AxisPredicate("s", query_length),
-            AxisPredicate("d", head_dim),
-        ),
+    return kv_attention_program(
+        *(graph.values[value_id] for value_id in op.operands), _result_value(op, graph)
     )
 
 
@@ -2023,30 +1521,14 @@ def _attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> Tens
     mask = node.args[3]
     if mask is not None and not isinstance(mask, torch.fx.Node):
         raise UnsupportedLowering("attention mask must be a tensor or None")
-    if any(
-        operand.shape is None or len(operand.shape) != 4 or operand.dtype != "torch.bfloat16"
-        for operand in (query, key, value)
-    ):
-        raise UnsupportedLowering("attention supports four-dimensional BF16 operands")
-    if query.shape[2] % key.shape[2] or key.shape != value.shape:
-        raise UnsupportedLowering("attention needs whole KV-head groups and matching K and V")
-    # Operands are [batch, sequence, heads, dim] by the op contract, so the
-    # head axis is known and no stride heuristic is needed.
-    program = attention_tensor_program(
-        _result_value(op, graph).id,
-        query.id,
-        key.id,
-        value.id,
+    return attention_program(
         query,
         key,
         value,
-        (2, 2, 2),
-        None if mask is None else _node_value(mask, graph).id,
+        None if mask is None else _node_value(mask, graph),
+        _result_value(op, graph),
         graph,
     )
-    if program is None:
-        raise UnsupportedLowering("attention operands lack static layouts")
-    return program
 
 
 LOWERERS: dict[Any, LoweringRule] = {
@@ -2432,7 +1914,7 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
             except UnsupportedLowering as error:
                 tensor_program = None
                 reason = f"unsupported lowering for FX target {target}: {error}"
-            except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
+            except Exception as error:  # noqa: BLE001 - preserve unsupported-lowering diagnostics.
                 tensor_program = None
                 reason = (
                     f"lowering rule failed for FX target {target}: {type(error).__name__}: {error}"

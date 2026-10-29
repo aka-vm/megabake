@@ -24,6 +24,7 @@ from megabake import (
     select_bodies,
 )
 from megabake.bodies import SelectionPolicy
+from megabake.bodies.cuda.sm90.gemm import HopperLaunchOptions
 from megabake.compiler import (
     _TABLE_LAUNCH_OPS,
     _current_parameter_tensors,
@@ -64,7 +65,9 @@ def diff_intermediates(
         Recorder(prepared.graph).run(*(_clone(value) for value in prepared.example_inputs))
 
     graph, target = _post_grad_graph(prepared, None)
-    policy = SelectionPolicy(mode=mode, allow_tma_gemm=len(graph.ops) <= _TABLE_LAUNCH_OPS)
+    policy = SelectionPolicy(
+        mode=mode, target_options=HopperLaunchOptions(tma_gemm=len(graph.ops) <= _TABLE_LAUNCH_OPS)
+    )
     selection = select_bodies(graph, target, policy)
     plan = assign_storage(
         make_phase_schedule(selection, derive_dependencies(selection)),

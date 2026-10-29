@@ -21,7 +21,9 @@ from megabake.fx_handler.transformers import (
     bind_kv_cache,
 )
 from megabake.graph import import_fx
-from megabake.lowering import canonicalize_semantics, kv_attention
+from megabake.lowering import canonicalize_semantics
+from megabake.ops import Attention
+from megabake.ops.attention import kv_attention
 from megabake.regions import form_regions
 from megabake.schedule import DependencyKind
 
@@ -75,11 +77,11 @@ def test_task28_lowers_dynamic_stateful_decode_attention():
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     )
-    state = candidate.semantic_facts["kv_state"]
+    state = candidate.semantics.kv_state
 
-    assert candidate.semantic_facts["cache_effects"]["policy"] == "stateful"
+    assert candidate.semantics.cache.policy == "stateful"
     assert state.capacity == 4
     assert state.query_length == 1
     assert state.read_range == (0, "valid_length")

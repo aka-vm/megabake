@@ -21,15 +21,15 @@ from .frontend import (
     prepare_fx_graph,
 )
 from .graph import ComputeGraph, import_fx
+from .ir import KVCacheAccess
 from .lowering import (
-    KVCacheAccess,
     canonicalize_semantics,
     dump_lowering_graph,
-    kv_attention,
     lower_semantics,
     semantic_coverage,
 )
 from .memory import assign_storage, verify_plan
+from .ops.attention import kv_attention
 from .plan import (
     BodySelectionPlan,
     KernelPlan,

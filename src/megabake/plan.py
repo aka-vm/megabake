@@ -17,7 +17,7 @@ from .bodies.interface import (
     WorkItem,
 )
 from .graph import ComputeGraph
-from .lowering import TensorProgram
+from .ir import TensorProgram
 
 if TYPE_CHECKING:
     from .memory import LaunchRequirements, StoragePlan

@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM
 
-from ..lowering import kv_attention
+from ..ops.attention import kv_attention
 from .export import ExportedCapture, capture_exported_program
 
 

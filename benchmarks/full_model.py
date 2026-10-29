@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import functools
 import gc
 import json
 import statistics
@@ -40,7 +39,7 @@ from megabake.fx_handler.hf_attention import (
     DecodeStep,
     register_transformers_attention,
 )
-from megabake.lowering import kv_attention
+from megabake.ops.attention import kv_attention
 from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM
 
 PROMPT = [1, 504, 3458, 314]
@@ -321,15 +320,11 @@ def bench_decode(model, args) -> dict:
             ]
             position = [0]
             if name == "inductor_graphed":
-                build = functools.partial(
-                    GraphedStep,
-                    torch.compile(stateful, fullgraph=True, dynamic=False),
-                    token,
-                    state,
+                build = lambda state=state: GraphedStep(
+                    torch.compile(stateful, fullgraph=True, dynamic=False), token, state
                 )
             if name == "megabake_graphed":
-                build = functools.partial(
-                    graphed,
+                build = lambda state=state: graphed(
                     torch.compile(
                         stateful,
                         backend=_megabake("decode", args.out),
@@ -447,7 +442,9 @@ def bench_decode_contexts(model, args) -> dict:
                         complete.append((time.perf_counter() - started) * 1e6)
                     pipelined = _pipelined_calls(
                         [
-                            lambda position=position: function(token, position, *state)  # noqa: B023  # Callback is consumed within this loop iteration.
+                            lambda position=position, function=function, state=state: function(
+                                token, position, *state
+                            )
                             for position in positions[4 + args.samples :]
                         ]
                     )

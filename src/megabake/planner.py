@@ -9,7 +9,8 @@ from typing import Any
 from .bodies.catalog import get_candidates
 from .bodies.interface import BodyConfig, SelectionPolicy, TargetFacts
 from .graph import DTYPE_BYTES, ComputeGraph, Region
-from .lowering import AxisAffine, DataIndex, TensorProgram
+from .ir import AxisAffine, DataIndex, TensorProgram
+from .ops import Attention
 from .plan import (
     BodySelectionPlan,
     ConversionBody,
@@ -76,18 +77,15 @@ def _validated_policy(graph: ComputeGraph, policy: SelectionPolicy | None) -> Se
     selected_policy = policy or SelectionPolicy()
     if selected_policy.mode not in {"prefill", "decode"}:
         raise ValueError(f"selection mode {selected_policy.mode!r} must be 'prefill' or 'decode'")
-    state_contracts = {
-        facts["cache_effects"]["policy"]
+    stateful = any(
+        isinstance(semantics, Attention) and semantics.cache.policy == "stateful"
         for region in graph.regions
-        for facts in (
-            region.semantic_facts,
-            *(candidate.semantic_facts for candidate in region.fusion_candidates),
+        for semantics in (
+            region.semantics,
+            *(candidate.semantics for candidate in region.fusion_candidates),
         )
-        if facts.get("family") == "attention"
-        and isinstance(facts.get("cache_effects"), dict)
-        and isinstance(facts["cache_effects"].get("policy"), str)
-    }
-    if "stateful" in state_contracts and selected_policy.mode != "decode":
+    )
+    if stateful and selected_policy.mode != "decode":
         raise ValueError("prefill mode cannot compile a stateful KV cache update")
     return selected_policy
 
@@ -129,11 +127,7 @@ def _enumerate_body_selections(
                 source_op_ids=candidate.source_op_ids,
                 external_inputs=candidate.external_inputs,
                 live_outputs=candidate.live_outputs,
-                semantic_facts={
-                    **region.semantic_facts,
-                    **candidate.semantic_facts,
-                    "fusion_saved_bytes": candidate.cost_bytes,
-                },
+                semantics=candidate.semantics,
                 tensor_programs=(candidate.tensor_program,),
             )
             options.extend(
@@ -416,10 +410,10 @@ def _attention_body_order(
     config: BodyConfig, region: Region, policy: SelectionPolicy
 ) -> tuple[int, ...]:
     loads = {load.id: load for load in region.tensor_programs[0].loads}
-    grouping = region.semantic_facts["head_grouping"]
+    grouping = region.semantics.grouping
     query_length = loads["attention:q"].source_shape[1]
     kv_length = loads["attention:k"].source_shape[1]
-    parallelism = grouping["batch"] * grouping["query_heads"] * query_length
+    parallelism = grouping.batch * grouping.query_heads * query_length
     decode_work = query_length == 1 and kv_length > 0 and parallelism > 0
     mode_priority = 0 if (policy.mode == "decode") == decode_work else 1
     return (

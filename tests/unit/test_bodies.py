@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,14 +21,9 @@ from megabake.bodies.catalog import get_candidates
 from megabake.bodies.cuda.sm90.gemm import gemm_candidates
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import Region, import_fx
-from megabake.lowering import (
-    Accumulator,
-    Binary,
-    Cast,
-    Constant,
-    Unary,
-    canonicalize_semantics,
-)
+from megabake.ir import Accumulator, Binary, Cast, Constant, Unary
+from megabake.lowering import canonicalize_semantics
+from megabake.ops import ViewPlusGemm
 from megabake.regions import form_regions
 
 
@@ -236,7 +232,7 @@ def test_emit_contraction_body_generates_gemm_source():
     region = next(
         region
         for region in _regions(Model(), source, weight)
-        if region.semantic_facts.get("family") == "view_plus_gemm"
+        if isinstance(region.semantics, ViewPlusGemm)
     )
     config = get_candidates(region, _target(), _policy()).configurations[0]
 
@@ -332,7 +328,7 @@ def test_emit_contraction_body_rejects_incompatible_schedule():
     region = next(
         region
         for region in _regions(Model(), source, weight)
-        if region.semantic_facts.get("family") == "view_plus_gemm"
+        if isinstance(region.semantics, ViewPlusGemm)
     )
     config = get_candidates(region, _target(), _policy()).configurations[0]
 
@@ -355,7 +351,7 @@ def test_catalog_describes_g0_range_and_rejects_incompatible_target():
     region = next(
         region
         for region in _regions(Model(), source, weight)
-        if region.semantic_facts.get("family") == "view_plus_gemm"
+        if isinstance(region.semantics, ViewPlusGemm)
     )
     result = get_candidates(region, _target(), _policy())
 
@@ -395,7 +391,7 @@ def test_gemm_candidates_reject_incompatible_operand_layout():
     region = next(
         region
         for region in _regions(Model(), source, weight)
-        if region.semantic_facts.get("family") == "view_plus_gemm"
+        if isinstance(region.semantics, ViewPlusGemm)
     )
     program = region.tensor_programs[0]
 
@@ -417,7 +413,6 @@ def test_region_without_tensor_program_is_rejected():
         source_op_ids=("op:unknown",),
         external_inputs=(),
         live_outputs=(),
-        semantic_facts={},
         tensor_programs=(),
     )
     result = get_candidates(region, _target(), _policy())
@@ -466,8 +461,6 @@ def test_emit_map_body_binds_each_load_once():
 
 
 def test_swap_ab_serves_small_m_launches_with_transposed_tiles():
-    from types import SimpleNamespace
-
     from megabake.bodies.cuda.sm90.gemm import is_swap_ab, kernel_tile, wants_swap_ab
 
     assert wants_swap_ab([(4, 2048), (4, 8192), (4, 49152)])
@@ -486,3 +479,38 @@ def test_swap_ab_serves_small_m_launches_with_transposed_tiles():
     body.tiles.cta_shape = (64, 64)
     assert not is_swap_ab(body)
     assert kernel_tile(body) == (64, 64)
+
+
+def test_catalog_offers_a_target_the_generic_and_its_generation_providers():
+    from megabake.bodies import catalog
+    from megabake.bodies.cuda.sm90.gemm import HopperLaunchOptions
+
+    def names(target):
+        return [provider.provider_name for provider in catalog.providers(target)]
+
+    assert names(_target()) == ["generic", "g0_range", "attention"]
+    assert names(_target(architecture="sm100")) == ["generic", "blackwell_mma"]
+    assert names(_target(architecture="sm80")) == ["generic"]
+    assert catalog.provider("attention").provider_name == "attention"
+
+    class Model(torch.nn.Module):
+        def forward(self, value, weight):
+            return value @ weight
+
+    region = next(
+        region
+        for region in _regions(
+            Model(),
+            torch.randn(4, 64, dtype=torch.bfloat16),
+            torch.randn(64, 64, dtype=torch.bfloat16),
+        )
+        if region.tensor_programs[0].family == "contraction"
+    )
+    graph = SimpleNamespace(
+        ops={"op:mm": SimpleNamespace(tensor_program=region.tensor_programs[0])}
+    )
+    assert catalog.launch_options(graph, _target(), table_launch=True) == HopperLaunchOptions(
+        swap_ab=True, swap_ab_rows=16
+    )
+    assert catalog.launch_options(graph, _target(), table_launch=False) == HopperLaunchOptions()
+    assert catalog.launch_options(graph, _target(architecture="sm100"), table_launch=True) is None

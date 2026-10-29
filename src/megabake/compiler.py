@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import copy
 import functools
-import os
 import sys
 import threading
 import time
@@ -19,24 +18,15 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.cuda.sm90.gemm import (
-    TABLE_DESCRIPTORS_PER_GEMM,
-    cute_gemm_tensors,
-    is_swap_ab,
-    swap_ab_rows,
-    wants_swap_ab,
-)
+from .bodies.catalog import launch_options
+from .bodies.cuda.sm90.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
-from .lowering import (
-    DataIndex,
-    TensorProgram,
-    canonicalize_semantics,
-    semantic_coverage,
-)
+from .ir import DataIndex, TensorProgram
+from .lowering import canonicalize_semantics, semantic_coverage
 from .memory import distinct_workspace, verify_plan
 from .plan import (
     BodySelectionPlan,
@@ -204,17 +194,6 @@ def _uses_table_launch(graph: ComputeGraph) -> bool:
     return parameter_bytes > _TABLE_LAUNCH_PARAMETER_BYTES
 
 
-def _gemm_shapes(graph: ComputeGraph) -> tuple[tuple[int, int], ...]:
-    """Output ``(rows, columns)`` of every two-dimensional contraction."""
-    return tuple(
-        tuple(operation.tensor_program.store.shape)
-        for operation in graph.ops.values()
-        if isinstance(operation.tensor_program, TensorProgram)
-        and operation.tensor_program.family == "contraction"
-        and len(operation.tensor_program.store.shape) == 2
-    )
-
-
 # A measured candidate must match the captured reference within this
 # relative L2 error before it can be selected. Deep table-launched graphs
 # accumulate bf16 rounding differences: on the 30-layer pinned SmolLM the
@@ -284,8 +263,7 @@ class _TeacherForcedCheck:
 
 def _region_failure(selected, values, inputs, state, by_name, order, module=None) -> str | None:
     members = sorted(
-        (op_id.removeprefix("op:") for op_id in selected.source_op_ids),
-        key=order.__getitem__,
+        (op_id.removeprefix("op:") for op_id in selected.source_op_ids), key=order.__getitem__
     )
     env: dict[str, Any] = {}
 
@@ -329,7 +307,7 @@ def _region_failure(selected, values, inputs, state, by_name, order, module=None
     try:
         for name in members:
             env[name] = evaluate(by_name[name])
-    except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
+    except Exception as error:  # noqa: BLE001 - report candidate evaluation failures.
         return f"cannot evaluate {selected.region_id}: {type(error).__name__}: {error}"
     compared = 0
     for value_id in selected.outputs:
@@ -397,14 +375,10 @@ def compile_post_grad(
         )
     if policy is None:
         table_launch = _uses_table_launch(graph)
-        shapes = _gemm_shapes(graph)
-        swap_ab = table_launch and wants_swap_ab(shapes)
         policy = SelectionPolicy(
             mode=prepared.context.mode,
             table_launch=table_launch,
-            table_gemm_swap_ab=swap_ab,
-            table_gemm_swap_ab_rows=swap_ab_rows(shapes) if swap_ab else 16,
-            table_gemm_split_k=swap_ab and os.environ.get("MEGABAKE_SPLIT_K") == "1",
+            target_options=launch_options(graph, selected_target, table_launch),
         )
     if isinstance(search_budget, int):
         if search_budget < 1:
@@ -1257,7 +1231,7 @@ def _make_plan_evaluator(
                 median_isolated_launch_us=median(isolated_samples),
                 verification_complete_call_us=verification_samples[0],
             )
-        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
+        except Exception as error:  # noqa: BLE001 - convert measurement failures to results.
             return PlanMeasurement(error=f"{type(error).__name__}: {error}")
 
     return evaluate
@@ -2643,12 +2617,7 @@ def _pack_arguments(compiled: Any, arguments: tuple[Any, ...]) -> tuple[Any, Any
 
 
 def _tensor_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
-    return (
-        tensor.data_ptr(),
-        tuple(tensor.shape),
-        tuple(tensor.stride()),
-        tensor.dtype,
-    )
+    return (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
 
 def _validate_state_capacities(plan: KernelPlan, input_tensors: Mapping[str, torch.Tensor]) -> None:

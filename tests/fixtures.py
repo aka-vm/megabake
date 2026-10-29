@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from megabake.lowering import kv_attention
+from megabake.ops.attention import kv_attention
 
 
 class CompleteMLP(torch.nn.Module):

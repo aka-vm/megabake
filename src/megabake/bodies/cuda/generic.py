@@ -3,12 +3,12 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any
 
-from ...graph import DTYPE_BYTES
-from ...lowering import (
+from ...graph import DTYPE_BYTES, Region
+from ...ir import (
     Accumulator,
     AxisAffine,
     AxisIndex,
@@ -23,7 +23,26 @@ from ...lowering import (
     Unary,
     Where,
 )
-from ..interface import BodyConfig, validate_body_config
+from ...ops import GemmEpilogue, ScalarChain
+from ..interface import (
+    BodyConfig,
+    CandidateSet,
+    CompletionContract,
+    LayoutContract,
+    ParticipantContract,
+    PipelineContract,
+    ProviderRejection,
+    ResourceEvidence,
+    ScratchContract,
+    SelectionPolicy,
+    SemanticContract,
+    TargetFacts,
+    TensorLayout,
+    TileContract,
+    access_effects,
+    validate_body_config,
+    widened_participants,
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +54,8 @@ class GeneratedMapBody:
     threads_per_cta: int = 128
     tile_elements: int = 128
     tile_count: int = 1
+    # Work-iterator stride between tiles (``GeneratedBody.work_step``).
+    work_step: int = 1
     work_iterator_dtype: str = "torch.int64"
     work_iterator_encoding: str = "one flat output-tile base index per tile"
     arguments: tuple[str, ...] = (
@@ -54,6 +75,8 @@ class GeneratedReductionBody:
     threads_per_cta: int = 128
     reduction_tile: int = 128
     tile_count: int = 1
+    # Work-iterator stride between tiles (``GeneratedBody.work_step``).
+    work_step: int = 1
     scratch_elements: int = 4
     work_iterator_dtype: str = "torch.int64"
     work_iterator_encoding: str = "one flat output index per CTA"
@@ -77,6 +100,8 @@ class GeneratedContractionBody:
     output_tile_elements: int = 128
     reduction_chunk: int = 32
     tile_count: int = 1
+    # Work-iterator stride between tiles (``GeneratedBody.work_step``).
+    work_step: int = 1
     work_iterator_dtype: str = "torch.int64"
     work_iterator_encoding: str = "one flat output-tile base index per CTA; thread adds its lane"
     phases: tuple[str, ...] = (
@@ -106,9 +131,8 @@ UnsupportedReductionBody = UnsupportedMapBody
 UnsupportedContractionBody = UnsupportedMapBody
 
 
-_HOISTED_LOADS: ContextVar[Mapping[str, str]] = ContextVar(
-    "megabake_hoisted_loads",
-    default={},  # noqa: B039  # The shared empty mapping is read-only; scoped mappings use ContextVar.set().
+_HOISTED_LOADS: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "megabake_hoisted_loads", default=None
 )
 
 _CUTLASS_TYPES = {
@@ -242,6 +266,7 @@ def run(
         threads_per_cta=threads,
         tile_elements=tile_elements,
         tile_count=tile_count,
+        work_step=tile_elements,
     )
 
 
@@ -711,6 +736,7 @@ def run(
         output_tile_elements=threads,
         reduction_chunk=reduction_chunk,
         tile_count=tile_count,
+        work_step=threads,
     )
 
 
@@ -974,7 +1000,7 @@ def _emit_expression(
         if index is None:
             raise UnsupportedMapBody(f"unknown load {expression.load_id}")
         load = next(candidate for candidate in loads if candidate.id == expression.load_id)
-        hoisted = _HOISTED_LOADS.get().get(expression.load_id)
+        hoisted = (_HOISTED_LOADS.get() or {}).get(expression.load_id)
         if hoisted is not None:
             return _TypedExpression(hoisted, load.dtype)
         return _load_access(load, index, loads, axis_coordinates)
@@ -1232,3 +1258,238 @@ def _dtype_bytes(dtype: str) -> int:
         return DTYPE_BYTES[dtype]
     except KeyError as error:
         raise UnsupportedReductionBody(f"unsupported dtype {dtype}") from error
+
+
+class GenericBodyProvider:
+    provider_name = "generic"
+
+    def get_candidates(
+        self, region: Region, target: TargetFacts, policy: SelectionPolicy
+    ) -> CandidateSet:
+        if not policy.allow_generic:
+            return CandidateSet(
+                (), (ProviderRejection(self.provider_name, "generic providers disabled"),)
+            )
+        if not region.tensor_programs:
+            return CandidateSet(
+                (),
+                (ProviderRejection(self.provider_name, "region has no tensor program"),),
+            )
+        if len(region.tensor_programs) != 1:
+            return CandidateSet(
+                (),
+                (
+                    ProviderRejection(
+                        self.provider_name, "multi-program regions are not supported yet"
+                    ),
+                ),
+            )
+
+        program = region.tensor_programs[0]
+        family = program.family
+        if family == "view":
+            return CandidateSet(
+                (),
+                (ProviderRejection(self.provider_name, "aliasing view needs no device body"),),
+            )
+        if isinstance(region.semantics, GemmEpilogue):
+            # The fused region only pays off in a tuned GEMM body; without one
+            # the planner keeps the unfused GEMM and its consumers.
+            return CandidateSet(
+                (),
+                (
+                    ProviderRejection(
+                        self.provider_name, "GEMM epilogue fusion needs a tuned GEMM body"
+                    ),
+                ),
+            )
+        if family not in {
+            "elementwise",
+            "copy",
+            "gather",
+            "concat",
+            "reduction",
+            "contraction",
+        }:
+            return CandidateSet(
+                (),
+                (ProviderRejection(self.provider_name, f"unsupported program family {family}"),),
+            )
+
+        return CandidateSet((generic_config(region, program),), ())
+
+    def emit(
+        self,
+        program: TensorProgram,
+        config: BodyConfig,
+        *,
+        defer_length_publish: bool = False,
+        workers: int | None = None,
+    ) -> GeneratedMapBody | GeneratedReductionBody | GeneratedContractionBody:
+        del defer_length_publish, workers
+        if program.family in {"elementwise", "copy", "gather", "concat"}:
+            return emit_map_body(program, config)
+        if program.family == "reduction":
+            return emit_reduction_body(program, config)
+        if program.family == "contraction":
+            return emit_contraction_body(program, config)
+        raise UnsupportedMapBody(f"no generic body emits {program.family} programs")
+
+    def widen(self, program: TensorProgram, config: BodyConfig, threads: int) -> BodyConfig:
+        participants = widened_participants(config, threads)
+        output_domains = tuple(
+            domain
+            for domain in program.iteration_domains
+            if domain.axis not in program.reduction_axes
+        )
+        cta_shape = (threads,) + (1,) * max(len(output_domains) - 1, 0)
+        if program.family in {"elementwise", "copy", "gather", "concat", "contraction"}:
+            return replace(
+                config, participants=participants, tiles=replace(config.tiles, cta_shape=cta_shape)
+            )
+        if program.family == "reduction":
+            accumulator_size = DTYPE_BYTES[program.accumulator_dtype or ""]
+            return replace(
+                config,
+                participants=participants,
+                tiles=replace(config.tiles, cta_shape=cta_shape, reduction_tile=(threads,)),
+                scratch=replace(
+                    config.scratch,
+                    size_bytes=max(config.scratch.size_bytes, (threads // 32) * accumulator_size),
+                ),
+            )
+        raise UnsupportedMapBody(f"cannot widen generic {program.family} bodies")
+
+
+def generic_config(region: Region, program: Any) -> BodyConfig:
+    """The generic body contract for ``program``; tuned providers that run a
+    generic-shaped body start from it."""
+    output_axes = tuple(
+        domain.axis
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    )
+    is_reduction = program.family == "reduction"
+    is_contraction = program.family == "contraction"
+    is_fused_chain = isinstance(region.semantics, ScalarChain)
+    threads = 128
+    warp_count = threads // 32
+    scratch_bytes = warp_count * DTYPE_BYTES[program.accumulator_dtype] if is_reduction else 0
+    barriers = ("cta_reduction",) if is_reduction else ()
+    cta_shape = (128,) + (1,) * max(len(output_axes) - 1, 0)
+    completion = CompletionContract(
+        outputs_ready="assigned output elements are stored when run returns",
+        scratch_reusable="scratch is reusable after the CTA reduction barrier"
+        if is_reduction
+        else "scratch is reusable when run returns",
+        register_fragments="none",
+    )
+    evidence = (
+        ResourceEvidence(
+            measured=False,
+            source="generated CuTe reduction; composition informed by Mirage primitive-body and Hopper norm tasks",
+            revision="mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-07",
+            resources={"threads": threads, "shared_bytes": scratch_bytes},
+            measurements={},
+        )
+        if is_reduction
+        else ResourceEvidence(
+            measured=False,
+            source=(
+                "generated CuTe indexed contraction; accumulation and epilogue "
+                "structure informed by Mirage forloop-accum and threadblock epilogues"
+            ),
+            revision="mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-08",
+            resources={
+                "threads": threads,
+                "shared_bytes": scratch_bytes,
+                "reduction_chunk": 32,
+            },
+            measurements={},
+        )
+        if is_contraction
+        else ResourceEvidence(
+            measured=False,
+            source="generated baseline contract",
+            revision="task-05",
+            resources={"threads": threads, "shared_bytes": scratch_bytes},
+            measurements=(
+                {"fusion_saved_bytes": region.semantics.saved_bytes} if is_fused_chain else {}
+            ),
+        )
+    )
+    return BodyConfig(
+        provider=GenericBodyProvider.provider_name,
+        name=f"generic_{program.family}_fused" if is_fused_chain else f"generic_{program.family}",
+        semantic=SemanticContract(
+            operation_family=program.family,
+            source_op_ids=region.source_op_ids,
+            numerical_policy="source_semantics",
+            expression_hooks=("vector_chain",) if is_fused_chain else (),
+            access_effects=access_effects(program),
+        ),
+        layouts=_layouts(program),
+        tiles=TileContract(
+            cta_shape=cta_shape,
+            cluster_shape=(1,) * len(cta_shape),
+            work_partition=(
+                "one output row per CTA" if is_reduction else "one output element per thread"
+            ),
+            mma_family=None,
+            reduction_tile=(threads,) if is_reduction else (32,) if is_contraction else (),
+        ),
+        participants=ParticipantContract(
+            participating_threads=threads,
+            waiting_threads=threads,
+            warp_roles=("worker",) * (threads // 32),
+            registers_per_thread=32,
+        ),
+        pipeline=PipelineContract(
+            stage_count=1,
+            barriers=barriers,
+            async_operations=(),
+            drain_rule="no asynchronous pipeline to drain",
+        ),
+        scratch=ScratchContract(
+            owner="cta" if is_reduction else "none",
+            size_bytes=scratch_bytes,
+            alignment_bytes=16,
+        ),
+        completion=completion,
+        evidence=evidence,
+    )
+
+
+def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract:
+    domain_sizes = {domain.axis: domain.size for domain in program.iteration_domains}
+    inputs: dict[str, TensorLayout] = {}
+    for load in program.loads:
+        if load.value_id in inputs:
+            continue
+        inputs[load.value_id] = TensorLayout(
+            dtype=load.dtype,
+            axes=tuple(load.axes),
+            strides=tuple(load.strides),
+            alignment_bytes=alignment_bytes or DTYPE_BYTES[load.dtype],
+            shape=(
+                tuple(load.source_shape)
+                if load.source_shape is not None
+                else tuple(1 if isinstance(axis, int) else domain_sizes[axis] for axis in load.axes)
+            ),
+        )
+    store = program.store
+    output_axes = tuple(
+        domain.axis
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    )
+    outputs = {
+        store.value_id: TensorLayout(
+            dtype=store.dtype,
+            axes=output_axes,
+            strides=tuple(store.strides),
+            alignment_bytes=alignment_bytes or DTYPE_BYTES[store.dtype],
+            shape=tuple(store.shape),
+        )
+    }
+    return LayoutContract(inputs, outputs)

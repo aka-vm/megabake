@@ -12,7 +12,9 @@ from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.compiler import _graph_ordered_inputs
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
+from megabake.ir import IndexedLoad
 from megabake.lowering import canonicalize_semantics
+from megabake.ops import HF_EAGER_NUMERICS, Attention, CacheEffects, HeadGrouping, Mask
 from megabake.plan import (
     CuTeLayout,
     CuTeSwizzle,
@@ -500,8 +502,23 @@ def test_mode_policy_rejects_prefill_for_stateful_cache():
             return value * 2
 
     graph = _graph(Model(), torch.randn(2, 3))
-    graph.regions[0].semantic_facts["family"] = "attention"
-    graph.regions[0].semantic_facts["cache_effects"] = {"policy": "stateful"}
+    access = IndexedLoad("attention:q", "value:arg0_1", (0, 0), (3, 1), "torch.bfloat16")
+    stateful = Attention(
+        algorithm="stable_softmax",
+        numerics=HF_EAGER_NUMERICS,
+        q=access,
+        k=access,
+        v=access,
+        grouping=HeadGrouping(batch=1, query_heads=1, kv_heads=1, head_dim=3),
+        scale=1.0,
+        mask=Mask("stateful_causal", causal_offset=0),
+        outputs=(),
+        boundary_output=None,
+        cache=CacheEffects("stateful"),
+    )
+    graph = replace(
+        graph, regions=(replace(graph.regions[0], semantics=stateful), *graph.regions[1:])
+    )
 
     with pytest.raises(ValueError, match="prefill mode cannot compile"):
         select_bodies(graph, _target(), SelectionPolicy(mode="prefill"))

@@ -14,15 +14,8 @@ from megabake.bodies import emit_reduction_body
 from megabake.bodies.catalog import get_candidates
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
-from megabake.lowering import (
-    Accumulator,
-    Binary,
-    Cast,
-    Constant,
-    Load,
-    Unary,
-    canonicalize_semantics,
-)
+from megabake.ir import Accumulator, Binary, Cast, Constant, Load, Unary
+from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
 
 pytestmark = pytest.mark.skipif(

@@ -15,7 +15,7 @@ import sys
 import torch
 from transformers.activations import ACT2FN
 
-from megabake.lowering import kv_attention
+from megabake.ops.attention import kv_attention
 
 
 def text_model(model: torch.nn.Module) -> torch.nn.Module:

@@ -14,6 +14,7 @@ from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.fx_handler.export import capture_exported_program
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
+from megabake.ops import Attention
 from megabake.regions import form_regions
 from tests.fixtures import StatefulTransformerBlock, TransformerBlock
 
@@ -94,7 +95,7 @@ def test_task29_forms_a_complete_block_plan(model, inputs, mode):
     assert source_targets.count("rope") == 2
     if mode == "prefill":
         assert any(
-            candidate.semantic_facts.get("family") == "attention" and candidate.executable
+            isinstance(candidate.semantics, Attention) and candidate.executable
             for region in plan.selection.graph.regions
             for candidate in region.fusion_candidates
         )
