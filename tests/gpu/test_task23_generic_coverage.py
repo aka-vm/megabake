@@ -17,9 +17,7 @@ pytestmark = pytest.mark.skipif(
 class VisionBlock(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.randn(6, 2, 3, 3, device="cuda")
-        )
+        self.weight = torch.nn.Parameter(torch.randn(6, 2, 3, 3, device="cuda"))
         self.bias = torch.nn.Parameter(torch.randn(6, device="cuda"))
 
     def forward(self, source, residual, index):
@@ -33,9 +31,7 @@ class VisionBlock(torch.nn.Module):
             groups=2,
         )
         conv = torch.relu(conv)
-        pooled = torch.nn.functional.avg_pool2d(
-            conv, (2, 2), stride=(1, 1), padding=(1, 1)
-        )
+        pooled = torch.nn.functional.avg_pool2d(conv, (2, 2), stride=(1, 1), padding=(1, 1))
         return torch.gather(pooled, 1, index) + residual
 
 
@@ -59,7 +55,6 @@ def test_task23_compiles_vision_block_with_generic_bodies(tmp_path):
         with torch.no_grad():
             actual = optimized(source, residual, index)
             expected = model(source, residual, index)
-
 
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
         context = backend.megabake_contexts[-1]

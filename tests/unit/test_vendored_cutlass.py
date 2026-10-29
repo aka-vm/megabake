@@ -13,6 +13,7 @@ def test_cutlass_upstream_copy_is_unmodified():
     result = subprocess.run(
         [sys.executable, str(ROOT / "tools" / "vendor_cutlass.py"), "--check"],
         capture_output=True,
+        check=False,
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout

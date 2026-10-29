@@ -28,9 +28,7 @@ def dump_graph(
     directory.mkdir(parents=True, exist_ok=True)
     safe_phase = re.sub(r"[^a-z0-9_]+", "_", phase.lower()).strip("_")
     filename = PHASE_FILES.get(phase, f"phase_{safe_phase}.txt")
-    graph_text = graph.print_readable(
-        print_output=False, include_stride=True, include_device=True
-    )
+    graph_text = graph.print_readable(print_output=False, include_stride=True, include_device=True)
     contents = f"# {phase}\n"
     if details:
         contents += f"{details}\n"

@@ -56,21 +56,18 @@ def _inference_call(item):
 
 
 def _assert_one_kernel(function):
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
-    ) as profiler, torch.no_grad():
+    with (
+        torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profiler,
+        torch.no_grad(),
+    ):
         result = function()
         torch.cuda.synchronize()
-    assert len(
-        [
-            event
-            for event in profiler.events()
-            if event.device_type == DeviceType.CUDA
-        ]
-    ) == 1
+    assert len([event for event in profiler.events() if event.device_type == DeviceType.CUDA]) == 1
     return result
 
 
@@ -194,9 +191,7 @@ def test_task29_compiles_complete_stateful_decode_block(tmp_path):
         second_source = source * 0.5
         second = optimized(second_source, *inputs[1:])
         second_expected = model(second_source, *expected_inputs[1:])
-        third = _assert_one_kernel(
-            lambda: optimized(second_source, *inputs[1:])
-        )
+        third = _assert_one_kernel(lambda: optimized(second_source, *inputs[1:]))
         third_expected = model(second_source, *expected_inputs[1:])
 
     for result, reference in (
@@ -217,6 +212,4 @@ def test_task29_compiles_complete_stateful_decode_block(tmp_path):
 
     _assert_block_plan(backend)
     assert backend.megabake_last_compiled.plan.storage.state[0].capacity == 4
-    assert backend.megabake_last_compiled.plan.storage.state[0].lifetime == (
-        "boundary_state"
-    )
+    assert backend.megabake_last_compiled.plan.storage.state[0].lifetime == ("boundary_state")

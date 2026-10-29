@@ -45,6 +45,10 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 100
+extend-exclude = [
+    # This snapshot is hash-pinned and must remain byte-for-byte identical to upstream.
+    "src/megabake/bodies/cuda/sm90/cutlass_upstream",
+]
 
 [tool.ruff.lint]
 extend-ignore = [

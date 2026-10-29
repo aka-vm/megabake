@@ -90,12 +90,8 @@ def _measure(name, launch, prepare, arguments, traces, batch_size):
         launch(prepare())
     torch.cuda.synchronize()
     single_host, single_device = _single(launch, prepare, arguments.samples)
-    burst_host, burst_device = _burst(
-        launch, prepare, arguments.samples, arguments.burst
-    )
-    trace = kernel_trace(
-        lambda: launch(prepare()), traces / f"m{batch_size}-{name}-trace.json"
-    )
+    burst_host, burst_device = _burst(launch, prepare, arguments.samples, arguments.burst)
+    trace = kernel_trace(lambda: launch(prepare()), traces / f"m{batch_size}-{name}-trace.json")
     return {
         "single_launch_and_wait": _summary(single_host),
         "single_device_span": _summary(single_device),
@@ -188,9 +184,7 @@ class _MegaBakeKernel:
         epoch = self.epoch
         self.epoch += self.stride
         # Table launches number their calls and stage per-call addresses.
-        return self.state.prepare_launch(
-            self.executor, epoch, torch.cuda.current_stream()
-        )
+        return self.state.prepare_launch(self.executor, epoch, torch.cuda.current_stream())
 
     def packed(self):
         return self.arguments()
@@ -204,16 +198,12 @@ class _MegaBakeKernel:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--output", type=Path, default=Path("artifacts/isolated/mlp.json")
-    )
+    parser.add_argument("--output", type=Path, default=Path("artifacts/isolated/mlp.json"))
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 4, 256])
     parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--burst", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=16)
-    parser.add_argument(
-        "--scheduler", choices=("auto", "phase", "region-events"), default="auto"
-    )
+    parser.add_argument("--scheduler", choices=("auto", "phase", "region-events"), default="auto")
     arguments = parser.parse_args()
     root = arguments.output.parent
     traces = root / "traces"
@@ -228,12 +218,9 @@ def main() -> None:
         "records": [],
     }
     for batch_size in arguments.batches:
-        source = torch.randn(batch_size, 576, dtype=torch.bfloat16, device="cuda") / (
-            576**0.5
-        )
+        source = torch.randn(batch_size, 576, dtype=torch.bfloat16, device="cuda") / (576**0.5)
         weights = tuple(
-            torch.randn(rows, columns, dtype=torch.bfloat16, device="cuda")
-            / (columns**0.5)
+            torch.randn(rows, columns, dtype=torch.bfloat16, device="cuda") / (columns**0.5)
             for rows, columns in ((1536, 576), (1536, 576), (576, 1536))
         )
         inputs = (source, *weights)
@@ -249,9 +236,7 @@ def main() -> None:
             traces,
             batch_size,
         )
-        modes["eager_graph"]["relative_l2_error"] = _relative_l2(
-            eager_result, reference
-        )
+        modes["eager_graph"]["relative_l2_error"] = _relative_l2(eager_result, reference)
 
         inductor = torch.compile(
             mlp, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs"
@@ -266,9 +251,7 @@ def main() -> None:
             traces,
             batch_size,
         )
-        modes["inductor_graph"]["relative_l2_error"] = _relative_l2(
-            inductor_result, reference
-        )
+        modes["inductor_graph"]["relative_l2_error"] = _relative_l2(inductor_result, reference)
 
         backend = make_backend(scheduler=arguments.scheduler, compile_kernel=True)
         bound = torch.compile(mlp, backend=backend, fullgraph=True, dynamic=False)
@@ -300,9 +283,7 @@ def main() -> None:
                 traces,
                 batch_size,
             )
-            modes["megabake_fast"]["relative_l2_error"] = _relative_l2(
-                megabake.output, reference
-            )
+            modes["megabake_fast"]["relative_l2_error"] = _relative_l2(megabake.output, reference)
         modes["megabake_call"] = _measure(
             "megabake_call",
             megabake.launch_call,
@@ -311,15 +292,11 @@ def main() -> None:
             traces,
             batch_size,
         )
-        modes["megabake_call"]["relative_l2_error"] = _relative_l2(
-            megabake.output, reference
-        )
+        modes["megabake_call"]["relative_l2_error"] = _relative_l2(megabake.output, reference)
 
         for name, mode in modes.items():
             if not mode["relative_l2_error"] < 0.01:
-                raise RuntimeError(
-                    f"{name} relative L2 error {mode['relative_l2_error']}"
-                )
+                raise RuntimeError(f"{name} relative L2 error {mode['relative_l2_error']}")
 
         artifact = root / f"m{batch_size}-megabake-kernel"
         artifact.mkdir(parents=True, exist_ok=True)
@@ -330,9 +307,7 @@ def main() -> None:
             json.dumps(
                 {
                     "kernel_name": resources.kernel_name,
-                    "selected_plan": getattr(
-                        compiled.search, "selected_description", None
-                    ),
+                    "selected_plan": getattr(compiled.search, "selected_description", None),
                     "workers": compiled.plan.launch.grid_size,
                     "threads_per_block": compiled.plan.launch.threads_per_block,
                     "registers_per_thread": resources.registers_per_thread,
@@ -359,9 +334,7 @@ def main() -> None:
             }
         )
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
-        arguments.output.write_text(
-            json.dumps(report, indent=2) + "\n", encoding="utf-8"
-        )
+        arguments.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
         print(f"\nM={batch_size}  (microseconds, medians)", flush=True)
         print(

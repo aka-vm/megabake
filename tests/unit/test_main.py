@@ -28,9 +28,7 @@ def test_transformers_cli_dumps_all_graphs(tmp_path, monkeypatch):
         context=prepared.context,
         run=lambda value: model(value.float(), weight, bias),
     )
-    monkeypatch.setattr(
-        "megabake.main.make_backend", lambda **kwargs: SimpleNamespace()
-    )
+    monkeypatch.setattr("megabake.main.make_backend", lambda **kwargs: SimpleNamespace())
     monkeypatch.setattr(
         "megabake.main.capture_transformer",
         lambda *args, **kwargs: capture,

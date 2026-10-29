@@ -27,14 +27,17 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+from typing import Optional, Tuple, Type
 import math
-
 import cuda.bindings.driver as cuda
+
 import cutlass
-import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import cute, pipeline, utils
-from cutlass.cute import testing
+import cutlass.cute as cute
+import cutlass.cute.testing as testing
+import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+import cutlass.utils as utils
+import cutlass.utils.hopper_helpers as sm90_utils
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -106,7 +109,9 @@ def parse_comma_separated_ints(s: str):
     try:
         return tuple([int(x.strip()) for x in s.split(",")])
     except ValueError:
-        raise argparse.ArgumentTypeError("Invalid format. Expected comma-separated integers.")
+        raise argparse.ArgumentTypeError(
+            "Invalid format. Expected comma-separated integers."
+        )
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -168,15 +173,21 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--a_major", choices=["k", "m"], type=str, default="k")
     parser.add_argument("--b_major", choices=["k", "n"], type=str, default="k")
     parser.add_argument("--c_major", choices=["n", "m"], type=str, default="n")
-    parser.add_argument("--tolerance", type=float, default=1e-01, help="Tolerance for validation")
-    parser.add_argument("--warmup_iterations", type=int, default=0, help="Warmup iterations")
+    parser.add_argument(
+        "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
+    )
+    parser.add_argument(
+        "--warmup_iterations", type=int, default=0, help="Warmup iterations"
+    )
     parser.add_argument(
         "--iterations",
         type=int,
         default=1,
         help="Number of iterations to run the kernel",
     )
-    parser.add_argument("--skip_ref_check", action="store_true", help="Skip reference checking")
+    parser.add_argument(
+        "--skip_ref_check", action="store_true", help="Skip reference checking"
+    )
     parser.add_argument(
         "--use_cold_l2",
         action="store_true",
@@ -270,7 +281,9 @@ class HopperWgmmaGemmPersistentKernel:
         # For large tile size, using two warp groups is preferred because using only one warp
         # group may result in register spill
         self.atom_layout_mnk = (
-            (2, 1, 1) if self.tile_shape_mnk[0] > 64 and self.tile_shape_mnk[1] > 128 else (1, 1, 1)
+            (2, 1, 1)
+            if self.tile_shape_mnk[0] > 64 and self.tile_shape_mnk[1] > 128
+            else (1, 1, 1)
         )
         self.num_mcast_ctas_a = None
         self.num_mcast_ctas_b = None
@@ -287,7 +300,9 @@ class HopperWgmmaGemmPersistentKernel:
             self.num_dma_warp_groups + self.num_mma_warp_groups
         ) * self.num_threads_per_warp_group
         self.load_warp_id = 0
-        self.epi_store_warp_id = self.num_dma_warp_groups * self.num_warps_per_warp_group
+        self.epi_store_warp_id = (
+            self.num_dma_warp_groups * self.num_warps_per_warp_group
+        )
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
@@ -303,7 +318,9 @@ class HopperWgmmaGemmPersistentKernel:
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
-        self.num_mma_threads = self.num_mma_warp_groups * self.num_threads_per_warp_group
+        self.num_mma_threads = (
+            self.num_mma_warp_groups * self.num_threads_per_warp_group
+        )
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.num_mma_threads
         )
@@ -420,10 +437,14 @@ class HopperWgmmaGemmPersistentKernel:
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        if cutlass.const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
+        if cutlass.const_expr(
+            self.a_dtype.width == 16 and self.a_dtype != self.b_dtype
+        ):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
         if cutlass.const_expr(self.a_dtype.width != self.b_dtype.width):
-            raise TypeError(f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}")
+            raise TypeError(
+                f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
+            )
         if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16, float8, or int8 ")
 
@@ -460,13 +481,19 @@ class HopperWgmmaGemmPersistentKernel:
 
         @cute.struct
         class SharedStorage:
-            mainloop_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
+            mainloop_pipeline_array_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.ab_stage * 2
+            ]
             sA: cute.struct.Align[
-                cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.a_dtype, cute.cosize(self.a_smem_layout_staged)
+                ],
                 self.buffer_align_bytes,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
+                cute.struct.MemRange[
+                    self.b_dtype, cute.cosize(self.b_smem_layout_staged)
+                ],
                 self.buffer_align_bytes,
             ]
             sC: cute.struct.Align[
@@ -500,6 +527,7 @@ class HopperWgmmaGemmPersistentKernel:
             min_blocks_per_mp=1,
             stream=stream,
         )
+        return
 
     # GPU device kernel
     @cute.kernel
@@ -557,19 +585,25 @@ class HopperWgmmaGemmPersistentKernel:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
 
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
         cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
 
-        a_mcast_mask = cute.make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=1)
-        b_mcast_mask = cute.make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=0)
+        a_mcast_mask = cute.make_layout_image_mask(
+            cta_layout_mnk, cluster_coord_mnk, mode=1
+        )
+        b_mcast_mask = cute.make_layout_image_mask(
+            cta_layout_mnk, cluster_coord_mnk, mode=0
+        )
 
         a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
-        tma_copy_bytes = cute.size_in_bytes(self.a_dtype, a_smem_layout) + cute.size_in_bytes(
-            self.b_dtype, b_smem_layout
-        )
+        tma_copy_bytes = cute.size_in_bytes(
+            self.a_dtype, a_smem_layout
+        ) + cute.size_in_bytes(self.b_dtype, b_smem_layout)
 
         # Alloc and init AB full/empty + ACC full mbar (pipeline)
         smem = cutlass.utils.SmemAllocator()
@@ -579,10 +613,14 @@ class HopperWgmmaGemmPersistentKernel:
         mainloop_pipeline_array_ptr = storage.mainloop_pipeline_array_ptr.data_ptr()
 
         # Threads/warps participating in this pipeline
-        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        mainloop_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread
+        )
         # Each warp will constribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_arrive_cnt = mcast_size * self.num_mma_warp_groups * self.num_warps_per_warp_group
+        consumer_arrive_cnt = (
+            mcast_size * self.num_mma_warp_groups * self.num_warps_per_warp_group
+        )
         mainloop_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
@@ -601,8 +639,12 @@ class HopperWgmmaGemmPersistentKernel:
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # Generate smem tensor A/B
-        sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
-        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
+        sA = storage.sA.get_tensor(
+            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
+        )
+        sB = storage.sB.get_tensor(
+            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
+        )
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
@@ -651,7 +693,9 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
         # Partition global tensor for TiledMMA_A/B/C
-        warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+        warp_group_idx = cute.arch.make_warp_uniform(
+            tidx // self.num_threads_per_warp_group
+        )
         mma_warp_group_thread_layout = cute.make_layout(
             self.num_mma_warp_groups, stride=self.num_threads_per_warp_group
         )
@@ -710,14 +754,18 @@ class HopperWgmmaGemmPersistentKernel:
                         tma_atom_a,
                         tAgA_k,
                         tAsA_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                            mainloop_producer_state
+                        ),
                         mcast_mask=a_mcast_mask,
                     )
                     cute.copy(
                         tma_atom_b,
                         tBgB_k,
                         tBsB_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(mainloop_producer_state),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                            mainloop_producer_state
+                        ),
                         mcast_mask=b_mcast_mask,
                     )
 
@@ -877,7 +925,9 @@ class HopperWgmmaGemmPersistentKernel:
 
                 epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1])
                 epi_tile_shape = tCgC_for_tma_partition.shape[1]
-                epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
+                epi_tile_layout = cute.make_layout(
+                    epi_tile_shape, stride=(epi_tile_shape[1], 1)
+                )
 
                 num_prev_epi_tiles = tile_sched.num_tiles_executed * epi_tile_num
                 for epi_idx in cutlass.range_constexpr(epi_tile_num):
@@ -890,7 +940,9 @@ class HopperWgmmaGemmPersistentKernel:
                     tRS_rD_out.store(acc_vec.to(self.c_dtype))
 
                     # Copy from D registers to shared memory
-                    epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(tRS_sD, mode=[3])
+                    epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(
+                        tRS_sD, mode=[3]
+                    )
                     cute.copy(
                         tiled_copy_r2s,
                         tRS_rD_out,
@@ -956,7 +1008,8 @@ class HopperWgmmaGemmPersistentKernel:
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
         ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8 + cute.size(b_shape) * b_dtype.width // 8
+            cute.size(a_shape) * a_dtype.width // 8
+            + cute.size(b_shape) * b_dtype.width // 8
         )
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_stage = 4
@@ -974,7 +1027,7 @@ class HopperWgmmaGemmPersistentKernel:
         tile_shape_mnk: tuple[int, int, int],
         element_type: type[cutlass.Numeric],
         is_cooperative: bool = False,
-        epi_tile_override: tuple[int, int] | None = None,
+        epi_tile_override: Optional[tuple[int, int]] = None,
     ) -> tuple[int, int]:
         """Compute the epilogue tile shape or use override if provided.
 
@@ -1043,8 +1096,12 @@ class HopperWgmmaGemmPersistentKernel:
         """
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
 
-        a_is_k_major = a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
-        b_is_k_major = b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
+        a_is_k_major = (
+            a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
+        )
+        b_is_k_major = (
+            b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
+        )
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
         a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
             sm90_utils.get_smem_layout_atom(
@@ -1202,10 +1259,10 @@ class HopperWgmmaGemmPersistentKernel:
 
     @staticmethod
     def is_valid_dtypes(
-        a_dtype: type[cutlass.Numeric],
-        b_dtype: type[cutlass.Numeric],
-        acc_dtype: type[cutlass.Numeric],
-        c_dtype: type[cutlass.Numeric],
+        a_dtype: Type[cutlass.Numeric],
+        b_dtype: Type[cutlass.Numeric],
+        acc_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
         a_major: str,
         b_major: str,
     ) -> bool:
@@ -1251,7 +1308,9 @@ class HopperWgmmaGemmPersistentKernel:
             is_valid = False
 
         # for 8-bit types, this implementation only supports k-major layout
-        if (a_dtype.width == 8 and a_major != "k") or (b_dtype.width == 8 and b_major != "k"):
+        if (a_dtype.width == 8 and a_major != "k") or (
+            b_dtype.width == 8 and b_major != "k"
+        ):
             is_valid = False
 
         # Define compatibility mapping between accumulator type and AB type
@@ -1306,8 +1365,8 @@ class HopperWgmmaGemmPersistentKernel:
         n: int,
         k: int,
         l: int,
-        ab_dtype: type[cutlass.Numeric],
-        c_dtype: type[cutlass.Numeric],
+        ab_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
         a_major: str,
         b_major: str,
         c_major: str,
@@ -1355,16 +1414,16 @@ class HopperWgmmaGemmPersistentKernel:
 
 
 def run(
-    mnkl: tuple[int, int, int, int],
-    a_dtype: type[cutlass.Numeric],
-    b_dtype: type[cutlass.Numeric],
-    c_dtype: type[cutlass.Numeric],
-    acc_dtype: type[cutlass.Numeric],
+    mnkl: Tuple[int, int, int, int],
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
     a_major: str,
     b_major: str,
     c_major: str,
-    tile_shape_mn: tuple[int, int],
-    cluster_shape_mn: tuple[int, int],
+    tile_shape_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
     swizzle_size: int = 1,
     raster_along_m: bool = True,
     tolerance: float = 1e-01,
@@ -1406,12 +1465,14 @@ def run(
     :return: Execution time of the GEMM kernel in microseconds
     :rtype: float
     """
-    import cutlass.torch as cutlass_torch
     import torch
+    import cutlass.torch as cutlass_torch
 
     print("Running Hopper Persistent Dense GEMM with:")
     print(f"mnkl: {mnkl}")
-    print(f"A dtype: {a_dtype}, B dtype: {b_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}")
+    print(
+        f"A dtype: {a_dtype}, B dtype: {b_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}"
+    )
     print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
     print(f"Tile Shape: {tile_shape_mn}, Cluster Shape: {cluster_shape_mn}")
     print(
@@ -1436,7 +1497,9 @@ def run(
     if not HopperWgmmaGemmPersistentKernel.is_valid_tensor_alignment(
         m, n, k, l, a_dtype, c_dtype, a_major, b_major, c_major
     ):
-        raise TypeError("the contiguous dimension of A/B/C tensors is not 16 bytes aligned")
+        raise TypeError(
+            "the contiguous dimension of A/B/C tensors is not 16 bytes aligned"
+        )
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
@@ -1468,7 +1531,9 @@ def run(
     torch_stream = torch.cuda.Stream()
     stream = cuda.CUstream(torch_stream.cuda_stream)
     # Compile gemm kernel
-    compiled_gemm = cute.compile(gemm, a_tensor, b_tensor, c_tensor, max_active_clusters, stream)
+    compiled_gemm = cute.compile(
+        gemm, a_tensor, b_tensor, c_tensor, max_active_clusters, stream
+    )
 
     if not skip_ref_check:
         compiled_gemm(a_tensor, b_tensor, c_tensor, stream)
@@ -1541,7 +1606,7 @@ if __name__ == "__main__":
         args.tile_shape_mn,
         args.cluster_shape_mn,
         args.swizzle_size,
-        args.raster_order == "along_m",
+        True if args.raster_order == "along_m" else False,
         args.tolerance,
         args.warmup_iterations,
         args.iterations,

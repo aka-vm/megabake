@@ -3,22 +3,22 @@
 import hashlib
 import json
 import os
-from dataclasses import dataclass
-from pathlib import Path
 import statistics
 import sys
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
-import torch
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
+import cutlass
+import torch
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "design_2026_10_08"))
 import resident_range_probe as range_probe
-from probe import REV, HASHES, source
+from probe import HASHES, REV, source
 
 
 @cute.jit
@@ -170,8 +170,7 @@ _vector_body_sources = [
 ]
 _generated_path = Path(__file__).with_name("generated_typed_bodies.py")
 _generated_path.write_text(
-    "import cutlass\nimport cutlass.cute as cute\n\n"
-    + "\n".join(_vector_body_sources)
+    "import cutlass\nimport cutlass.cute as cute\n\n" + "\n".join(_vector_body_sources)
 )
 _generated_module = range_probe._load(_generated_path, "megabake_generated_typed_bodies")
 _vector_affine = _generated_module._vector_affine
@@ -188,7 +187,13 @@ GENERATED_BODY_SPECS = [
     }
     for name, expression, input_dtype, accumulator_dtype, source_text in (
         ("_vector_affine", "cast_f32(x) * scale + offset", "bf16", None, _vector_body_sources[0]),
-        ("_vector_row_bias", "cast_f32(x) + cast_f32(row) * scale + offset", "bf16", None, _vector_body_sources[1]),
+        (
+            "_vector_row_bias",
+            "cast_f32(x) + cast_f32(row) * scale + offset",
+            "bf16",
+            None,
+            _vector_body_sources[1],
+        ),
         ("_row_reduce", "sum(cast_f32(x))", "bf16", "f32", _vector_body_sources[2]),
     )
 ]
@@ -237,10 +242,8 @@ def _mixed_class(base):
             # bypass the GEMM pipeline and still join the phase barriers.
             tiles0 = cute.size(work0.problem_shape_ntile_mnl)
             active0 = workers // 2
-            if active0 > tiles0 // 2:
-                active0 = tiles0 // 2
-            if active0 < 1:
-                active0 = 1
+            active0 = min(active0, tiles0 // 2)
+            active0 = max(active0, 1)
             if block < active0:
                 self.run_range(
                     work0,
@@ -299,10 +302,8 @@ def _mixed_class(base):
 
             tiles1 = cute.size(work1.problem_shape_ntile_mnl)
             active1 = workers // 2
-            if active1 > tiles1 // 2:
-                active1 = tiles1 // 2
-            if active1 < 1:
-                active1 = 1
+            active1 = min(active1, tiles1 // 2)
+            active1 = max(active1, 1)
             if block < active1:
                 self.run_range(
                     work1,
@@ -405,25 +406,17 @@ def _mixed_class(base):
 
             @cute.struct
             class SharedStorage:
-                mainloop_pipeline_array_ptr: cute.struct.MemRange[
-                    cutlass.Int64, self.ab_stage * 2
-                ]
+                mainloop_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
                 sA: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.a_dtype, cute.cosize(self.a_smem_layout_staged)
-                    ],
+                    cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged)],
                     self.buffer_align_bytes,
                 ]
                 sB: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.b_dtype, cute.cosize(self.b_smem_layout_staged)
-                    ],
+                    cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
                     self.buffer_align_bytes,
                 ]
                 sC: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.c_dtype, cute.cosize(self.epi_smem_layout_staged)
-                    ],
+                    cute.struct.MemRange[self.c_dtype, cute.cosize(self.epi_smem_layout_staged)],
                     self.buffer_align_bytes,
                 ]
 
@@ -471,15 +464,11 @@ def _mixed_class(base):
 
 
 def _matrix(tensor):
-    return from_dlpack(tensor.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
+    return from_dlpack(tensor.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(leading_dim=1)
 
 
 def _flat(tensor):
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
+    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
 
 
 def _bindings(m, max_workers, seed):
@@ -512,9 +501,15 @@ def _reference(inputs):
 
 def _check(compiled, args, inputs, expected, workers, epoch, delay_cta, stream, profile=False):
     matrix, flat = args
-    x, gate, down, t, u, rows, v, y, ready, delay_sink = inputs
-    launch_args = (*matrix, *flat, cutlass.Int32(workers), cutlass.Int32(epoch),
-                   cutlass.Int32(delay_cta), stream)
+    _x, _gate, _down, t, u, rows, v, y, ready, delay_sink = inputs
+    launch_args = (
+        *matrix,
+        *flat,
+        cutlass.Int32(workers),
+        cutlass.Int32(epoch),
+        cutlass.Int32(delay_cta),
+        stream,
+    )
     if profile:
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
@@ -526,7 +521,9 @@ def _check(compiled, args, inputs, expected, workers, epoch, delay_cta, stream, 
         torch.cuda.synchronize()
         profiler = None
     for name, actual in (("t", t), ("u", u), ("rows", rows), ("v", v), ("y", y)):
-        err = (actual.float() - expected[name].float()).norm() / expected[name].float().norm().clamp_min(1e-6)
+        err = (actual.float() - expected[name].float()).norm() / expected[
+            name
+        ].float().norm().clamp_min(1e-6)
         assert torch.isfinite(actual).all().item(), name
         assert err.item() < 0.01, {
             "name": name,
@@ -537,9 +534,9 @@ def _check(compiled, args, inputs, expected, workers, epoch, delay_cta, stream, 
             "max_actual": actual.flatten()[
                 (actual.float() - expected[name].float()).abs().argmax().item()
             ].item(),
-            "max_expected": expected[name].flatten()[
-                (actual.float() - expected[name].float()).abs().argmax().item()
-            ].item(),
+            "max_expected": expected[name]
+            .flatten()[(actual.float() - expected[name].float()).abs().argmax().item()]
+            .item(),
             "actual": actual.flatten()[:8].float().tolist(),
             "expected": expected[name].flatten()[:8].float().tolist(),
             "rows": rows.float().tolist(),
@@ -567,14 +564,17 @@ def _query_resources(compiled, threads, shared_bytes):
         for label, attribute in (
             ("registers_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS),
             ("static_shared_bytes", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
-            ("local_bytes_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            (
+                "local_bytes_per_thread",
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+            ),
         ):
             status, value = cuda.cuKernelGetAttribute(attribute, kernel, 0)
             assert int(status) == 0, status
             values[label] = value
         status, function = cuda.cuKernelGetFunction(kernel)
         assert int(status) == 0, status
-        status, = cuda.cuFuncSetAttribute(
+        (status,) = cuda.cuFuncSetAttribute(
             function,
             cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             shared_bytes,
@@ -616,7 +616,7 @@ def main():
     first_args, first_tensors = _bindings(first_m, 60, 501)
     matrices, flats = first_args
     properties = torch.cuda.get_device_properties(0)
-    device, = cuda.cuDeviceGet(0)[1:]
+    (device,) = cuda.cuDeviceGet(0)[1:]
     status, cooperative = cuda.cuDeviceGetAttribute(
         cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH, device
     )
@@ -700,18 +700,24 @@ def main():
         )
         if trace:
             traces.append(trace)
-        correctness.append({
-            "m": tensors[0].shape[0],
-            "epoch": epoch,
-            "delay_cta": delay_cta,
-            "delay_sum": tensors[9][delay_cta].item(),
-            "max_abs_error": {
-                key: (tensor.float() - expected[key].float()).abs().max().item()
-                for key, tensor in (("t", tensors[3]), ("u", tensors[4]),
-                                    ("rows", tensors[5]), ("v", tensors[6]),
-                                    ("y", tensors[7]))
-            },
-        })
+        correctness.append(
+            {
+                "m": tensors[0].shape[0],
+                "epoch": epoch,
+                "delay_cta": delay_cta,
+                "delay_sum": tensors[9][delay_cta].item(),
+                "max_abs_error": {
+                    key: (tensor.float() - expected[key].float()).abs().max().item()
+                    for key, tensor in (
+                        ("t", tensors[3]),
+                        ("u", tensors[4]),
+                        ("rows", tensors[5]),
+                        ("v", tensors[6]),
+                        ("y", tensors[7]),
+                    )
+                },
+            }
+        )
 
     gpu_samples = []
     host_samples = []
@@ -757,7 +763,7 @@ def main():
                 "threads_per_cta": op.threads_per_cta,
                 "dma_warp_group": "warps 0-3; warp 0 issues TMA loads",
                 "mma_warp_group": "warps 4-7 issue WGMMA and perform the epilogue reduction/store work",
-                "tma_store_warp": 4
+                "tma_store_warp": 4,
             },
             "scratch": "one CTA-local SharedStorage allocated by the enclosing kernel and reused only after TMA store tail completion",
             "epilogue": "source GEMM TMA output followed by generated BF16 vector and row-reduction work",

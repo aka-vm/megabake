@@ -153,9 +153,7 @@ def test_form_regions_pairs_gate_and_up_gemms_with_their_activation():
     graph = form_regions(_import(Model(), source, gate_weight, up_weight))
 
     candidate = next(
-        candidate
-        for candidate in _epilogue_candidates(graph)
-        if candidate.semantic_facts["paired"]
+        candidate for candidate in _epilogue_candidates(graph) if candidate.semantic_facts["paired"]
     )
     assert candidate.source_op_ids == (
         "op:mm",
@@ -197,9 +195,7 @@ def test_form_regions_does_not_pair_gemms_whose_results_escape():
     up_weight = torch.randn(6, 8, dtype=torch.bfloat16)
     graph = form_regions(_import(Model(), source, gate_weight, up_weight))
 
-    assert not any(
-        candidate.semantic_facts["paired"] for candidate in _epilogue_candidates(graph)
-    )
+    assert not any(candidate.semantic_facts["paired"] for candidate in _epilogue_candidates(graph))
 
 
 def test_form_regions_fuses_residual_add_into_gemm_epilogue():
@@ -240,9 +236,7 @@ def test_form_regions_matches_view_plus_gemm_and_preserves_alias_index_map():
     bias = torch.randn(4)
     graph = form_regions(_import(Model(), x, weight, bias))
 
-    gemm_region = next(
-        region for region in graph.regions if region.id == "region:addmm"
-    )
+    gemm_region = next(region for region in graph.regions if region.id == "region:addmm")
     facts = gemm_region.semantic_facts
     assert facts["family"] == "view_plus_gemm"
     assert facts["view"] == "op:permute"
@@ -295,15 +289,11 @@ def test_form_regions_keeps_unfamiliar_operations_representable():
     torch.manual_seed(47)
     x = torch.randn(2, 3)
     graph_module = torch.fx.symbolic_trace(Model())
-    unknown_node = next(
-        node for node in graph_module.graph.nodes if node.op == "call_function"
-    )
+    unknown_node = next(node for node in graph_module.graph.nodes if node.op == "call_function")
     unknown_node.meta["val"] = x
     unknown_node.args = ()
     unknown_operation_id = f"op:{unknown_node.name}"
-    graph = form_regions(
-        canonicalize_semantics(import_fx(graph_module, _context(graph_module, x)))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(graph_module, _context(graph_module, x))))
 
     unknown_region = graph.regions[0]
     assert unknown_region.source_op_ids == (unknown_operation_id,)
@@ -359,14 +349,8 @@ def test_form_regions_matches_exact_rope_and_keeps_unfamiliar_variants_generic()
     class Model(torch.nn.Module):
         def forward(self, source, cosine, sine):
             half = source.shape[-1] // 2
-            first = (
-                source[..., :half] * cosine[..., :half]
-                - source[..., half:] * sine[..., :half]
-            )
-            second = (
-                source[..., half:] * sine[..., half:]
-                + source[..., :half] * cosine[..., half:]
-            )
+            first = source[..., :half] * cosine[..., :half] - source[..., half:] * sine[..., :half]
+            second = source[..., half:] * sine[..., half:] + source[..., :half] * cosine[..., half:]
             return torch.cat((first, second), dim=-1)
 
     torch.manual_seed(24)
@@ -428,15 +412,11 @@ def test_form_regions_matches_exact_rope_and_keeps_unfamiliar_variants_generic()
 
 def _grouped_attention(source, key, value, mask):
     query = source.permute(0, 2, 1, 3)
-    grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(
-        source.shape[2] // key.shape[2], dim=1
-    )
+    grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(source.shape[2] // key.shape[2], dim=1)
     grouped_value = value.permute(0, 2, 1, 3).repeat_interleave(
         source.shape[2] // value.shape[2], dim=1
     )
-    scores = (
-        query @ grouped_key.transpose(-2, -1)
-    ) * source.shape[-1] ** -0.5 + mask
+    scores = (query @ grouped_key.transpose(-2, -1)) * source.shape[-1] ** -0.5 + mask
     probabilities = torch.softmax(scores.float(), dim=-1).to(source.dtype)
     return probabilities @ grouped_value, scores
 
@@ -556,9 +536,7 @@ def test_task25_preserves_functional_kv_cache_append_effects():
         def forward(self, source, past_key, key, past_value, value, mask):
             full_key = torch.cat((past_key, key), dim=1)
             full_value = torch.cat((past_value, value), dim=1)
-            output, scores = _grouped_attention(
-                source, full_key, full_value, mask
-            )
+            output, scores = _grouped_attention(source, full_key, full_value, mask)
             return output, scores, full_key, full_value
 
     torch.manual_seed(25)
@@ -568,9 +546,7 @@ def test_task25_preserves_functional_kv_cache_append_effects():
     past_value = torch.randn(1, 1, 2, 8, dtype=torch.bfloat16)
     value = torch.randn(1, 2, 2, 8, dtype=torch.bfloat16)
     mask = torch.randn(1, 1, 2, 3)
-    graph = form_regions(
-        _import(Model(), source, past_key, key, past_value, value, mask)
-    )
+    graph = form_regions(_import(Model(), source, past_key, key, past_value, value, mask))
 
     candidate = next(
         candidate
@@ -640,14 +616,8 @@ def test_form_regions_rope_reads_each_half_at_its_source_slices():
     class Model(torch.nn.Module):
         def forward(self, source, cosine, sine):
             half = source.shape[-1] // 2
-            first = (
-                source[..., :half] * cosine[..., :half]
-                - source[..., half:] * sine[..., :half]
-            )
-            second = (
-                source[..., half:] * sine[..., :half]
-                + source[..., :half] * cosine[..., :half]
-            )
+            first = source[..., :half] * cosine[..., :half] - source[..., half:] * sine[..., :half]
+            second = source[..., half:] * sine[..., :half] + source[..., :half] * cosine[..., :half]
             return torch.cat((first, second), dim=-1)
 
     source = torch.randn(3, 6, dtype=torch.bfloat16)
@@ -667,9 +637,7 @@ def test_form_regions_rope_reads_each_half_at_its_source_slices():
         return 0 if isinstance(axis, str) else axis.offset
 
     trig_offsets = {
-        (load.value_id, offset(load))
-        for load in program.loads
-        if load.value_id != "value:arg0_1"
+        (load.value_id, offset(load)) for load in program.loads if load.value_id != "value:arg0_1"
     }
     # The second half reuses the first-half trig values, so it reads them
     # half a width earlier than its own output coordinate.

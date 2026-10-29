@@ -16,14 +16,26 @@ def _tiny_models():
     )
 
     llama = LlamaConfig(
-        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
     )
     # One KV head, sliding and full layers, and a query_pre_attn_scalar scale.
     gemma = Gemma3TextConfig(
-        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=1, head_dim=32,
-        query_pre_attn_scalar=24, sliding_window=4, max_position_embeddings=64,
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=32,
+        query_pre_attn_scalar=24,
+        sliding_window=4,
+        max_position_embeddings=64,
         layer_types=["sliding_attention", "full_attention"],
     )
     return (("llama", LlamaForCausalLM, llama), ("gemma3", Gemma3ForCausalLM, gemma))
@@ -86,7 +98,11 @@ def test_decode_step_matches_hugging_face_decode(name, model_class, config):
             cache = out.past_key_values
             expected.append(out.logits)
         step = DecodeStep(model, capacity=8)
-        state = [torch.zeros(s, dtype=d if d == torch.int32 else torch.float32) for layer in step.state_shapes() for s, d in layer]
+        state = [
+            torch.zeros(s, dtype=d if d == torch.int32 else torch.float32)
+            for layer in step.state_shapes()
+            for s, d in layer
+        ]
         for position in range(tokens.shape[1]):
             actual = step(tokens[:, position : position + 1], torch.tensor([[position]]), *state)
             torch.testing.assert_close(actual, expected[position], rtol=1e-4, atol=1e-4)
@@ -99,8 +115,13 @@ def test_decode_step_rejects_undeclared_token_mixers():
     from megabake.fx_handler import DecodeStep
 
     config = Qwen3_5TextConfig(
-        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=16,
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
         layer_types=["linear_attention", "full_attention"],
     )
     with pytest.raises(NotImplementedError, match="linear_attention"):

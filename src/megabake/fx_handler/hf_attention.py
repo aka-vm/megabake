@@ -48,8 +48,15 @@ def megabake_attention_forward(
         # Not covered by the declared op yet: keep the model's own eager path.
         eager = sys.modules[type(module).__module__].eager_attention_forward
         return eager(
-            module, query, key, value, attention_mask,
-            dropout=dropout, scaling=scaling, softcap=softcap, **kwargs,
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            softcap=softcap,
+            **kwargs,
         )
     if scaling is None:
         scaling = query.shape[-1] ** -0.5
@@ -121,8 +128,15 @@ def megabake_decode_attention(
     cache. The cache holds every earlier token, so the causal mask is implied."""
     if megabake_state is None:
         return megabake_attention_forward(
-            module, query, key, value, attention_mask,
-            dropout=dropout, scaling=scaling, softcap=softcap, **kwargs,
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            softcap=softcap,
+            **kwargs,
         )
     if softcap is not None or kwargs.get("s_aux") is not None:
         raise NotImplementedError("decode attention with soft cap or sinks is not declared yet")
@@ -138,8 +152,12 @@ def megabake_decode_attention(
         query = query * (scaling * dim**0.5)
     batch, heads, length, _ = query.shape
     output = torch.ops.megabake.kv_attention(
-        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
-        key_cache, value_cache, valid_length,
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+        key_cache,
+        value_cache,
+        valid_length,
     )
     return output.view(batch, heads, length, dim).transpose(1, 2).contiguous(), None
 
@@ -169,7 +187,9 @@ class DecodeStep(torch.nn.Module):
             raise NotImplementedError(f"decode of {sorted(unsupported)} layers is not declared yet")
         self.layer_count = config.num_hidden_layers
         self.kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        self.head_dim = (
+            getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+        )
 
     def state_shapes(self, batch: int = 1, dtype: torch.dtype = torch.bfloat16):
         cache = ((batch, self.capacity, self.kv_heads, self.head_dim), dtype)

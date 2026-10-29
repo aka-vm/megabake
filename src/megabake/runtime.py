@@ -58,7 +58,7 @@ def ready_slots(workers: int) -> int:
 # 60-SM H200 slice (artifacts/step3_2026-10-21). Issuing them blocks warp 0
 # once the SM's TMA queue is full, so they overlap little beyond the barrier
 # wait.
-WEIGHT_STREAM_STAGES = int(os.environ.get("MEGABAKE_WEIGHT_STREAM_STAGES", 0))
+WEIGHT_STREAM_STAGES = int(os.environ.get("MEGABAKE_WEIGHT_STREAM_STAGES", "0"))
 
 
 # Host-mapped buffers holding table launches' per-call boundary addresses;

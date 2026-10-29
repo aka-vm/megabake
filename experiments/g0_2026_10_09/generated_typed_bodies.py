@@ -1,5 +1,6 @@
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
+
 
 @cute.jit
 def _vector_affine(
@@ -16,8 +17,9 @@ def _vector_affine(
     first = block * threads + thread
     step = workers * threads
     for i in cutlass.range(first, count, step):
-        value = (((source[i]).to(cutlass.Float32) * scale) + offset)
+        value = ((source[i]).to(cutlass.Float32) * scale) + offset
         target[i] = value.to(cutlass.BFloat16)
+
 
 @cute.jit
 def _vector_row_bias(
@@ -36,8 +38,11 @@ def _vector_row_bias(
     first = block * threads + thread
     step = workers * threads
     for i in cutlass.range(first, count, step):
-        value = (((source[i]).to(cutlass.Float32) + ((rows[i // columns]).to(cutlass.Float32) * scale)) + offset)
+        value = (
+            (source[i]).to(cutlass.Float32) + ((rows[i // columns]).to(cutlass.Float32) * scale)
+        ) + offset
         target[i] = value.to(cutlass.BFloat16)
+
 
 @cute.jit
 def _row_reduce(
@@ -53,5 +58,5 @@ def _row_reduce(
         for row in cutlass.range(block, rows, workers):
             total = cutlass.Float32(0.0)
             for column in cutlass.range(columns):
-                total = (total + (source[row * columns + column]).to(cutlass.Float32))
+                total = total + (source[row * columns + column]).to(cutlass.Float32)
             target[row] = total.to(cutlass.BFloat16)

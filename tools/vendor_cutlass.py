@@ -50,9 +50,14 @@ def main() -> int:
     for name, fork in FORKS.items():
         subprocess.run(
             [
-                "git", "diff", "--no-index", *(["--stat"] if args.stat else []),
-                str((UPSTREAM / name).relative_to(ROOT)), str(fork.relative_to(ROOT)),
+                "git",
+                "diff",
+                "--no-index",
+                *(["--stat"] if args.stat else []),
+                str((UPSTREAM / name).relative_to(ROOT)),
+                str(fork.relative_to(ROOT)),
             ],
+            check=False,
             cwd=ROOT,
         )
     return 0

@@ -97,9 +97,7 @@ def capture_exported_program(
     input_defaults: Mapping[str, Any] | None = None,
     **backend_options: Any,
 ) -> ExportedCapture:
-    example_inputs = _binding_values(
-        exported, model, args, dict(kwargs or {}), input_defaults
-    )
+    example_inputs = _binding_values(exported, model, args, dict(kwargs or {}), input_defaults)
     graph = copy.deepcopy(exported.graph_module)
     input_kinds: dict[str, str] = {}
     parameter_names: set[str] = set()

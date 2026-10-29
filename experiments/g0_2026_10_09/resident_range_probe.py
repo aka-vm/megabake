@@ -3,18 +3,17 @@
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
-import torch
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
+import cutlass
+import torch
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "design_2026_10_08"))
-from probe import REV, HASHES, samples, source
-
+from probe import HASHES, REV, samples, source
 
 UPSTREAM_FILE = "dense_gemm_persistent.py"
 
@@ -48,7 +47,7 @@ def _adapt(source_path):
     assert text.count(allocation) == 1
     text = text.replace(allocation, "", 1)
     insert_at = text.index("    @cute.jit\n    def kernel(")
-    run = '''    @cute.jit
+    run = """    @cute.jit
     def run_range(self, work_iterator, tensor_bindings, scratch, epilogue, schedule_grid_dim):
         (
             tma_atom_a,
@@ -78,7 +77,7 @@ def _adapt(source_path):
             schedule_grid_dim,
         )
 
-'''
+"""
     text = text[:insert_at] + run + text[insert_at:]
     target = source_path.with_name("dense_gemm_persistent_range.py")
     target.write_text(text)
@@ -96,14 +95,17 @@ def _device_resources(compiled, threads, shared_bytes):
         for label, attribute in (
             ("registers_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS),
             ("static_shared_bytes", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
-            ("local_bytes_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            (
+                "local_bytes_per_thread",
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+            ),
         ):
             status, value = cuda.cuKernelGetAttribute(attribute, kernel, 0)
             assert int(status) == 0, status
             values[label] = value
         status, function = cuda.cuKernelGetFunction(kernel)
         assert int(status) == 0, status
-        status, = cuda.cuFuncSetAttribute(
+        (status,) = cuda.cuFuncSetAttribute(
             function,
             cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             shared_bytes,
@@ -202,25 +204,17 @@ def _range_class(base):
 
             @cute.struct
             class SharedStorage:
-                mainloop_pipeline_array_ptr: cute.struct.MemRange[
-                    cutlass.Int64, self.ab_stage * 2
-                ]
+                mainloop_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
                 sA: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.a_dtype, cute.cosize(self.a_smem_layout_staged)
-                    ],
+                    cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged)],
                     self.buffer_align_bytes,
                 ]
                 sB: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.b_dtype, cute.cosize(self.b_smem_layout_staged)
-                    ],
+                    cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
                     self.buffer_align_bytes,
                 ]
                 sC: cute.struct.Align[
-                    cute.struct.MemRange[
-                        self.c_dtype, cute.cosize(self.epi_smem_layout_staged)
-                    ],
+                    cute.struct.MemRange[self.c_dtype, cute.cosize(self.epi_smem_layout_staged)],
                     self.buffer_align_bytes,
                 ]
 
@@ -252,16 +246,12 @@ def _range_class(base):
 
 
 def _matrix(tensor):
-    return from_dlpack(tensor.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
+    return from_dlpack(tensor.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(leading_dim=1)
 
 
 def _run_case(name, tile, measured_m, followup_m, modules, hardware, stream):
-    original_module, range_module, dense_module = modules
-    tile_count = ((measured_m + tile[0] - 1) // tile[0]) * (
-        (1536 + tile[1] - 1) // tile[1]
-    )
+    original_module, range_module, _dense_module = modules
+    tile_count = ((measured_m + tile[0] - 1) // tile[0]) * ((1536 + tile[1] - 1) // tile[1])
     range_workers = max(1, tile_count // 2)
     b = torch.randn((1536, 576), device="cuda", dtype=torch.bfloat16)
     a = torch.randn((measured_m, 576), device="cuda", dtype=torch.bfloat16)
@@ -288,12 +278,14 @@ def _run_case(name, tile, measured_m, followup_m, modules, hardware, stream):
     resources = _device_resources(
         range_compiled, ranged.threads_per_cta, ranged.shared_storage.__sizeof__()
     )
-    max_workers = torch.cuda.get_device_properties(0).multi_processor_count * resources[
-        "active_blocks_per_sm"
-    ]
+    max_workers = (
+        torch.cuda.get_device_properties(0).multi_processor_count
+        * resources["active_blocks_per_sm"]
+    )
     assert range_workers <= max_workers
 
     from restart_body import adapt
+
     restart_path = adapt(source(Path("/tmp/megabake-design-research"), "dense_gemm.py"))
     restart_module = _load(restart_path, f"dense_gemm_restart_{name}")
     restarted = restart_module.HopperWgmmaGemmKernel(cutlass.Float32, tile, (1, 1))
@@ -310,9 +302,7 @@ def _run_case(name, tile, measured_m, followup_m, modules, hardware, stream):
         if m == measured_m:
             workers = range_workers
         else:
-            tile_count_call = ((m + tile[0] - 1) // tile[0]) * (
-                (1536 + tile[1] - 1) // tile[1]
-            )
+            tile_count_call = ((m + tile[0] - 1) // tile[0]) * ((1536 + tile[1] - 1) // tile[1])
             workers = min(max_workers, max(1, tile_count_call // 2))
         # The same compiled range entry sees new pointers, contents, and tile
         # counts. It keeps its selected tile shape and rebinds TMA descriptors.
@@ -329,21 +319,25 @@ def _run_case(name, tile, measured_m, followup_m, modules, hardware, stream):
             "expected": ref[0, :8].float().tolist(),
         }
         assert torch.isfinite(c_call).all().item()
-        rows.append({
-            "m": m,
-            "n": 1536,
-            "k": 576,
-            "tile": tile,
-            "workers": workers,
-            "max_admitted_workers": max_workers,
-            "max_abs_error": (c_call.float() - ref.float()).abs().max().item(),
-            "relative_l2_error": err.item(),
-            "resident_range_gpu_us": samples(
-                lambda: range_compiled(*views, cutlass.Int32(workers), stream),
-                32,
-                output=c_call,
-            )["median_us"],
-        })
+        rows.append(
+            {
+                "m": m,
+                "n": 1536,
+                "k": 576,
+                "tile": tile,
+                "workers": workers,
+                "max_admitted_workers": max_workers,
+                "max_abs_error": (c_call.float() - ref.float()).abs().max().item(),
+                "relative_l2_error": err.item(),
+                "resident_range_gpu_us": samples(
+                    lambda range_compiled=range_compiled, views=views, workers=workers, stream=stream: (
+                        range_compiled(*views, cutlass.Int32(workers), stream)
+                    ),
+                    32,
+                    output=c_call,
+                )["median_us"],
+            }
+        )
         if m == measured_m:
             # Compare the original launch and the restarting adapter at the
             # same shape. These are references, not production providers.
@@ -404,12 +398,12 @@ def main():
             "warp_roles": {
                 "dma_warp_group": "warps 0-3; warp 0 issues TMA input loads",
                 "mma_warp_group": "warps 4-7 consume staged tiles and issue WGMMA",
-                "epilogue_store_warp": 4
+                "epilogue_store_warp": 4,
             },
             "pipeline": "source TMA/WGMMA stage ring remains active across the assigned persistent tile range; producer_tail drains input work, WGMMA wait_group(0) completes MMA, and TMA store producer_tail drains output writes",
             "scratch_release": "CTA-local shared storage is reusable only after the range body returns from both pipeline tails",
             "exit": "all output tiles assigned to the synthetic scheduler grid are globally stored; the enclosing kernel must grid-synchronize before another CTA reads them",
-            "binding": "host rebuilds descriptors for each call; scheduler grid can be narrowed while idle outer CTAs bypass the range body"
+            "binding": "host rebuilds descriptors for each call; scheduler grid can be narrowed while idle outer CTAs bypass the range body",
         },
         "records": [],
     }

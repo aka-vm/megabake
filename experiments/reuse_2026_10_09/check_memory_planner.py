@@ -7,10 +7,9 @@ lifetime analysis, asynchronous GPU uses, or megakernel composition.
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import subprocess
 import tempfile
-
+from pathlib import Path
 
 REVISION = "f9eb70c254acefc9f3667b2a973d0dcf25471fce"
 SOURCE_HASH = "4b1400e4aa90cae8411c648002c23b6de899301fbbeedb982e4282fd29921657"
@@ -116,17 +115,20 @@ def main():
     text = data.decode()
     start, end = "namespace memory_planner {", "} // namespace memory_planner"
     assert text.count(start) == text.count(end) == 1
-    core = text[text.index(start):text.index(end) + len(end)]
+    core = text[text.index(start) : text.index(end) + len(end)]
     with tempfile.TemporaryDirectory(prefix="megabake-memory-reuse-") as tmp:
         cpp, exe = Path(tmp) / "check.cc", Path(tmp) / "check"
         cpp.write_text(PREAMBLE + core + CHECKS)
         compiler = subprocess.check_output(["g++", "--version"], text=True)
-        subprocess.run(["g++", "-std=c++17", "-O2", str(cpp), "-o", str(exe)],
-                       check=True)
+        subprocess.run(["g++", "-std=c++17", "-O2", str(cpp), "-o", str(exe)], check=True)
         result = json.loads(subprocess.check_output([str(exe)], text=True))
-    result.update(revision=revision, source_sha256=SOURCE_HASH,
-                  compiler=compiler.splitlines()[0], seed=20261009,
-                  limits="Host allocation only; valid nonzero sizes padded to 128 bytes; supplied finite half-open lifetimes.")
+    result.update(
+        revision=revision,
+        source_sha256=SOURCE_HASH,
+        compiler=compiler.splitlines()[0],
+        seed=20261009,
+        limits="Host allocation only; valid nonzero sizes padded to 128 bytes; supplied finite half-open lifetimes.",
+    )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 

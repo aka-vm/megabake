@@ -6,11 +6,11 @@ This is a small G0 protocol probe. It is not a reusable scheduler.
 import json
 from pathlib import Path
 
-import torch
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
+import cutlass
+import torch
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 
 @cute.kernel
@@ -105,7 +105,10 @@ def _resources(compiled, threads):
         for label, attribute in (
             ("registers_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS),
             ("static_shared_bytes", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
-            ("local_bytes_per_thread", cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            (
+                "local_bytes_per_thread",
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+            ),
         ):
             status, value = cuda.cuKernelGetAttribute(attribute, kernel, 0)
             assert int(status) == 0, status
@@ -178,13 +181,15 @@ def main():
         torch.testing.assert_close(y[:workers], expected_y)
         torch.testing.assert_close(sums[:workers], expected_sums)
         assert torch.equal(ready[:workers], torch.full_like(ready[:workers], epoch))
-        reports.append({
-            "epoch": epoch,
-            "workers": workers,
-            "delay_cta": delay_cta,
-            "output": y[:workers].cpu().tolist(),
-            "sum": sums[:workers].cpu().tolist(),
-        })
+        reports.append(
+            {
+                "epoch": epoch,
+                "workers": workers,
+                "delay_cta": delay_cta,
+                "output": y[:workers].cpu().tolist(),
+                "sum": sums[:workers].cpu().tolist(),
+            }
+        )
 
     # Run the largest grid admitted by the complete compiled kernel. A late
     # final CTA checks that every participant arrives at the barrier.

@@ -30,7 +30,9 @@ def text_config(model: torch.nn.Module):
 
 def layer_types(model: torch.nn.Module) -> list[str]:
     config = text_config(model)
-    return list(getattr(config, "layer_types", None) or ["full_attention"] * config.num_hidden_layers)
+    return list(
+        getattr(config, "layer_types", None) or ["full_attention"] * config.num_hidden_layers
+    )
 
 
 def _l2norm(source: torch.Tensor) -> torch.Tensor:
@@ -44,7 +46,9 @@ class StatefulCausalLM(torch.nn.Module):
         self.lm_head = model.lm_head
         self.config = text_config(model)
         self.layer_types = layer_types(model)
-        self.rotary_takes_type = "layer_type" in inspect.signature(self.model.rotary_emb.forward).parameters
+        self.rotary_takes_type = (
+            "layer_type" in inspect.signature(self.model.rotary_emb.forward).parameters
+        )
         self.softcap = getattr(self.config, "final_logit_softcapping", None)
 
     def state_shapes(self, capacity: int) -> list[list[tuple[tuple[int, ...], torch.dtype]]]:
@@ -63,14 +67,18 @@ class StatefulCausalLM(torch.nn.Module):
                 attention = layer.self_attn
                 window = getattr(attention, "sliding_window", None)
                 if window is not None and capacity > window:
-                    raise ValueError(f"capacity {capacity} exceeds the {window}-token sliding window")
+                    raise ValueError(
+                        f"capacity {capacity} exceeds the {window}-token sliding window"
+                    )
                 cache = (1, capacity, self.config.num_key_value_heads, attention.head_dim)
                 shapes.append(
                     [(cache, torch.bfloat16), (cache, torch.bfloat16), ((1,), torch.int32)]
                 )
         return shapes
 
-    def _attention(self, attention, normalized, position_embeddings, key_cache, value_cache, valid_length):
+    def _attention(
+        self, attention, normalized, position_embeddings, key_cache, value_cache, valid_length
+    ):
         batch, sequence, _ = normalized.shape
         head_dim = attention.head_dim
         projected = attention.q_proj(normalized)
@@ -106,7 +114,9 @@ class StatefulCausalLM(torch.nn.Module):
         conv_state.copy_(window[:, :, 1:])
         mixed = torch.nn.functional.conv1d(window, mixer.conv1d.weight, groups=mixer.conv_dim)
         mixed = ACT2FN[mixer.activation](mixed).transpose(1, 2)
-        query, key, value = torch.split(mixed, [mixer.key_dim, mixer.key_dim, mixer.value_dim], dim=-1)
+        query, key, value = torch.split(
+            mixed, [mixer.key_dim, mixer.key_dim, mixer.value_dim], dim=-1
+        )
         query = query.reshape(batch, mixer.num_k_heads, mixer.head_k_dim).float()
         key = key.reshape(batch, mixer.num_k_heads, mixer.head_k_dim).float()
         value = value.reshape(batch, mixer.num_v_heads, mixer.head_v_dim).float()
@@ -143,7 +153,9 @@ class StatefulCausalLM(torch.nn.Module):
             residual = hidden
             normalized = layer.input_layernorm(hidden)
             if kind == "linear_attention":
-                mixed = self._linear_attention(layer.linear_attn, normalized, *state[offset : offset + 2])
+                mixed = self._linear_attention(
+                    layer.linear_attn, normalized, *state[offset : offset + 2]
+                )
                 offset += 2
             else:
                 mixed = self._attention(

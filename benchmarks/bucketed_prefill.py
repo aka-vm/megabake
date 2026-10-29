@@ -86,7 +86,8 @@ def main() -> None:
                 "bucket_compile_s": first_call_s if first_bucket_call else 0.0,
                 "relative_l2_vs_eager": error,
                 "megabake_call_us": _median_call(
-                    lambda: prefill(input_ids=ids, attention_mask=mask), args.samples  # noqa: B023  # Callback is consumed within this loop iteration.
+                    lambda ids=ids, mask=mask: prefill(input_ids=ids, attention_mask=mask),
+                    args.samples,
                 ),
             }
             print(json.dumps(row), flush=True)
@@ -103,7 +104,10 @@ def main() -> None:
                 torch.cuda.synchronize()
                 row["inductor_compile_s"] = time.perf_counter() - started
                 row["inductor_cudagraphs_call_us"] = _median_call(
-                    lambda: inductor(input_ids=ids, attention_mask=mask), args.samples  # noqa: B023  # Callback is consumed within this loop iteration.
+                    lambda inductor=inductor, ids=ids, mask=mask: inductor(
+                        input_ids=ids, attention_mask=mask
+                    ),
+                    args.samples,
                 )
                 print(json.dumps(row), flush=True)
     args.out.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import itertools
 import json
 import textwrap
 from collections.abc import Mapping, Sequence
@@ -711,7 +712,7 @@ def launch(
         + (("max_active_clusters",) if has_g0 else ())
         + ("stream",),
         tuple(work_iterators),
-        tuple((*tensor_arguments, *g0_tensor_arguments)),
+        (*tensor_arguments, *g0_tensor_arguments),
         tuple(phase_records),
         launch_policy=(
             "megabake_cooperative_events" if event_schedule is not None else "megabake_cooperative"
@@ -1862,7 +1863,7 @@ def _weight_stream_schedule(
         intervals[-1].append(phase.index)
         if phase.barrier is not None:
             intervals.append([])
-    for previous, members in zip(intervals, intervals[1:]):
+    for previous, members in itertools.pairwise(intervals):
         entries = [0] * (3 * workers)
         for cta in range(workers):
             for index in members:
