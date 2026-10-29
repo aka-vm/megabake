@@ -36,18 +36,10 @@ def _target() -> TargetFacts:
 
 
 def _plan(model, *inputs):
-    prepared = prepare_fx_graph(
-        torch.export.export(model, inputs).graph_module, inputs
-    )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
-    selection = select_bodies(
-        graph, _target(), SelectionPolicy(allow_tuned=False)
-    )
-    return assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    prepared = prepare_fx_graph(torch.export.export(model, inputs).graph_module, inputs)
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=False))
+    return assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
 
 
 def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path):
@@ -64,7 +56,7 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     # Both reductions share one body and one table-dispatched call site.
     assert generated.source.count("_body_0(") == 2
     assert "for phase in cutlass.range(3, unroll=1):" in generated.source
-    assert "variant = phase_table[phase, 0]" in generated.source
+    assert "variant = cute.arch.make_warp_uniform(phase_table[phase, 0])" in generated.source
     # The independent reductions share a barrier interval before the join.
     assert [row[:2] for row in generated.launch.phase_table] == [
         (0, 0),
@@ -89,15 +81,14 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     source_lines = generated.source.splitlines()
     for symbol, expected in (
         ("_body_0", "sync_threads"),
-        ("megabake_kernel", "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])"),
+        (
+            "megabake_kernel",
+            "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])",
+        ),
         ("launch", ".launch("),
     ):
-        entry = next(
-            entry for entry in generated.source_map if entry.symbol == symbol
-        )
-        mapped_source = "\n".join(
-            source_lines[entry.line_start - 1 : entry.line_end]
-        )
+        entry = next(entry for entry in generated.source_map if entry.symbol == symbol)
+        mapped_source = "\n".join(source_lines[entry.line_start - 1 : entry.line_end])
         assert expected in mapped_source
 
 
@@ -132,13 +123,9 @@ def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):
         torch.export.export(Model(), (source, weight)).graph_module,
         (source, weight),
     )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
 
     generated = emit_cute(plan, tmp_path)
 
@@ -163,13 +150,9 @@ def test_emit_cute_reuses_g0_scratch_for_duplicate_body_variants(tmp_path):
         torch.export.export(Model(), (source, weight, other_weight)).graph_module,
         (source, weight, other_weight),
     )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
 
     generated = emit_cute(plan, tmp_path)
 
@@ -195,13 +178,9 @@ def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
         torch.export.export(Model(), (source, weight, other_weight)).graph_module,
         (source, weight, other_weight),
     )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
     first, second = plan.phases
     first_body = replace(
         first.body,
@@ -241,29 +220,17 @@ def test_emit_cute_emits_explicit_layout_conversion(tmp_path):
             return value.relu().sum(dim=-1)
 
     value = torch.randn(2, 3)
-    prepared = prepare_fx_graph(
-        torch.export.export(Model(), (value,)).graph_module, (value,)
-    )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
-    selection = select_bodies(
-        graph, _target(), SelectionPolicy(allow_tuned=False)
-    )
+    prepared = prepare_fx_graph(torch.export.export(Model(), (value,)).graph_module, (value,))
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=False))
     producer = next(
-        selected
-        for selected in selection.selections
-        if selected.program.family == "elementwise"
+        selected for selected in selection.selections if selected.program.family == "elementwise"
     )
     consumer = next(
-        selected
-        for selected in selection.selections
-        if selected.program.family == "reduction"
+        selected for selected in selection.selections if selected.program.family == "reduction"
     )
     value_id = producer.outputs[0]
-    source_layout = CuTeLayout.from_contract(
-        producer.body.layouts.outputs[value_id]
-    )
+    source_layout = CuTeLayout.from_contract(producer.body.layouts.outputs[value_id])
     target_layout = replace(source_layout, strides=(1, 3))
     load = consumer.program.loads[0]
     consumer_program = replace(
@@ -295,23 +262,53 @@ def test_emit_cute_emits_explicit_layout_conversion(tmp_path):
         selection,
         selections=(
             producer,
-            replace(
-                consumer, program=consumer_program, body=consumer_body
-            ),
+            replace(consumer, program=consumer_program, body=consumer_body),
         ),
         conversions=(conversion,),
     )
     plan = assign_storage(
-        make_phase_schedule(
-            converted_selection, derive_dependencies(converted_selection)
-        )
+        make_phase_schedule(converted_selection, derive_dependencies(converted_selection))
     )
 
     generated = emit_cute(plan, tmp_path)
     ast.parse(generated.source)
     assert "_conversion_0_0(" in generated.source
     assert generated.launch.phases[0].conversion_symbols == ("_conversion_0_0",)
-    assert any(
-        entry.kind == "layout_conversion"
-        for entry in generated.source_map
+    assert any(entry.kind == "layout_conversion" for entry in generated.source_map)
+
+
+def test_weight_stream_schedule_streams_each_ctas_first_gemm_of_the_next_interval():
+    from types import SimpleNamespace
+
+    from megabake.codegen import _weight_stream_schedule
+
+    # Phase 0 closes the first interval; the second runs a norm recomputed on
+    # every CTA, then q, k and v GEMMs side by side on 4 CTAs (v wraps
+    # around); the third runs o, whose weight cannot be streamed.
+    barriers = (True, False, False, False, True, True)
+    plan = SimpleNamespace(
+        phases=tuple(
+            SimpleNamespace(index=index, barrier=object() if barrier else None)
+            for index, barrier in enumerate(barriers)
+        ),
+        launch=SimpleNamespace(grid_size=4),
     )
+    rotations = (0, -1, 0, 2, 3, 0)
+    units = {0: 1, 1: 1, 2: 2, 3: 1, 4: 3, 5: 4}
+    gemm_of_phase = {2: 0, 3: 1, 4: 2, 5: 3}
+    variants = (0, 1, 1, 0)
+
+    rows, issues = _weight_stream_schedule(
+        plan, rotations, units, gemm_of_phase, variants, {0, 1, 2}, 8
+    )
+
+    # (GEMM row + 1, variant, rotated block) per CTA: CTAs 0-1 run q tiles
+    # 0-1, CTA 2 the k tile, and CTA 3 v tile 0 (v tiles 1-2 come after q
+    # on CTAs 0-1, which stream q).
+    assert rows == [(0,) * 12, (1, 0, 0, 1, 0, 1, 2, 1, 0, 3, 1, 0)]
+    assert issues == {0: 1}
+
+    rows, issues = _weight_stream_schedule(
+        plan, rotations, units, gemm_of_phase, variants, {0, 1, 2}, 0
+    )
+    assert rows == [(0,) * 12] and issues == {}

@@ -1,0 +1,295 @@
+{
+  "name": "Mirage superoptimizer and compiler pipeline",
+  "scope": "Static review of the Mirage checkout at agent_space/mirage (commit f9eb70c254acefc9f3667b2a973d0dcf25471fce, 2026-10-05). It covers the muGraph superoptimizer (src/search: kernel- and threadblock-level enumeration, abstract-expression pruning through egg and Z3, the finite-field probabilistic verifier, and the GeneratorConfig and DimStrategy candidate spaces), the transpiler pass pipeline (resolve_tb_fusion, resolve_tensor_layout with Z3, plan_dtensor_memory and plan_stensor_memory, CUDA/Triton/NKI back ends), and the MPK graph-to-task-graph compiler (python/mirage/mpk/persistent_kernel.py layer methods, src/kernel/annotated_graph.cc, src/kernel/runtime.cc, and the worker event loop in include/mirage/persistent_kernel/persistent_kernel.cuh). The papers are the Mirage OSDI'25 paper (arXiv 2405.05751) and the MPK OSDI'26 paper (arXiv 2512.22219). The MegaBake side is src/megabake/{regions.py, planner.py, schedule.py, memory.py, compiler.py, bodies/gemm.py, bodies/attention.py, bodies/generic.py}, plus SCHEDULER_REUSE.md, ROADMAP.md and the fresh reports in artifacts/full_model_2026-10-18. Questions answered: (1) Can MegaBake use superoptimization or search instead of hand-written region matchers to stay model-generic? (2) Which reuse items in SCHEDULER_REUSE.md are done and which are not? (3) Which Mirage compiler mechanisms map onto MegaBake's measured gaps? No GPU jobs were run.",
+  "key_sources": [
+    "agent_space/mirage/src/search/search.cc:127 (KernelGraphGenerator::generate_next_operator: DFS that adds one kernel op or one customized threadblock graph at a time, with canonical Order pruning via check_order at :83 and abstract-expression pruning at :162)",
+    "agent_space/mirage/src/search/search.cc:206-275 (customized op: enumerate grid_dim x block_dim x input_map x forloop_dim x forloop_range from DimStrategy)",
+    "agent_space/mirage/src/search/config.cc:8-75 (default GeneratorConfig: <=5 kernel ops, <=9 threadblock ops, 1 threadblock graph, frange {4,16,64}, reduction_dimx 64, a fixed op vocabulary of matmul/exp/square/sqrt/silu/gelu/relu/clamp/add/mul/div/pow/rms_norm)",
+    "agent_space/mirage/src/search/dim_strategy.cc:31-75 (get_grid_dim_cand: grid sizes are dim/x for hard-coded x in 8..256 (CUDA) or {1024,2048,4096} for 2-D; pure divisibility enumeration, no hardware query)",
+    "agent_space/mirage/src/search/abstract_expr/abstract_expr.cc:17-39 (subexpr_to_final_expr: abstract expressions serialized to egg s-expressions; e-graph equivalence checks whether a prefix is a subexpression of the target)",
+    "agent_space/mirage/src/search/verification/probabilistic_verifier.cc:9-80 (fingerprint the reference graph once, fingerprint each candidate's outputs, try every output permutation via OutputMatch)",
+    "agent_space/mirage/include/mirage/config.h:23-24 (FP_P = 167, FP_Q = 83; the paper text says p=227, q=113)",
+    "agent_space/mirage/src/search/verification/formal_verifier.cc (Z3-based alternative verifier, 483 lines)",
+    "agent_space/mirage/python/mirage/kernel.py:543-742 (superoptimize(): search, then profile every verified muGraph profile_iters times on the GPU and keep the fastest; backends cuda/triton, NKI not implemented at :301)",
+    "agent_space/mirage/include/mirage/transpiler/transpiler.h:128-135 (generate_code pass order: resolve_distributed_config -> resolve_dtensor_meta -> resolve_tb_fusion -> resolve_tensor_layout -> plan_dtensor_memory -> transpile_ugraph)",
+    "agent_space/mirage/src/transpiler/resolve_tensor_layout.cc (Z3 layout solver with fixed cost penalties)",
+    "agent_space/mirage/src/transpiler/plan_stensor_memory.cc:15 (first/best/worst-fit interval allocator keeping the smallest peak)",
+    "agent_space/mirage/src/transpiler/plan_dtensor_memory.cc (monotonic 128-byte-aligned global workspace, no lifetime reuse)",
+    "agent_space/mirage/python/mirage/mpk/persistent_kernel.py:2390-2447 (linear_layer: hand-built TBGraph with an explicit caller-supplied grid_dim; task variant chosen by target_cc; Hopper always linear_swapAB_hopper)",
+    "agent_space/mirage/python/mirage/mpk/models/utils.py:3-15 (grid_for_rmsnorm_linear_layer: returns 96 or 64 with the comment '96 and 64 are enough to cover all Qwen3 model?', plus an ad-hoc size//256 workaround for wrong outputs on large linears)",
+    "agent_space/mirage/python/mirage/mpk/models/dflash/builder.py:65-67 (_gpl: 96 if out_dim % 96 == 0 else 64)",
+    "agent_space/mirage/src/kernel/annotated_graph.cc:119-430 (step a: most-recent-writer DAG with bounding-box view-window overlap; conservative whole-parent fallback for reshape views)",
+    "agent_space/mirage/src/kernel/annotated_graph.cc:430-990 (steps b-j: Kahn cycle check, residual stripping, role classification, case-2/3 rejection at :584-660, per-edge GCD event_dim at :748-770, fork LCM at :787-885, join LCM at :888-955)",
+    "agent_space/mirage/src/kernel/runtime.cc:970-1025 (sanity_check: host simulation of event/task firing), :1027 print_task_graph (emits _init_persistent_kernel with task descs, events and first_tasks), :1915 Graph::generate_task_graph",
+    "agent_space/mirage/src/kernel/task_register.cc:36 (dedups generated variant strings per task type)",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:1083-1110 (worker waits on dependent_event: the counter target is num_triggers * iteration_num, polled with ld.acquire and __nanosleep(10)) and :1150-1185 (trigger_event: atom.add.release.gpu; counters are monotonic across iterations, so no reset is needed)",
+    "src/megabake/regions.py:147-192 (_fusion_candidates: fixed list of hand-written matchers: stateful/declared attention, scalar_chain, gated MLP, RMSNorm, RoPE, decomposed attention)",
+    "src/megabake/regions.py:686-720 (_rms_norm_chain: exact aten.pow.Tensor_Scalar -> mean -> add -> rsqrt -> mul pattern)",
+    "src/megabake/regions.py:1250-1263 (_attention_head_axes stride heuristic; the source of the Gemma 3 single-KV-head miss in ROADMAP 2.2)",
+    "src/megabake/regions.py:2159 (_gated_mlp_candidate: SiLU-times-up pattern walk)",
+    "src/megabake/compiler.py:414-431 (default policy: swapAB when the table launch has small GEMMs; split-K only with MEGABAKE_SPLIT_K=1; table-launch graphs get SearchBudget(max_plans=1, max_compilations=1), so full models do no plan search)",
+    "src/megabake/bodies/gemm.py:1853-1880 (table launch: exactly one GEMM config, (token_tile,64) with 8 stages and a shared TABLE_GEMM_SHARED_BYTES; non-table path offers two configs)",
+    "src/megabake/bodies/gemm.py:1893-1915 (SWAP_AB_MAX_ROWS=64, SWAP_AB_ROW_TILES=(16,32,64), SPLIT_K_MAX=16, SPLIT_K_MIN_K_TILES=2)",
+    "src/megabake/bodies/gemm.py:1829-1832 (rejects N or K not a multiple of 64, and anything that is not BF16)",
+    "src/megabake/schedule.py:1364-1384 (_worker_count = min(max tiles, SM count * max active blocks), derived from the target)",
+    "src/megabake/schedule.py:1381-1500 (_fold_small_intervals with constants _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6, _FOLD_MAX_PHASES=6)",
+    "src/megabake/schedule.py:487-695 (make_event_schedule / make_region_event_schedule with tile-level prerequisites; only usable by the per-tensor-parameter launch), :1103 _logical_tiles_overlap (exact interval overlap)",
+    "src/megabake/memory.py:574-622 (_allocate_workspace: best-fit over phase lifetimes with free-range coalescing, the same idea as Mirage plan_stensor_memory but applied to global workspace)",
+    "src/megabake/bodies/attention.py:422-423 (DECODE_MAX_CHUNKS=16, DECODE_MIN_CHUNK_KEYS=64)",
+    "src/megabake/bodies/generic.py:441,478 (MAP_ELEMENTS_PER_THREAD=4, _UNROLL_ITERATIONS=16)",
+    "src/megabake/buckets.py:38 (DEFAULT_BUCKETS=(16,32,64,128,256,512))",
+    "src/megabake/codegen.py:264-292 (table GEMM variant dedup keyed by (shape, layout) tuples)",
+    "SCHEDULER_REUSE.md sections 4, 5 and 9 (reuse table and port order); ROADMAP.md sections 4-6 (step status and measured state)",
+    "artifacts/full_model_2026-10-18/*/report.json (decode kernel_duration_us: SmolLM-135M MegaBake 1501.8 vs Inductor 1382.1; SmolLM-1.7B 2974.3 vs 2425.0; Qwen2-0.5B 1584.2 vs 1636.0)",
+    "https://arxiv.org/abs/2405.05751 (Mirage: A Multi-Level Superoptimizer for Tensor Programs, OSDI'25)",
+    "https://arxiv.org/html/2512.22219v1 and https://www.usenix.org/conference/osdi26/presentation/cheng (MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs, OSDI'26)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "Multi-level muGraph representation (kernel graph -> threadblock graph -> thread graph)",
+      "how_it_works": "A kernel graph has DTensors in device memory and operators that are either predefined (matmul or elementwise, which become library calls such as cuBLAS) or KN_CUSTOMIZED_OP. A customized op holds a threadblock graph with an explicit grid_dim, block_dim, forloop_range, per-input imap (which grid axis partitions which tensor dim), fmap (which dim the for-loop iterates) and omap. Threadblock ops act on STensors in shared memory. Accumulator ops (FORLOOP_ACCUM_*) mark the boundary between loop-body and epilogue. The thread level is produced by rule-based fusion, not search. The representation makes tiling, the reduction loop and the cross-op fusion boundary explicit, searchable variables.",
+      "where_in_source": "agent_space/mirage/include/mirage/kernel, include/mirage/threadblock; search.cc:206-275 creates TB graphs from (grid, block, imap, fmap, frange); persistent_kernel.py:2403-2413 shows MPK reusing the same TBGraph as the task description"
+    },
+    {
+      "idea": "Exhaustive bounded enumeration with canonical ordering",
+      "how_it_works": "DFS adds one operator at a time, at kernel level first and then inside a customized op at threadblock level. check_order requires the new (input_idx, op_type) Order to be strictly greater than the last op's Order, so each DAG is generated once. Depth is limited by max_num_kernel_graph_op=5 and max_num_threadblock_graph_op=9 in the code (the paper says 11), with at most 1 custom TB graph (2 with attention optimization). OpenMP tasks fork below depth 5. The op vocabulary and frange {4,16,64} are fixed in GeneratorConfig.",
+      "where_in_source": "src/search/search.cc:83-95 (check_order), :127-420 (generate_next_operator), src/search/config.cc:8-75"
+    },
+    {
+      "idea": "Abstract-expression pruning (subexpression test via e-graph and SMT)",
+      "how_it_works": "Each tensor gets a symbolic AbstractExpr (Var, Add, Mul, Div, Pow, Exp, Square, Sqrt, Silu, Gelu, Relu, Clamp, Sum-over-dim). Before an op is added, its output expression is checked against the target program's final expression with subexpr_to_final_expr. This serializes to egg s-expressions and runs an e-graph saturation over the equivalence axioms. Prefixes that cannot be a subexpression are cut. The paper reports RMSNorm search at 11-28 s with pruning, versus 768 s and then over 10 h without it. The axioms omit cancellation, so some equivalent graphs are unreachable by design.",
+      "where_in_source": "src/search/abstract_expr/abstract_expr.cc:17-39, abstract_expr_for_ops.cc, abstract_expr_eval.cc; search.cc:149-162"
+    },
+    {
+      "idea": "Probabilistic equivalence verification over finite fields",
+      "how_it_works": "Every operator has a fingerprint() implementation that evaluates it on random inputs in modular arithmetic: values mod P=167, with exponent values mod Q=83, where Q divides P-1, so exp maps into the multiplicative group. Candidate outputs are compared with the reference fingerprints under every output permutation. This is exact for 'Lax' programs (linear ops, division, at most one exp per path). ReLU, clamp and non-polynomial activations are outside the guarantee. Search runs one random test per candidate; a Z3 formal verifier is an alternative. Floating-point rounding and casts are not modeled at all.",
+      "where_in_source": "src/search/verification/probabilistic_verifier.cc:9-80, include/mirage/config.h:23-24, src/search/verification/formal_verifier.cc"
+    },
+    {
+      "idea": "Empirical selection: profile every verified muGraph",
+      "how_it_works": "superoptimize() collects all verified muGraphs, compiles each through the transpiler, times it with CUDA events (profile_iters=1000), and keeps the fastest. No analytical cost model ranks candidates; search only enumerates legal, equivalent candidates. Results are cached in a checkpoint file.",
+      "where_in_source": "python/mirage/kernel.py:543-742, triton_profiler.py (Triton back end)"
+    },
+    {
+      "idea": "Transpiler pass pipeline (fusion -> layout -> memory -> schedule -> codegen)",
+      "how_it_works": "resolve_tb_fusion fuses single-consumer elementwise and accumulator chains. resolve_tensor_layout solves a Z3 problem that picks innermost and swizzled dims under copy/MMA constraints with fixed penalty constants. plan_dtensor_memory bump-allocates the global workspace with 128-byte alignment. sched_tb_graph builds pre-loop, loop and post-loop schedules and checks 16-byte copy alignment. plan_stensor_memory does interval allocation of shared memory with first-, best- and worst-fit, keeping the smallest peak. Hopper and Blackwell swizzle planners select layout atoms. Back ends emit CUDA (with Hopper/Blackwell TB variants), Triton or NKI (stubbed in Python).",
+      "where_in_source": "include/mirage/transpiler/transpiler.h:128-135; src/transpiler/*.cc; src/triton_transpiler, src/nki_transpiler"
+    },
+    {
+      "idea": "MPK graph-to-task-graph: most-recent-writer DAG with view-window overlap",
+      "how_it_works": "Layers are processed in program order. Each read binds to the most recent writer of the same base storage whose bounding box overlaps the read window, which amounts to implicit SSA renaming of reused buffers. Same-rank narrow views get exact boxes. Reshape views fall back to the whole parent, which is conservative. Kahn's algorithm checks for cycles. Residual edges implied by op-level reachability are stripped.",
+      "where_in_source": "src/kernel/annotated_graph.cc:119-560"
+    },
+    {
+      "idea": "Tensor partitioning and regular event grouping (GCD event grids, fork/join LCM)",
+      "how_it_works": "Each layer's grid_dim partitions its output. For a producer-consumer edge, event_dim[d] = gcd(producer_partitions[d], consumer_partitions[d]), so one event covers a common tile group and a consumer task waits only on producers overlapping its slice. Fork and join groups are unified by an LCM pass so that every task has one wait event and one trigger event. Graphs where a layer is both join-consumer and fork-consumer (case 2), or both join-producer and fork-producer (case 3), are rejected. Events are linearized so successor tasks are contiguous (first/last index), and a host sanity_check simulates firing. The paper also describes successor- and predecessor-set event fusion and dummy tasks (under 1% overhead).",
+      "where_in_source": "src/kernel/annotated_graph.cc:584-660 (case 2/3), :748-955 (GCD/LCM); src/kernel/runtime.cc:76 (dfs_create_events_add_tasks), :970 (sanity_check), :1915 (generate_task_graph)"
+    },
+    {
+      "idea": "Device runtime: monotonic event counters, workers plus schedulers, hybrid JIT/AOT",
+      "how_it_works": "Each task descriptor has a dependent_event and a trigger_event. The worker's thread 0 polls the counter with ld.acquire and __nanosleep(10) until it reaches num_triggers * iteration_num. Because the counters keep counting across invocations, they are never reset. Completion does atom.add.release.gpu, and the last trigger enqueues successors. Per the paper, AOT tasks are pre-enqueued round-robin and JIT tasks (data-dependent attention) are dispatched by scheduler warps. Task descriptors are prefetched into shared memory.",
+      "where_in_source": "include/mirage/persistent_kernel/persistent_kernel.cuh:1083-1110, :1150-1185"
+    },
+    {
+      "idea": "Cross-task pipelining (preload phase plus paged shared memory)",
+      "how_it_works": "Per the MPK paper, each task is split into a pre-load phase (issue TMA/cp.async) and a compute phase. Shared memory is divided into 32 KB pages (7 per SM on H100 and B200), so task i+1's loads can overlap task i's compute once pages are free. The ablation reports 1.2-1.3x on the final linear of Qwen3-8B on B200. In this checkout the preload identifiers appear only in a few task bodies (ampere/linear.cuh, some Blackwell attention), so the generic paged mechanism could not be located in persistent_kernel.cuh [uncertain].",
+      "where_in_source": "MPK paper section on cross-task pipelining; include/mirage/persistent_kernel/tasks/ampere/linear.cuh"
+    },
+    {
+      "idea": "Task-variant registration and deduplication",
+      "how_it_works": "Each layer method registers a task type plus parameters. TaskRegister generates a variant string and dedups identical ones, then emits a single device switch over registered variants. Parameters are bound at runtime through the task descriptor.",
+      "where_in_source": "src/kernel/task_register.cc:36; persistent_kernel.py:2438-2447"
+    },
+    {
+      "idea": "Per-model builders with hand-picked grid sizes (MPK does NOT run the superoptimizer in this checkout)",
+      "how_it_works": "MPK models (qwen3, dflash, deepseek_v3, glm4_moe, gpt_oss, inkling) call layer APIs with grid_dim chosen by helpers such as grid_for_rmsnorm_linear_layer (96 or 64, with a comment asking whether that covers all Qwen3 models) and _gpl. No file under python/mirage/mpk calls superoptimize or search. The MPK paper says the superoptimizer generates task bodies, but the code ships hand-written CUDA task bodies (tasks/hopper, tasks/blackwell, tasks/cute). In practice MPK is a hand-scheduled, per-model system on top of a generic event runtime.",
+      "where_in_source": "python/mirage/mpk/models/utils.py:3-15, models/dflash/builder.py:65-67, models/qwen3/builder.py:358-652; grep for superoptimize in python/mirage/mpk returns nothing"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "Multi-level muGraph representation",
+      "status": "partial",
+      "evidence": "src/megabake/graph.py (ComputeGraph, Region, TensorProgram with loads, iteration_domains, reduction_axes, combine expressions); planner tile maps (planner.py:475); bodies/interface.py BodyConfig",
+      "notes": "MegaBake has a kernel-level region graph and a typed scalar or tensor program per region. It has no separate threadblock-graph IR with explicit imap/fmap/forloop variables that a search could mutate. Tiling lives inside body providers (BodyConfig), not in the IR."
+    },
+    {
+      "idea": "Exhaustive bounded enumeration with canonical ordering",
+      "status": "missing",
+      "evidence": "regions.py:147-192 uses a fixed matcher list; compiler.py:430-431 sets max_plans=1 for every table-launch (full-model) compile",
+      "notes": "MegaBake has 'plan search' (enumerate_body_selections, PlanCandidate measurement in plan.py:316), but it searches over the provider choices that the matchers produce. It does not search over graph rewrites. For full models the search budget is forced to one plan."
+    },
+    {
+      "idea": "Abstract-expression pruning",
+      "status": "missing",
+      "evidence": "No egg or Z3 dependency; regions.py matchers walk aten targets (e.g. _rms_norm_chain at regions.py:686-720 requires aten.pow.Tensor_Scalar -> mean -> add -> rsqrt -> mul)",
+      "notes": "MegaBake already composes scalar chains into ScalarExpression trees (regions.py:426 _compose_scalar_chain), which is the natural place to add expression canonicalization (e-graph or a rewrite normal form) and recognize norms, activations and RoPE by meaning rather than by op spelling."
+    },
+    {
+      "idea": "Probabilistic equivalence verification",
+      "status": "not_applicable",
+      "evidence": "ROADMAP.md 4.4: per-region bit-exact or teacher-forced GPU verification against PyTorch on real inputs",
+      "notes": "MegaBake's contract is stronger (it is floating-point aware, catches cast and rounding changes, and runs on real data). The finite-field check would be useful only as a cheap compile-time CPU filter for candidate rewrites before GPU verification. It cannot replace MegaBake's check because it ignores bf16 rounding, which MegaBake treats as semantics."
+    },
+    {
+      "idea": "Empirical selection by profiling candidates",
+      "status": "partial",
+      "evidence": "plan.py:300-395 (PlanCandidate, median_device_event_span_us, measured candidates); compiler.py:430-431 disables this for table launches; bodies/gemm.py:1853-1880 offers one table GEMM config",
+      "notes": "The machinery exists and was used in RESEARCH.md tile sweeps (five CTA tiles). Full models, the ones that matter, compile with a single config and no measurement, so every table-launch tile, stage and split choice is a fixed constant."
+    },
+    {
+      "idea": "Transpiler pass pipeline",
+      "status": "partial",
+      "evidence": "regions.py scalar_chain fusion (:340-470); memory.py:574 best-fit workspace allocator; bodies/catalog.py:252-296 alignment contracts; CuTe DSL bodies in bodies/generic.py and bodies/gemm.py",
+      "notes": "Fusion: scalar-chain fusion plus interval folding by recompute, which covers more than Mirage's unary-chain fusion. Layout: no Z3 solver; layouts come from CuTe and body contracts. Memory: MegaBake's global workspace reuses storage across phase lifetimes, which Mirage's plan_dtensor_memory does not. Shared-memory planning is per body, with one fixed TABLE_GEMM_SHARED_BYTES budget (gemm.py:1711), not interval allocation across co-resident bodies."
+    },
+    {
+      "idea": "Most-recent-writer DAG with view-window overlap",
+      "status": "implemented",
+      "evidence": "schedule.py:1141 _storage_order_dependencies, :1205 _state_access_dependencies, :1241 _storage_dependency; memory.py:436 _storage_value_ids",
+      "notes": "MegaBake keeps values distinct from storage versions, takes PyTorch's alias and mutation contract from FX, and adds WAR/WAW ordering. That is stricter than MPK's bbox heuristic."
+    },
+    {
+      "idea": "GCD event grids and fork/join LCM grouping",
+      "status": "partial",
+      "evidence": "schedule.py:487-695 (make_event_schedule, make_region_event_schedule), :816 _tile_prerequisites, :1103 _logical_tiles_overlap; ROADMAP step 10 'Event counters in the table launch: not started'",
+      "notes": "MegaBake computes exact per-tile prerequisite sets (arbitrary dependency lists, so MPK's case-2/3 graphs stay legal), but only in the per-tensor-parameter launch, which full models exceed (32 KB parameter limit). The table launch that every full model uses has only grid barriers. No compaction to GCD groups or contiguous successor ranges exists yet."
+    },
+    {
+      "idea": "Device runtime with monotonic event counters and JIT/AOT",
+      "status": "partial",
+      "evidence": "ROADMAP 6 (counting grid barrier with release reduction and acquire polling, 0.70 us); device call counter (ROADMAP 6 'device call counter'); ROADMAP step 10 not started",
+      "notes": "MegaBake already has the monotonic counter trick in its barrier and call counter, so per-phase counters keyed by call index (MPK's num_triggers * iteration_num) are a small extension. There is no JIT queue or scheduler warp; work assignment is static."
+    },
+    {
+      "idea": "Cross-task pipelining (preload plus paged smem)",
+      "status": "missing",
+      "evidence": "ROADMAP step 9 (cross-phase L2 prefetch) not started; bodies/gemm.py:684-686 only prefetches TMA descriptors",
+      "notes": "Each GEMM phase starts its TMA pipeline cold after the grid barrier. No body issues the next phase's weight loads before the barrier."
+    },
+    {
+      "idea": "Task-variant registration and dedup",
+      "status": "implemented",
+      "evidence": "codegen.py:264-292 (variants keyed by tuple, _g0_body_{id}); ROADMAP 1 'device address table, per-phase TMA descriptors'",
+      "notes": "Equivalent to MPK. Bodies are keyed by normalized config and parameters come through the device table."
+    },
+    {
+      "idea": "Per-model builders and hand-picked grids",
+      "status": "not_applicable",
+      "evidence": "MegaBake imports FX directly (frontend.py, fx_handler/*); worker count comes from target SM count (schedule.py:1364-1384)",
+      "notes": "MegaBake is already more generic than MPK here. Model specificity sits in matchers (regions.py) and in tuning constants, not in per-model builders, except for the declared attention ops."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Fine-grained tile-level dependencies across operator boundaries (MPK GCD events)",
+      "why_multi_kernel_cannot": "Between two kernels, a consumer CTA cannot start until the whole producer grid has retired. PDL's cudaGridDependencySynchronize is all-or-nothing per grid, and CUDA Graph edges are per kernel. A megakernel can let consumer tile j start as soon as the gcd-group of producer tiles it reads has signaled, for example the first columns of o_proj output feeding the first RMSNorm rows.",
+      "nearest_multi_kernel_substitute": "PDL plus overlapped prologues hides about 2-4 us of launch and ramp per edge but still waits for full producer completion; stream-level concurrency only helps independent branches."
+    },
+    {
+      "opportunity": "Prefetching the next operator's weights while the current operator drains (MPK cross-task preload; ROADMAP step 9)",
+      "why_multi_kernel_cannot": "A kernel cannot issue loads for the next kernel's operands: it does not know their addresses or descriptors, and the next kernel's CTAs do not exist yet. In a persistent kernel a CTA idling at a barrier or event can issue cp.async.bulk.prefetch.L2 for its next GEMM tiles, keeping HBM busy through the tail.",
+      "nearest_multi_kernel_substitute": "PDL lets the next kernel's prologue issue its own prefetches before griddepcontrol.wait, which recovers part of it, but only for one-kernel lookahead, and only when the kernels are PDL-enabled."
+    },
+    {
+      "opportunity": "Search over fusion boundaries that cross what would be kernel boundaries, with the barrier priced in",
+      "why_multi_kernel_cannot": "Mirage's search picks the cheapest muGraph, but its cost is measured per kernel. In a megakernel, the choice to recompute (MegaBake's folding) or fuse norm into a GEMM prologue also removes a grid barrier (~0.7 us plus drain and ramp). A multi-kernel compiler cannot trade 'one extra recompute on every CTA' against 'one global synchronization', because it has no cheap global sync.",
+      "nearest_multi_kernel_substitute": "Inductor fuses pointwise into templates (epilogue fusion) but cannot recompute a reduction redundantly in every consumer CTA without a separate kernel."
+    },
+    {
+      "opportunity": "Single compile-time memory plan over the whole step, including scratch reuse across operators",
+      "why_multi_kernel_cannot": "The caching allocator and CUDA Graph pools reuse memory too, but at allocation granularity with no knowledge of which CTA finishes when. A megakernel with known phase lifetimes can alias intermediate workspace tightly (memory.py:574) and keep the working set L2-resident (decode activations are a few KB).",
+      "nearest_multi_kernel_substitute": "CUDA Graph memory pools and Inductor's buffer reuse give comparable footprint. L2 residency across kernels is incidental, not planned."
+    }
+  ],
+  "measured_or_reported_gains": "Mirage superoptimizer (arXiv 2405.05751, A100/H100, fp16): up to 3.3x over the best baseline on subgraphs; RMSNorm+MatMul 1.5x (A100) and 1.9x (H100); GatedMLP 1.5x (A100) and 2.7-3.3x (H100); GQA up to 2.2x over hand-written kernels (LLaMA-3-70B shapes, 8K context, TP=4, batch 1); QKNorm up to 1.4x; LoRA 1.1-2.4x; end-to-end PyTorch models 0.9-1.9x. Search time: RMSNorm 11-28 s with pruning versus over 10 h without; up to 4 h for the largest subgraphs. MPK (arXiv 2512.22219, OSDI'26): 1.0-1.7x single-batch serving throughput over SGLang and vLLM on A100, H100 and B200 (64-token prompt, 1024 decode tokens); Qwen3-8B on A100 per-token latency 14.5 ms (vLLM/SGLang) to 12.5 ms (bound about 10 ms); 8xH100 1.1-1.4x; cross-task pipelining 1.2-1.3x on the last linear of Qwen3-8B on B200; compute-communication overlap 1.1x on Qwen3-1.7B on 4xH100. Workers per GPU: 104 (A100), 128 (H100), 144 (B200). [uncertain] whether paper numbers match the current checkout, since code constants differ from the paper (FP_P/FP_Q 167/83 vs 227/113; 9 vs 11 TB ops). MegaBake's own fresh numbers (artifacts/full_model_2026-10-18, H200 MIG 3g.71gb, KV capacity 128, decode kernel_duration_us): SmolLM-135M 1501.8 vs Inductor 1382.1; SmolLM-1.7B 2974.3 vs 2425.0; Qwen2-0.5B 1584.2 vs 1636.0 (MegaBake ahead). Complete calls: 2138 vs 11925 us, 3311 vs 10323 us, and 2380 vs 10739 us.",
+  "expected_impact_on_megabake": "Ranked by expected decode gain on the 60-SM slice, derived from ROADMAP section 6 breakdowns. (1) MPK-style events in the table launch (step 10), with the GCD grouping only as an encoding optimization. 1.7B decode has about 6 barrier intervals per layer x 24 layers, roughly 150 intervals (267 before folding). Each costs 0.7 us of barrier plus a few us of pipeline drain and ramp at small decode tiles. If events let about half of that tail overlap, saving 2-3 us per interval, the gain is roughly 0.3-0.45 ms of 2.97 ms (10-15%) on 1.7B and a similar absolute amount (0.3-0.4 ms, 20-25%) on 135M. This is the largest structural gain [uncertain: depends on measured per-interval drain, which tools/phase_profile.py can isolate]. (2) Cross-phase weight prefetch (MPK preload, step 9). GEMMs are about 1.9 ms on 1.7B at about 1.8 TB/s versus a ~1.5 ms floor. Hiding the TMA ramp at each of the 169 GEMM starts (about 1-2 us each) gives an estimated 0.15-0.3 ms (5-10%). (3) Search-based config selection for table-launch bodies (dim_strategy-style enumeration plus profiling, which MegaBake already has but disables for full models). The swapAB tile (16/32/64 x 64, 8 stages), split-K, attention chunks and fold limits are each currently one value. Expected 0-10% depending on how far each constant is from optimal on a given model; mostly a generality and robustness gain rather than raw speed on the tested models. (4) Superoptimizer-discovered fusions (RMSNorm into the GEMM prologue, gated MLP into the down-projection prologue). The relevant saving is at most one interval plus one norm per site: about 49 RMSNorms x 2.8 us = 0.14 ms on 1.7B (about 5%), part of which folding already captures. Mirage's reported 1.5-1.9x for RMSNorm+MatMul is for standalone kernels at larger M and will not carry over. (5) Prefill above 64 tokens (3-21x slower than Inductor). The superoptimizer is irrelevant there; the gap is the >64-row GEMM path and the first-generation prefill attention body. Mirage's search could, in principle, propose a FlashAttention-like muGraph (its GQA case), but MPK ships hand-written attention bodies, so the practical path is porting a tuned body family. Summary: search instead of matchers is mainly a generality win (new models compile onto tuned paths), not a decode-speed win; events and prefetch are the speed wins.",
+  "generality_and_overfitting_risk": "Mirage superoptimizer: model-generic by construction (works on any Lax subgraph), but its candidate spaces are hard-coded. Grid candidates are dim/x with x in 8..256 and 2-D sizes {1024,2048,4096} (dim_strategy.cc:31-75), frange is {4,16,64}, and reduction_dimx is 64 (config.cc). Hardware generality comes only from profiling the survivors on the target GPU. MPK: the runtime is generic, but the compiler front end is per model. Grid choices are hand-picked (grid_for_rmsnorm_linear_layer returns 96 or 64 with a TODO asking whether that covers all Qwen3 models, plus an ad-hoc size//256 workaround for wrong outputs, models/utils.py:3-15; _gpl in dflash/builder.py:65-67). Hopper linear always picks linear_swapAB_hopper (persistent_kernel.py:2438-2442), and RMSNorm registration hard-codes eps 1e-6 (SCHEDULER_REUSE.md section 5). Its 96/64 grids are tuned to 132-SM H100s, not to a 60-SM MIG slice. MegaBake items that look tuned to the tested models or this slice: (a) regions.py:686-720 _rms_norm_chain matches only the HF Llama-style spelling pow -> mean -> add -> rsqrt -> mul; other spellings (x*x, F.rms_norm decompositions, Gemma (1+w)) fall to generic reductions, which stays correct but runs the slower path. (b) regions.py:1250-1263 _attention_head_axes stride heuristic already failed on Gemma 3 single-KV-head (ROADMAP 2.2). (c) bodies/gemm.py:1829-1832 rejects N or K not a multiple of 64 and anything not BF16; models with odd vocab or intermediate sizes or FP16 weights drop to the generic contraction. (d) bodies/gemm.py:1853-1880: table-launch GEMMs get exactly one config ((16|32|64) x 64 tile, 8 stages, one shared smem budget); SWAP_AB_MAX_ROWS=64 and SWAP_AB_ROW_TILES (gemm.py:1893-1896) came from SmolLM and Qwen2 decode on 60 SMs. (e) split-K is off by default because it gave 'no gain on the 60-SM slice' (ROADMAP 6), a decision tied to this SM count; on a 132-SM H100 or a smaller hidden size, the tiles-vs-SMs ratio differs and split-K probably matters. (f) DECODE_MAX_CHUNKS=16 and DECODE_MIN_CHUNK_KEYS=64 (attention.py:422-423), MAP_ELEMENTS_PER_THREAD=4 and _UNROLL_ITERATIONS=16 (generic.py:441,478), and the fold limits _FOLD_MAX_ROUNDS_PER_PHASE=2, _FOLD_MAX_ROUNDS=6 and _FOLD_MAX_PHASES=6 (schedule.py:1381-1384) are untuned constants with no target query. (g) compiler.py:430-431 forces max_plans=1 for full models, so none of the above is re-searched per model or GPU. Generic parts: _worker_count (schedule.py:1364-1384) uses the target SM count and occupancy; the memory planner and dependency derivation are shape-agnostic. How the references avoid overfitting: Mirage enumerates legal candidates and profiles them on the target (kernel.py:596-690); Inductor autotunes templates per shape with a persistent cache; MPK does not avoid it (per-model builders). Recommendation: make each constant in (d)-(f) a small candidate set, prune by legality (divisibility, smem, registers queried from the target), and measure per shape bucket with a persistent cache keyed by (GPU name, SM count, shape). That is Mirage's search-then-profile loop applied to configs instead of graphs.",
+  "hardware_portability": "Search, abstract-expression pruning, finite-field verification, the dependency DAG, GCD/LCM event grouping and memory planning are target-independent. In Mirage, target specificity enters only through the transpiler's TB code generators (transpiler_tb_hopper.cc, transpiler_tb_blackwell.cc, plan_tb_swizzle_{hopper,blackwell}.cc) and MPK's task variants selected by target_cc (persistent_kernel.py:2427-2447). SM90-specific pieces in MegaBake: the TMA/WGMMA swapAB GEMM (gemm.py rejects anything but sm90a at :1846), TMA descriptors in the device table, and the shared-memory budget (TABLE_GEMM_SHARED_BYTES, gemm.py:1711). Toward SM100: tcgen05 MMA accumulates in TMEM with a 128-row MMA_M (2-CTA 256), so swapAB with a 64-row weight tile does not transfer directly. MPK's SM100 linear tiles 128 output rows (models/utils.py:17-35 split-K comment). Cluster Launch Control could replace static work assignment for JIT-like tasks. Event counters and L2 prefetch (cp.async.bulk.prefetch.L2) exist on SM90 and SM100. Toward SM80: no TMA or WGMMA, so cp.async plus mma.sync bodies (MPK ships tasks/ampere/linear.cuh); the event runtime carries over unchanged. To stay target-generic, keep the target query (SM count, smem per block, max active blocks; schedule.py:1364 already does this) as the only source of hardware constants, and express body configs as candidate sets filtered by target capability flags (bodies/blackwell.py is the start). Never derive tile or grid constants from the 60-SM slice.",
+  "recommended_actions": [
+    {
+      "action": "Add per-phase completion counters to the table launch (ROADMAP step 10). Encode MegaBake's existing exact tile prerequisite sets (schedule.py:816) as counters in the device table, using MPK's monotonic num_triggers * call_index target so nothing is reset. Start with coarse per-phase counters (consumer waits for all producer CTAs of the phases it reads), then add GCD tile groups only where traces show wait time. Keep the grid barrier as fallback for any phase whose prerequisites are not proven.",
+      "expected_gain": "0.3-0.45 ms on 1.7B decode (10-15%) and 0.3-0.4 ms on 135M (20-25%) [uncertain; measure per-interval drain first]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/schedule.py, src/megabake/codegen.py, src/megabake/runtime.py, src/megabake/memory.py (counter storage), tools/phase_profile.py",
+      "prerequisite": "Device table layout with a counter region; host simulation like MPK sanity_check (runtime.cc:970) to prove termination"
+    },
+    {
+      "action": "Turn table-launch constants into searched candidate sets: swapAB row tile, pipeline stages, split-K count, decode attention chunks, fold limits. Re-enable plan search (remove the max_plans=1 override at compiler.py:430-431, or give it a small budget) with per-(GPU, SM count, shape bucket) persistent caching, copying Mirage's 'enumerate legal, verify, profile, keep fastest' loop (kernel.py:596-690).",
+      "expected_gain": "0-10% per model, plus removal of 60-SM-specific tuning (split-K on/off, chunk counts) when moving to other GPUs or models",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/compiler.py, src/megabake/bodies/gemm.py (1853-1915), src/megabake/bodies/attention.py (422-423), src/megabake/schedule.py (1381-1384), src/megabake/cache.py",
+      "prerequisite": "Compile time per candidate must stay low (table launches already reuse the compiled kernel across workspace bindings); needs a quiet-clock measurement protocol (ROADMAP 6 clock caveat)"
+    },
+    {
+      "action": "Replace op-spelling matchers with expression-level recognition. Canonicalize each fused scalar or reduction program (regions.py _compose_scalar_chain already builds ScalarExpression trees) into a normal form, with an e-graph (egg via the Python 'egglog' package) or a small rewrite system. Recognize RMSNorm, LayerNorm, SiLU*mul and RoPE by expression, not by aten target sequence. Keep the existing matchers only as fast paths and log every region that falls to a generic body.",
+      "expected_gain": "No change on tested models; new models (other RMSNorm spellings, Gemma (1+w), LayerNorm models) reach fused bodies instead of generic paths",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/regions.py (501-720, 822-1245, 2159-2330), src/megabake/graph.py",
+      "prerequisite": "Rules must preserve casts and rounding points (no reassociation of fp32 reductions) to keep the per-region bit-exact contract"
+    },
+    {
+      "action": "Cross-phase L2 weight prefetch (ROADMAP step 9, MPK preload). While a CTA waits on a barrier or counter, issue cp.async.bulk.prefetch.L2 for its first K-tiles of the next GEMM phase. Addresses are already in the device table.",
+      "expected_gain": "0.15-0.3 ms on 1.7B decode (5-10%)",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/codegen.py, src/megabake/bodies/gemm.py, src/megabake/runtime.py",
+      "prerequisite": "None; more effective after events, because events create more waiting slack per CTA"
+    },
+    {
+      "action": "Use a bounded Mirage-style local search only where no tuned body or matcher applies. For a residual subgraph of at most 3-4 ops (e.g. 'x + mean*c + bias with broadcast' from ROADMAP 6 gaps, multi-axis reductions), enumerate fusion groupings and reduction tilings over MegaBake's own primitive families, prune by the finite-field fingerprint on CPU, then verify on GPU against PyTorch. Do not port Mirage's C++ search wholesale: its op vocabulary, Lax restriction and multi-hour worst case do not fit FX graphs with casts.",
+      "expected_gain": "Coverage of unmatched fusion patterns; small speed effect",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "new src/megabake/search.py, src/megabake/regions.py, src/megabake/planner.py",
+      "prerequisite": "Expression canonicalization (action 3); compile-time budget per region"
+    },
+    {
+      "action": "Fuse RMSNorm into the following GEMM's prologue and the residual add into the GEMM epilogue (Mirage rmsnorm_linear / linear_with_residual) as generic 'reduction-prologue' and 'pointwise-epilogue' hooks in the GEMM body rather than named fusions",
+      "expected_gain": "Up to about 0.14 ms on 1.7B (49 norms x 2.8 us), minus what folding already saves; 1-2 barrier intervals per layer",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/gemm.py, src/megabake/regions.py, src/megabake/planner.py",
+      "prerequisite": "Bit-exactness of the norm inside the prologue (same fp32 reduction order as the standalone body)"
+    }
+  ],
+  "open_questions": [
+    "How much of each barrier interval is barrier vs pipeline drain/ramp? Settle with tools/phase_profile.py by stamping CTA start/finish of the first and last tile per phase on 1.7B decode; this sizes the gain from events.",
+    "Does MPK's generic cross-task preload exist in this checkout or only in the paper? Settle by tracing the task-body interface in include/mirage/persistent_kernel/tasks/hopper for a split pre-load entry point and by checking git history for removed paging code.",
+    "Would a searched swapAB tile or stage count beat the fixed (16|32|64)x64/8-stage config on other shapes? Settle with a GEMM sweep over the 169 decode GEMM shapes of 1.7B plus Qwen2 and Qwen3.5 shapes once the GPU is free.",
+    "Does split-K pay on a full 132-SM H100 or on models with narrow projections (hidden 576 in 135M)? Settle by running the existing split-K path (MEGABAKE_SPLIT_K=1) on a non-MIG GPU.",
+    "Can an e-graph normal form preserve bf16/fp32 cast points well enough to keep per-region bit-exactness? Settle by canonicalizing the 49 RMSNorm and 48 RoPE regions of 1.7B and checking that recognized regions produce byte-identical bodies.",
+    "Is Mirage's finite-field fingerprint usable for MegaBake's ops with casts, rsqrt and clamp? Settle by fingerprinting the region programs and counting how many fall outside the Lax class."
+  ],
+  "scheduler_reuse_status": {
+    "done": [
+      "Global workspace lifetime reuse: MegaBake has its own best-fit interval allocator over phase lifetimes (memory.py:574-622). It is not a literal port of plan_stensor_memory, but uses the same algorithm family; the extracted Mirage core was validated only in experiments/reuse_2026_10_09",
+      "Simple local fusion: scalar-chain fusion (regions.py:340-470) plus interval folding by recompute (schedule.py:1389), which goes beyond Mirage's unary-chain fusion",
+      "Task variant dedup: table GEMM variants keyed by config (codegen.py:264-292)",
+      "Explicit dependency sets kept in the plan, with WAR/WAW storage ordering (schedule.py:1141-1262), so MPK case-2/3 graphs are legal",
+      "Host simulation of schedules (schedule.py:402 simulate_phase_schedule, :695 simulate_event_schedule)",
+      "swapAB small-M GEMM following linear_swapAB_hopper (ROADMAP step 3), bias epilogue (step 7), split-context decode attention (step 11)",
+      "Primitive families and decompositions (ROADMAP step 5); fallback=inductor whole-invocation delegation (compiler.py:616, main.py:227)",
+      "Device-side timing: tools/phase_profile.py stamps the global timer after barriers (not Mirage's per-task profiler)"
+    ],
+    "not_done": [
+      "Event runtime in the table launch (MPK worker/atomics, GCD event grouping, compact descriptors, contiguous successor ranges): ROADMAP step 10 not started; events exist only in the per-tensor-parameter launch",
+      "Cross-task preload / L2 prefetch: ROADMAP step 9 not started",
+      "Dimension candidate search (dim_strategy port) for full models: the table launch uses one config and max_plans=1",
+      "Z3 tensor layout solver and Hopper swizzle planning: not ported (CuTe atoms used directly)",
+      "Shared-memory interval allocation across co-resident bodies: one fixed TABLE_GEMM_SHARED_BYTES budget",
+      "Porting of Mirage Hopper norm or attention task bodies and the poisoned-tail attention test: not done (the attention-tail check could not run, per SCHEDULER_REUSE section 8)",
+      "Reduction-prologue / residual-epilogue GEMM fusion (rmsnorm_linear, linear_with_residual): not done",
+      "Gated delta rule (step 6) and fast prefill above 64 tokens: not done",
+      "Superoptimizer / algebraic search: explicitly deferred as 'reference' in SCHEDULER_REUSE section 7"
+    ]
+  },
+  "uncertain": [
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake",
+    "core_ideas"
+  ]
+}

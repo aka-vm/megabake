@@ -12,7 +12,7 @@ from megabake import (
     verify_plan,
 )
 from megabake.bodies import SelectionPolicy, TargetFacts
-from megabake.bodies.attention import emit_attention_body
+from megabake.bodies.cuda.sm90.attention import emit_attention_body
 from megabake.compiler import CompilerError, _validate_state_capacities
 from megabake.frontend import prepare_fx_graph
 from megabake.fx_handler.transformers import (

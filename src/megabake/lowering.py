@@ -79,6 +79,9 @@ class Load:
 @dataclass(frozen=True)
 class Accumulator:
     dtype: str
+    # Which accumulator of a paired contraction: 0 multiplies the first right
+    # operand (load 1), 1 the second (load 2) with the same left operand.
+    index: int = 0
 
 
 @dataclass(frozen=True)
@@ -176,7 +179,6 @@ class KVCacheAccess:
         "write_value_cache",
         "write_valid_length",
     )
-    capacity_guard: str = "0 <= valid_length and valid_length + query_length <= capacity"
     storage_class: str = "bounded_contiguous"
     valid_length_specialized: bool = False
 
@@ -1238,7 +1240,7 @@ def _indexed_gather_program(
         raise UnsupportedLowering("gather result shape does not match its operands")
 
     output_axes = tuple(f"o{index}" for index in range(len(result.shape)))
-    _index_axes = output_axes[: len(index_shape)]
+
     index_loads = tuple(
         IndexedLoad(
             id=f"gather:index:{index}",

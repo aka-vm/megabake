@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
+import gc
 import json
 import statistics
 import sys
@@ -32,7 +34,7 @@ if __package__ in {None, ""}:
 
 from benchmarks.measure import kernel_trace
 from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config
-from megabake import make_backend
+from megabake import graphed, make_backend
 from megabake.fx_handler.hf_attention import (
     ATTENTION_IMPLEMENTATION,
     DecodeStep,
@@ -42,7 +44,14 @@ from megabake.lowering import kv_attention
 from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM
 
 PROMPT = [1, 504, 3458, 314]
-VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake")
+VARIANTS = (
+    "eager",
+    "inductor",
+    "inductor_cudagraphs",
+    "inductor_graphed",
+    "megabake",
+    "megabake_graphed",
+)
 
 
 def _load(name: str, revision: str | None, attention: str = "eager") -> torch.nn.Module:
@@ -86,6 +95,9 @@ def _time_calls(function, count: int) -> dict[str, object]:
 
 def _pipelined_calls(calls) -> float:
     """Mean time per call when ``calls`` are issued back to back with one sync."""
+    # A full collection over the compilers' objects takes ~0.6 s; inside the
+    # window it would add ~15 ms per call to whichever variant it lands in.
+    gc.collect()
     torch.cuda.synchronize()
     started = time.perf_counter()
     for call in calls:
@@ -134,7 +146,11 @@ def _measure_or_error(
 
 def _megabake(mode: str, out: Path):
     return make_backend(
-        mode=mode, compile_kernel=True, cache=False, dump_dir=out / "dumps" / mode, scheduler="phase"
+        mode=mode,
+        compile_kernel=True,
+        cache=False,
+        dump_dir=out / "dumps" / mode,
+        scheduler="phase",
     )
 
 
@@ -288,6 +304,7 @@ def bench_decode(model, args) -> dict:
         "megabake": lambda: torch.compile(
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),
+        "megabake_graphed": None,
     }
     calls = 1 + args.warmup + 2 * args.samples + 1
     if calls > args.capacity:
@@ -304,8 +321,24 @@ def bench_decode(model, args) -> dict:
             ]
             position = [0]
             if name == "inductor_graphed":
-                build = lambda state=state: GraphedStep(
-                    torch.compile(stateful, fullgraph=True, dynamic=False), token, state
+                build = functools.partial(
+                    GraphedStep,
+                    torch.compile(stateful, fullgraph=True, dynamic=False),
+                    token,
+                    state,
+                )
+            if name == "megabake_graphed":
+                build = functools.partial(
+                    graphed,
+                    torch.compile(
+                        stateful,
+                        backend=_megabake("decode", args.out),
+                        fullgraph=True,
+                        dynamic=False,
+                    ),
+                    token,
+                    torch.zeros((1, 1), dtype=torch.long, device="cuda"),
+                    *state,
                 )
 
             def step(function, state=state, position=position):
@@ -356,6 +389,9 @@ def bench_decode_contexts(model, args) -> dict:
         "megabake": lambda: torch.compile(
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),
+        # Built per variant below: the capture binds that variant's state tensors.
+        "inductor_graphed": None,
+        "megabake_graphed": None,
     }
     results: dict[str, object] = {"capacity": capacity, "contexts": contexts}
     with torch.no_grad():
@@ -370,7 +406,24 @@ def bench_decode_contexts(model, args) -> dict:
                     for shape, dtype in layer
                 ]
                 lengths = [t for t in state if t.dtype == torch.int32 and t.numel() == 1]
-                function = build()
+                if name == "inductor_graphed":
+                    function = GraphedStep(
+                        torch.compile(stateful, fullgraph=True, dynamic=False), token, state
+                    )
+                elif name == "megabake_graphed":
+                    function = graphed(
+                        torch.compile(
+                            stateful,
+                            backend=_megabake("decode", args.out),
+                            fullgraph=True,
+                            dynamic=False,
+                        ),
+                        token,
+                        torch.tensor([[0]], device="cuda"),
+                        *state,
+                    )
+                else:
+                    function = build()
                 function(token, torch.tensor([[0]], device="cuda"), *state)
                 rows = {}
                 for context in contexts:
@@ -406,7 +459,9 @@ def bench_decode_contexts(model, args) -> dict:
                 summary = {
                     context: round(row["pipelined_call_us"]) for context, row in rows.items()
                 }
-                print(f"decode_contexts_{name} pipelined_call_us: {json.dumps(summary)}", flush=True)
+                print(
+                    f"decode_contexts_{name} pipelined_call_us: {json.dumps(summary)}", flush=True
+                )
             except Exception as error:  # noqa: BLE001 - keep benchmarking the other variants
                 traceback.print_exc()
                 print(f"decode_contexts_{name}: FAILED {type(error).__name__}: {error}", flush=True)
@@ -444,7 +499,8 @@ def main() -> None:
         "--model", nargs="+", default=[SMOLLM_MODEL_NAME], help="Hugging Face causal LM id(s)"
     )
     parser.add_argument(
-        "--revision", help=f"checkpoint revision (default: pinned for {SMOLLM_MODEL_NAME}, else main)"
+        "--revision",
+        help=f"checkpoint revision (default: pinned for {SMOLLM_MODEL_NAME}, else main)",
     )
     parser.add_argument(
         "--attention",
@@ -452,7 +508,9 @@ def main() -> None:
         default="eager",
         help="prefill attention: eager (pattern-matched by MegaBake) or the declared megabake op",
     )
-    parser.add_argument("--modes", nargs="+", choices=("prefill", "decode"), default=["prefill", "decode"])
+    parser.add_argument(
+        "--modes", nargs="*", choices=("prefill", "decode"), default=["prefill", "decode"]
+    )
     parser.add_argument(
         "--variants",
         nargs="+",

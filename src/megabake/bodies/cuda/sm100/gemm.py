@@ -4,14 +4,14 @@ SM12x does not implement Hopper WGMMA. This provider admits SM10x and SM12x
 without requiring the tcgen05/TMEM programming model. Every
 warp keeps its fragments in registers; no asynchronous pipeline survives run().
 """
+
 from __future__ import annotations
 
 from dataclasses import replace
 
-from ..graph import Region
-from ..lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
-from .generic import GeneratedContractionBody
-from .interface import (
+from ....graph import Region
+from ....lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
+from ...interface import (
     BodyConfig,
     CandidateSet,
     ParticipantContract,
@@ -22,6 +22,7 @@ from .interface import (
     TileContract,
     validate_body_config,
 )
+from ..generic import GeneratedContractionBody
 
 BLACKWELL_ARCHITECTURES = frozenset({"sm100", "sm103", "sm120", "sm121"})
 
@@ -42,8 +43,12 @@ class BlackwellGemmProvider:
         if len(region.tensor_programs) != 1:
             return reject("provider requires a single tensor program")
         program = region.tensor_programs[0]
-        if (program.family != "contraction" or len(program.loads) != 2
-                or len(program.store.shape) != 2 or program.reduction_axes != ("r0",)):
+        if (
+            program.family != "contraction"
+            or len(program.loads) != 2
+            or len(program.store.shape) != 2
+            or program.reduction_axes != ("r0",)
+        ):
             return reject("provider supports unbiased 2-D GEMM only")
         if any(domain.size < 1 for domain in program.iteration_domains):
             return reject("provider requires nonempty GEMM dimensions")
@@ -60,44 +65,59 @@ class BlackwellGemmProvider:
         # Reject scaled contractions and fused epilogues rather than silently
         # substituting plain GEMM for a different tensor program.
         acc = Accumulator("torch.float32")
-        product = Binary("mul", Cast(Load(left.id, dtype), "torch.float32", "round_nearest_even"),
-                         Cast(Load(right.id, dtype), "torch.float32", "round_nearest_even"), "torch.float32")
-        if (program.accumulator_dtype != "torch.float32"
-                or program.init != Constant(0.0, "torch.float32")
-                or program.combine != Binary("add", acc, product, "torch.float32")
-                or program.post != Cast(acc, dtype, "round_nearest_even")):
+        product = Binary(
+            "mul",
+            Cast(Load(left.id, dtype), "torch.float32", "round_nearest_even"),
+            Cast(Load(right.id, dtype), "torch.float32", "round_nearest_even"),
+            "torch.float32",
+        )
+        if (
+            program.accumulator_dtype != "torch.float32"
+            or program.init != Constant(0.0, "torch.float32")
+            or program.combine != Binary("add", acc, product, "torch.float32")
+            or program.post != Cast(acc, dtype, "round_nearest_even")
+        ):
             return reject("provider requires an unscaled FP32 accumulation and result cast")
-        from .catalog import _generic_config
+        from ...catalog import _generic_config
+
         base = _generic_config(region, program)
-        return CandidateSet((replace(
-            base,
-            provider=self.provider_name,
-            name="blackwell_mma_16x32x16",
-            tiles=TileContract(
-                cta_shape=(16, 32), cluster_shape=(1, 1),
-                work_partition="persistent range of output tiles",
-                mma_family="mma.sync", reduction_tile=(16,),
+        return CandidateSet(
+            (
+                replace(
+                    base,
+                    provider=self.provider_name,
+                    name="blackwell_mma_16x32x16",
+                    tiles=TileContract(
+                        cta_shape=(16, 32),
+                        cluster_shape=(1, 1),
+                        work_partition="persistent range of output tiles",
+                        mma_family="mma.sync",
+                        reduction_tile=(16,),
+                    ),
+                    participants=ParticipantContract(
+                        participating_threads=128,
+                        waiting_threads=128,
+                        warp_roles=("mma",) * 4,
+                        registers_per_thread=64,
+                    ),
+                    completion=replace(
+                        base.completion,
+                        register_fragments="warp MMA FP32 accumulators are cast and stored before return",
+                    ),
+                    evidence=ResourceEvidence(
+                        measured=False,
+                        source="megabake Blackwell warp MMA baseline",
+                        revision="blackwell-mma-v1",
+                        resources={"threads": 128, "shared_bytes": 0},
+                        measurements={},
+                    ),
+                ),
             ),
-            participants=ParticipantContract(
-                participating_threads=128, waiting_threads=128,
-                warp_roles=("mma",) * 4, registers_per_thread=64,
-            ),
-            completion=replace(
-                base.completion,
-                register_fragments="warp MMA FP32 accumulators are cast and stored before return",
-                output_tiles_ready="all assigned 16x32 tiles are stored before return",
-            ),
-            evidence=ResourceEvidence(
-                measured=False, source="megabake Blackwell warp MMA baseline",
-                revision="blackwell-mma-v1", resources={"threads": 128, "shared_bytes": 0},
-                measurements={},
-            ),
-        ),), ())
+            (),
+        )
 
 
-def emit_blackwell_gemm(
-    program: TensorProgram, config: BodyConfig
-) -> GeneratedContractionBody:
+def emit_blackwell_gemm(program: TensorProgram, config: BodyConfig) -> GeneratedContractionBody:
     """Emit a synchronous 16x32 CTA tile with predicated M/N/K tails."""
     validate_body_config(config)
     if config.provider != "blackwell_mma" or config.tiles.cta_shape != (16, 32):
@@ -107,7 +127,7 @@ def emit_blackwell_gemm(
     dtype = "cutlass.BFloat16" if program.store.dtype == "torch.bfloat16" else "cutlass.Float16"
     right_index = "(k, n)" if program.loads[1].axes == ("r0", "o1") else "(n, k)"
     ntiles = (columns + 31) // 32
-    source = f'''import cutlass
+    source = f"""import cutlass
 import cutlass.cute as cute
 
 @cute.kernel
@@ -152,15 +172,13 @@ def run(
             n = col_base + cc[i][1]
             if m < {rows} and n < {columns}:
                 tensor_bindings[2][m, n] = {dtype}(fc[i])
-'''
+"""
     return GeneratedContractionBody(
-        source=source, threads_per_cta=128, output_tile_elements=512,
-        reduction_chunk=16, tile_count=((rows + 15) // 16) * ntiles,
+        source=source,
+        threads_per_cta=128,
+        output_tile_elements=512,
+        reduction_chunk=16,
+        tile_count=((rows + 15) // 16) * ntiles,
         work_iterator_encoding="one row-major 16x32 output tile ordinal per CTA",
         phases=("output_tile", "warp_mma", "epilogue"),
-        phase_descriptions={
-            "output_tile": "four warps partition a predicated 16x32 output tile",
-            "warp_mma": "synchronous 16x8x16 warp MMA accumulates into FP32 registers",
-            "epilogue": "cast and store the owned output fragment with M/N predicates",
-        },
     )

@@ -6,61 +6,47 @@
 
 MegaBake turns a captured PyTorch inference workload into a planned, composable CUDA megakernel. PyTorch and Hugging Face keep the model and runtime interface. MegaBake owns region fusion, CuTe DSL device bodies, scheduling, and execution planning.
 
-## Design
+## Documents
 
-[north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the proposed compiler. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) gives the build gates. [RESEARCH.md](RESEARCH.md) records the source review and GPU experiments behind the design.
-
-[TASKS.md](TASKS.md) gives the step-by-step execution plan: get live FX, build the Compute Graph, plan execution, and generate complete CuTe megakernels. Each step names its implementation, inputs, outputs, and checks.
-
-[ELEVATOR_PITCH.md](ELEVATOR_PITCH.md) summarizes the vision, current status, audience value, and contribution asks.
-
-[SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) covers operation variants, generic lowering, explicit fallback, and reusable Mirage components with source references.
-
-Mirage is the main reference architecture for lowering, tile/layout planning, storage, and persistent scheduling. Start from its compatible algorithms and tests. Adapt them for the FX contract, CuTe DSL, and measured target requirements.
+| Document | What it holds |
+| --- | --- |
+| [north-star.md](north-star.md) | The fixed scope |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | The compiler as built and its target design |
+| [ROADMAP.md](ROADMAP.md) | **What to do next**, what is missing, and the measured state |
+| [docs/research/](docs/research/) | Research reports with source citations: the [2026-10-18 megakernel gap report](docs/research/2026-10-18-megakernel-gap/report.md) and the [2026-10-22 comparison with HazyResearch's ThunderKittens and Megakernels](docs/research/2026-10-22-hazy-megakernels/report.md) (warp roles, shared-memory pages, counters) |
+| [docs/history/](docs/history/) | Superseded design documents, build plans, performance reports and the old pitch |
 
 The compilation path is:
 
 1. Capture the invocation with Dynamo and preserve the PyTorch runtime contract.
 2. Receive live FX after the pinned AOT/Inductor preparation and post-grad passes, before lowering and scheduling.
-3. Recover tensor semantics and source-backed regions with explicit layouts, dependencies, effects, and numerical requirements.
-4. Generate baseline CuTe bodies from supported tensor primitives and add valid tuned candidates. Plan their execution in one persistent kernel where legal.
-5. Check the complete invocation and measure it against the strongest equivalent baseline: `torch.compile` and CUDA Graph replay.
+3. Recover tensor semantics and regions with explicit layouts, dependencies, effects, and numerical requirements.
+4. Select CuTe device bodies (tuned where available, generated otherwise) and plan their execution in one persistent kernel.
+5. Check the complete invocation and measure it against the strongest equivalent baseline.
 
-The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The frontend accepts `--mode prefill|decode`, validates the captured state contract, and uses mode-specific bounded search priorities while actual dimensions select the body family. Bounded contiguous one-token decode KV state is supported through an explicit cache contract; broader Hugging Face cache formats remain later work. On an SM90 CUDA device, `make_backend()` compiles supported post-grad graphs into one cooperative CuTe workload kernel and rebinds current inputs and parameters on every call. Pass `compile_kernel=False` to retain the FX reference path for CPU-only capture work.
-
-A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure before any device work. Strict megakernel compilation is the default (`fallback=error`); `fallback=inductor` delegates the whole invocation to Inductor and labels the result `inductor_fallback`.
+`mode=prefill|decode` selects policy defaults and validates the captured state contract; actual dimensions select the bodies. Strict megakernel compilation is the default (`fallback=error`); `fallback=inductor` delegates the whole invocation to Inductor and labels the result `inductor_fallback`. Pass `compile_kernel=False` to keep the FX reference path for CPU-only capture work.
 
 ## Current status
 
-Complete Hugging Face decoder models compile through the normal backend into one cooperative CuTe kernel, in prefill and stateful decode: SmolLM-135M and SmolLM-1.7B (Llama blocks), Qwen2-0.5B (q/k/v biases). Gemma 3 decode compiles through the declared attention op (ROADMAP step 4; not re-measured since). The kernel covers the embedding, every layer, the final norm, the vocabulary projection, and the KV-cache updates.
+Complete Hugging Face decoders compile into one cooperative CuTe kernel, in prefill and stateful decode: SmolLM-135M and 1.7B, Qwen2-0.5B, the DeepSeek-V3 0.6B draft, the Beam DFlash2 draft, gemma-2b, Gemma-3-270M, and Qwen3.5-0.8B (decode only; its prefill needs `cumsum`). The kernel covers the embedding, every layer, the final norm, the vocabulary projection, and the KV-cache updates.
 
-- **Projections:** the tuned Hopper TMA/WGMMA GEMM. Launches whose GEMMs have at most 64 rows use swapAB (weights on WGMMA's M side, tokens on N = 16/32/64); `addmm` biases are added in the epilogue.
-- **Attention:** declared through transformers' `AttentionInterface` (`megabake::attention`, `megabake::kv_attention`). Decode splits each row's context across CTAs.
-- **Small operators** (norms, RoPE, residual adds, gated activations) run generated bodies. At decode sizes they fold into the barrier interval of their consumer: every CTA recomputes them, so a layer costs about six barrier intervals instead of eleven.
-- **Synchronization:** a grid barrier on a monotonic arrival counter (~0.7 µs at 60 CTAs). Kernel arguments are constant between calls, so a call packs nothing and does not block.
+- **Projections:** the Hopper TMA/WGMMA GEMM. Launches whose GEMMs have at most 64 rows use swapAB; `addmm` biases are added in the epilogue.
+- **Attention:** declared through transformers' `AttentionInterface` (`megabake::attention`, `megabake::kv_attention`). Decode is flash decoding: each row's context splits across CTAs, and at long contexts a row packs the query heads that share a KV head, so each cached key and value is read once.
+- **Small operators** (norms, RoPE, residual adds, gated activations) run generated bodies and, at decode sizes, fold into their consumer's barrier interval.
+- **Synchronization:** a counting grid barrier (~0.7 µs at 60 CTAs). Full models do not use events yet.
 
-Decode of SmolLM-135M and Qwen2-0.5B matches eager bf16 exactly over advancing calls. SmolLM-1.7B regions match PyTorch on their own inputs up to GEMM accumulation order (≤ 2.6e-4).
-
-Limits: SM90 and bf16 only; kernels have static shapes, and `megabake.bucketed` serves variable prompt and batch lengths through a few compiled buckets, checking that padding cannot change real outputs; prefill is slow above ~64 tokens; linear-attention mixers (Qwen3.5's gated delta rule) are not declared yet. [ROADMAP.md](ROADMAP.md) has the plan and the measured state.
+Limits: SM90 and bf16 only; static shapes served through size buckets; decode KV capacity ≤ 8,192; prefill is slow above ~64 tokens; the compiler is still tuned to Llama-shaped models (see [ROADMAP.md](ROADMAP.md)).
 
 ## Current performance
 
-H200 MIG `3g.71gb` slice (60 SMs, ~2.2 TB/s), bf16, 40 warm calls, KV capacity 128. Medians in microseconds. "Call" is a synchronized complete call; "kernel" is GPU time of one profiled call. The slice shares a GPU with other tenants and its clocks move with their load, so single-call kernel times vary by 10–15%.
+On a 60-SM H200 MIG slice, bf16 (full table in [ROADMAP.md](ROADMAP.md#measured-state-2026-10-21)):
 
-| Model | Variant | Decode call | Decode kernel | Prefill call, 4 tokens |
-| --- | --- | ---: | ---: | ---: |
-| SmolLM-135M | Inductor | 11,575 | 1,384 | 1,931 (CUDA graphs) |
-| | MegaBake | **2,135** | 1,503 | 2,093 |
-| SmolLM-1.7B | Inductor | 9,568 | 2,421 | 2,923 (CUDA graphs) |
-| | MegaBake | **3,318** | 2,983 | 3,317 |
-| Qwen2-0.5B | Inductor | 10,178 | 1,650 | 2,162 (CUDA graphs) |
-| | MegaBake | **2,282** | **1,578** | 2,354 |
+- **Decode, pipelined calls:** 5–55% faster than a CUDA-graphed Inductor decode on 6 of 8 models; 1.3x slower on Gemma 3 and 2.2x slower on Qwen3.5.
+- **Long-context decode** (2026-10-27, flash-decoding attention): 6–29% faster than before at 4,096 cached keys on the head_dim-64 models. There SmolLM-135M, Qwen2-0.5B and the DeepSeek draft run 1.8–2.1x faster than graphed Inductor; SmolLM-1.7B is still 1.5x slower ([ROADMAP.md](ROADMAP.md#done-part-of-step-11-flash-decoding-attention-2026-10-27)).
+- **Decode, synchronized calls:** roughly ties graphed Inductor; ~600 µs of host work per call loses four models.
+- **Prefill** is slower than Inductor + CUDA graphs on every model, and 3–21x slower at 128–300 tokens.
 
-Inductor skips CUDA graphs in decode because the KV caches are mutated inputs. Back-to-back decode calls (`pipelined_call_us`) overlap MegaBake's host work with the previous kernel: 1.50 ms per call on 135M, 2.84 ms on 1.7B.
-
-- **Decode end to end:** 3–5x faster than Inductor, since one launch replaces 450–630.
-- **Long contexts:** decode stays flat. At 2,000 cached tokens: 135M 2.3 ms (Inductor 10.5 ms), 1.7B 5.5 ms (8.5 ms).
-- **Still behind:** decode GPU time on the SmolLM models (1.50 vs 1.38 ms, 2.98 vs 2.42 ms), prefill on 1.7B and at 32-token prompts, and compilation (1–6 minutes, growing with token count).
+Against hand-tuned baselines on a full H100 (external run, Llama-3.2-1B decode), MegaBake takes 1,784 µs/token. Hand-written CUDA graphs + PDL take 980 and HazyResearch's megakernel 966. Both are hand-written for this one model. With the real checkpoint on the 60-SM slice, the kernel reaches ~58% of read bandwidth. It loses most to decode attention that splits short contexts across CTAs, GEMMs that leave SMs idle, RoPE in its own barrier interval, and ~630 µs of host time per call; the LM head runs near peak. [ROADMAP.md](ROADMAP.md#done-external-baseline-llama-321b-2026-10-23) has the breakdown.
 
 Reproduce on an SM90 device:
 
@@ -71,7 +57,7 @@ MEGABAKE_PHASE_TIMER=1 .venv/bin/python tools/phase_profile.py --mode decode    
 .venv/bin/python tools/dump_megakernels.py --checkpoint                                   # correctness check plus generated source
 ```
 
-`benchmarks/run.py --workload mlp|transformer-block` and `benchmarks/isolated.py` measure the smaller fixtures. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) has the earlier analysis.
+`benchmarks/run.py --workload mlp|transformer-block` and `benchmarks/isolated.py` measure the smaller fixtures. Earlier performance reports are in [docs/history/](docs/history/).
 
 ## Current frontend
 

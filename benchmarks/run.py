@@ -60,10 +60,7 @@ def _relative_l2(actual, expected):
 
 
 def _clones(inputs):
-    return tuple(
-        value.clone() if isinstance(value, torch.Tensor) else value
-        for value in inputs
-    )
+    return tuple(value.clone() if isinstance(value, torch.Tensor) else value for value in inputs)
 
 
 def _state_error(actual_inputs, expected_state):
@@ -79,9 +76,7 @@ def _run_transformer_block(arguments, report):
     if arguments.mode == "decode" and arguments.sequence != 1:
         raise SystemExit("decode benchmark requires --sequence 1")
 
-    model, base_inputs = transformer_block(
-        arguments.mode, arguments.batch, arguments.sequence
-    )
+    model, base_inputs = transformer_block(arguments.mode, arguments.batch, arguments.sequence)
     reference_inputs = _clones(base_inputs)
     inductor_inputs = _clones(base_inputs)
     megabake_inputs = _clones(base_inputs)
@@ -107,18 +102,14 @@ def _run_transformer_block(arguments, report):
     )
     backend_setup_us = (time.perf_counter() - backend_setup_started) * 1_000_000
     wrapper_setup_started = time.perf_counter()
-    compiled = torch.compile(
-        model, backend=backend, fullgraph=True, dynamic=False
-    )
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
     wrapper_setup_us = (time.perf_counter() - wrapper_setup_started) * 1_000_000
     result, megabake_first = _first_call(compiled, *megabake_inputs)
 
     error = _relative_l2(result, reference)
     inductor_error = _relative_l2(inductor_result, reference)
     state_error = (
-        _state_error(megabake_inputs, expected_state)
-        if arguments.mode == "decode"
-        else 0.0
+        _state_error(megabake_inputs, expected_state) if arguments.mode == "decode" else 0.0
     )
     if error >= 0.01:
         raise RuntimeError(f"Transformer block relative error {error}")
@@ -194,9 +185,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=5)
     parser.add_argument("--samples", type=int, default=32)
-    parser.add_argument(
-        "--scheduler", choices=("auto", "phase", "region-events"), default="auto"
-    )
+    parser.add_argument("--scheduler", choices=("auto", "phase", "region-events"), default="auto")
     arguments = parser.parse_args()
     if arguments.output is None:
         arguments.output = Path(
@@ -204,10 +193,6 @@ def main() -> None:
             if arguments.workload == "transformer-block"
             else "artifacts/task16/mlp.json"
         )
-    if arguments.workload == "transformer-block":
-        arguments.traces = Path("artifacts/task29/traces")
-        _run_transformer_block(arguments, report)  # noqa: F821  # TODO: report is undefined on this existing benchmark path; fix separately.
-        return
 
     torch.manual_seed(16)
     torch.set_grad_enabled(False)
@@ -217,13 +202,15 @@ def main() -> None:
         "seed": 16,
         "records": [],
     }
+    if arguments.workload == "transformer-block":
+        arguments.traces = Path("artifacts/task29/traces")
+        _run_transformer_block(arguments, report)
+        return
+
     for batch_size in arguments.batches:
-        source = torch.randn(
-            batch_size, 576, dtype=torch.bfloat16, device="cuda"
-        ) / (576**0.5)
+        source = torch.randn(batch_size, 576, dtype=torch.bfloat16, device="cuda") / (576**0.5)
         weights = tuple(
-            torch.randn(rows, columns, dtype=torch.bfloat16, device="cuda")
-            / (columns**0.5)
+            torch.randn(rows, columns, dtype=torch.bfloat16, device="cuda") / (columns**0.5)
             for rows, columns in ((1536, 576), (1536, 576), (576, 1536))
         )
         inputs = (source, *weights)
@@ -243,17 +230,12 @@ def main() -> None:
         backend = make_backend(scheduler=arguments.scheduler, compile_kernel=True)
         backend_setup_us = (time.perf_counter() - backend_setup_started) * 1_000_000
         wrapper_setup_started = time.perf_counter()
-        compiled = torch.compile(
-            mlp, backend=backend, fullgraph=True, dynamic=False
-        )
+        compiled = torch.compile(mlp, backend=backend, fullgraph=True, dynamic=False)
         wrapper_setup_us = (time.perf_counter() - wrapper_setup_started) * 1_000_000
         result, megabake_first = _first_call(compiled, *inputs)
-        error = (
-            (result.float() - reference.float()).norm() / reference.float().norm()
-        ).item()
+        error = ((result.float() - reference.float()).norm() / reference.float().norm()).item()
         inductor_error = (
-            (inductor_result.float() - reference.float()).norm()
-            / reference.float().norm()
+            (inductor_result.float() - reference.float()).norm() / reference.float().norm()
         ).item()
         if not error < 0.01:
             raise RuntimeError(f"MLP relative error {error}")
@@ -275,9 +257,7 @@ def main() -> None:
             "megabake_cost_breakdown": {
                 "backend_setup_us": backend_setup_us,
                 "dynamo_wrapper_setup_us": wrapper_setup_us,
-                "megabake_compilation_us": getattr(
-                    backend, "megabake_last_compile_us", None
-                ),
+                "megabake_compilation_us": getattr(backend, "megabake_last_compile_us", None),
                 "first_call_host_us": megabake_first["host_us"],
             },
             "eager": event_samples(lambda: mlp(*inputs)),  # noqa: B023  # Callback is consumed within this loop iteration.
@@ -333,14 +313,10 @@ def main() -> None:
                 {
                     "batch_size": batch_size,
                     "eager_complete_us": record["eager"]["complete_call_us"],
-                    "cuda_graph_complete_us": record["cuda_graph"][
-                        "complete_call_us"
-                    ],
+                    "cuda_graph_complete_us": record["cuda_graph"]["complete_call_us"],
                     "inductor_complete_us": record["inductor"]["complete_call_us"],
                     "megabake_complete_us": record["megabake"]["complete_call_us"],
-                    "megabake_kernel_duration_us": record["megabake"][
-                        "kernel_duration_us"
-                    ],
+                    "megabake_kernel_duration_us": record["megabake"]["kernel_duration_us"],
                     "megabake_first_launch_to_last_kernel_us": record["megabake"][
                         "first_launch_to_last_kernel_us"
                     ],

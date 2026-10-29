@@ -1,8 +1,10 @@
 # MegaBake implementation plan
 
+> **Historical document.** This is the G0–G5 build gates. Complete-model compilation (G4) now works for SmolLM-class decoders; G1 (the MLP) was last recorded as "hold" on 2026-10-13. It is kept for its evidence and history and is not maintained. The current design is [ARCHITECTURE.md](../../ARCHITECTURE.md) and the current plan is [ROADMAP.md](../../ROADMAP.md).
+
 **Status: G0 probes are recorded as complete for their declared target. Production integration and later gates remain open.**
 
-[north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the design. [RESEARCH.md](RESEARCH.md) records the work completed for this revision.
+[north-star.md](../../north-star.md) defines the scope. [ARCHITECTURE.md](../../ARCHITECTURE.md) defines the design. [RESEARCH.md](RESEARCH.md) records the work completed for this revision.
 
 [TASKS.md](TASKS.md) gives the step-by-step execution order, functions to implement, inputs, outputs, and completion checks. Follow that sequence to build the compiler. Use the gates below to assess the resulting implementation.
 

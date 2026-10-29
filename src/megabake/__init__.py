@@ -7,9 +7,11 @@ from .compiler import (
     CompiledKernel,
     CompiledResources,
     CompilerError,
+    GraphedCall,
     bind_callable,
     compile_plan,
     compile_post_grad,
+    graphed,
 )
 from .frontend import (
     CaptureCache,
@@ -70,6 +72,7 @@ __all__ = [
     "DependencyPlan",
     "EventSchedule",
     "EventScheduleSimulation",
+    "GraphedCall",
     "KVCacheAccess",
     "KernelPlan",
     "PaddingDependence",
@@ -99,6 +102,7 @@ __all__ = [
     "execute_phase_plan",
     "form_regions",
     "get_candidates",
+    "graphed",
     "import_fx",
     "kv_attention",
     "lower_semantics",

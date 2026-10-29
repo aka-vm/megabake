@@ -48,8 +48,8 @@ def rotate_half(source, cosine, sine):
         - source[..., half:] * sine[..., :half]
     )
     second = (
-        source[..., half:] * sine[..., :half]
-        + source[..., :half] * cosine[..., :half]
+        source[..., half:] * cosine[..., :half]
+        + source[..., :half] * sine[..., :half]
     )
     return torch.cat((first, second), dim=-1)
 

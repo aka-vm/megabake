@@ -1,0 +1,91 @@
+topic: MegaBake vs Mirage MPK and reference megakernel systems - implemented ideas, remaining gaps, megakernel-exclusive optimizations, and overfitting risk
+context: &ctx |
+  MegaBake (repo root /workspace/megabake, code in src/megabake, docs README.md ROADMAP.md PERFORMANCE_REPORT.md
+  ARCHITECTURE.md SCHEDULER_REUSE.md RESEARCH.md) compiles a captured PyTorch/HF model (Dynamo -> AOT/Inductor post-grad FX)
+  into ONE cooperative persistent CuTe-DSL CUDA kernel on SM90 (H200 MIG 3g.71gb slice, 60 SMs, ~2.2 TB/s, shared/noisy clocks).
+  Current runtime: table-driven phases separated by grid barriers (~0.7us each, ~6 barrier intervals per layer at decode after
+  interval folding), tuned TMA/WGMMA GEMM with swapAB for <=64 rows, bias epilogue, split-context decode attention, generated
+  bodies for norms/RoPE/pointwise, declared megabake::attention / kv_attention ops via HF AttentionInterface, size buckets.
+  NOT done: event counters in the table launch (ROADMAP step 10), cross-phase L2 weight prefetch (step 9), split-K (built, off),
+  gated delta rule (step 6), fast prefill above ~64 tokens (3-21x slower than Inductor+CUDA graphs at 128-300 tokens).
+  Decode kernel GPU time is still above Inductor's summed kernels (135M 1.50 vs 1.38 ms; 1.7B 2.98 vs 2.42 ms); MegaBake wins
+  end-to-end only via launch/host overhead. Fresh benchmark results land in /workspace/megabake/artifacts/full_model_2026-10-18/*/report.json
+  (older ones in artifacts/full_model/). Profiling tool: tools/phase_profile.py. Reference projects are checked out under
+  /workspace/megabake/agent_space/{mirage,tpu-megakernels,vllm,pytorch}. Read code, do not just skim READMEs. Do not run GPU jobs
+  (the GPU is busy with benchmarks); static analysis plus web research only. The user wants a GENERIC compiler for generic
+  hardware and is worried compiler params/optimizations are overfit to the tested models - always flag that.
+items:
+  - name: Mirage MPK runtime and scheduler
+    category: Mirage (primary reference)
+    description: Mirage Persistent Kernel runtime in agent_space/mirage (include/mirage/persistent_kernel, src/persistent_kernel, python/mirage/mpk). Worker/scheduler CTA split, task graph, events (trigger_event/dependent_event counters), task queues, dynamic vs static scheduling, how it avoids grid barriers, paged KV/runtime token counts, multi-GPU (NVSHMEM), host-device interaction, request batching. Compare point-by-point with MegaBake's runtime (src/megabake/runtime.py, schedule.py, codegen.py, plan.py) and quantify how far MegaBake is.
+    megabake_context: *ctx
+  - name: Mirage MPK task library and fusion patterns
+    category: Mirage (primary reference)
+    description: Mirage MPK task implementations and layer builders (python/mirage/mpk, mpk/models/*/builder.py, include/mirage/persistent_kernel/tasks or equivalent). rmsnorm_linear, linear_with_residual, linear_swapAB_hopper, fused QKV / gate-up, paged attention, MoE, argmax/sampling, split strategies (how many tasks per linear, split-K), tile sizes, Hopper/Blackwell variants. Map each to MegaBake bodies (src/megabake/bodies/*, regions.py, lowering.py) and say which fusions MegaBake lacks and their expected gain.
+    megabake_context: *ctx
+  - name: Mirage superoptimizer and compiler pipeline
+    category: Mirage (primary reference)
+    description: Mirage's muGraph superoptimizer (kernel/threadblock/thread graphs, search in include/mirage/search, probabilistic equivalence verification, transpiler to CUDA/Triton/NKI) and the MPK graph-to-task-graph compilation (memory planning, layout, tensor partitioning, task dependency derivation). Can MegaBake use superoptimization or search instead of hand-written region matchers to stay model-generic? What parts of SCHEDULER_REUSE.md plans are done vs not?
+    megabake_context: *ctx
+  - name: Inferact TPU megakernels
+    category: Reference megakernel
+    description: agent_space/tpu-megakernels (qwen/, kimi/, collectives32.py, pool_alias.py). The cross-op/cross-layer weight streaming bank ring (BANK_COUNT), how norms/RoPE/attention/gated delta rule hide under weight streaming, speculative decoding (DFlash/DSpark) integration, buffer aliasing. Which ideas transfer to a GPU megakernel (L2 prefetch, TMA multicast, smem ring across ops) and what MegaBake has of each.
+    megabake_context: *ctx
+  - name: vLLM compilation and custom-op strategy
+    category: Reference system
+    description: agent_space/vllm - vllm/compilation (piecewise CUDA graphs, splitting ops, fusion passes such as rmsnorm+quant, allreduce+rmsnorm, activation+quant, sequence parallelism, noop elimination), declared custom ops for stateful mixers, model-agnostic config of capture sizes, how vLLM keeps optimizations generic across hundreds of models. What MegaBake should adopt for generality, and what the multi-kernel approach fundamentally cannot do that MegaBake can.
+    megabake_context: *ctx
+  - name: PyTorch Inductor generality and autotuning
+    category: Reference system
+    description: agent_space/pytorch torch/_inductor - IR kinds, decompositions, scheduler fusion rules, template autotuning (max-autotune, choices, heuristics per device in template_heuristics), combo kernels/horizontal fusion, cudagraph trees, how config is derived from device properties rather than models. Contrast with MegaBake's lowering.py/planner.py/plan.py choices. Use as the yardstick for "generic compiler for generic hardware".
+    megabake_context: *ctx
+  - name: Megakernel-exclusive optimizations catalogue
+    category: Megakernel technique survey
+    description: Deep web + literature research on optimizations that exist ONLY (or are only practical) inside a single persistent megakernel and cannot be matched by a graph of ~500 kernels even with CUDA Graphs and PDL. E.g. cross-op weight prefetch into smem/L2 during the previous op, overlapping the tail of one op with the head of the next at tile granularity (fine-grained dataflow), keeping activations resident in smem/registers across ops, shared-memory paging (Hazy), instruction pipelining across ops, cross-layer software pipelining/unrolling, warp-specialized producer streams spanning the whole model, on-device scheduling/load balancing, eliminating launch+drain tails, fusing sampling/argmax and next-step embedding, in-kernel speculative decoding loops, multi-step decode loops in one launch. Sources include Hazy Research "Look Ma No Bubbles" Llama-1B megakernel and throughput megakernel, ThunderKittens/ThunderMittens, the Mirage MPK paper (find it on arXiv), Event Tensor, TileRT, FlashInfer persistent, Tokasaurus, NVIDIA PDL docs, any 2025-2026 work. For each, state whether MegaBake has it and expected gain on decode.
+    megabake_context: *ctx
+  - name: Megakernel systems state of the art 2025-2026
+    category: Megakernel technique survey
+    description: Web survey of published megakernel / persistent-kernel inference compilers and systems 2025-2026 (Mirage MPK, Hazy megakernels, Event Tensor compiler, TileLang/TileRT, Triton-distributed, MegaScale, SGLang/vLLM megakernel efforts, Blackwell CLC persistent schedulers, any compiler that generates megakernels automatically from a framework graph). Reported numbers vs CUDA-graph baselines, what makes them generic vs hand-built, and where MegaBake sits relative to each.
+    megabake_context: *ctx
+  - name: MegaBake overfitting audit
+    category: Generality audit
+    description: Static audit of /workspace/megabake/src/megabake for parameters, thresholds, tile sizes, worker counts, swapAB row cutoffs (16/32/64), buckets, region matchers (regions.py RMSNorm/RoPE/attention patterns), stride heuristics, per-model wrappers (benchmarks/stateful_models.py, StatefulSmolLM), hard-coded SM90/60-SM/bf16 assumptions, plan-search budgets and anything chosen by measuring on the tested models. Use git log/blame to see which constants were tuned against which model. Classify each as generic, hardware-specific, or model-overfit; propose the generic replacement (derive from device properties, autotune at compile time with a cost model, search). Also check test coverage across model families.
+    megabake_context: *ctx
+  - name: Hardware-generic megakernel design
+    category: Generality audit
+    description: How to keep a megakernel compiler generic across GPUs - SM80 (cp.async, mma.sync), SM90 (TMA, WGMMA, clusters, distributed smem), SM100/Blackwell (tcgen05, TMEM, 2-CTA MMA, cluster launch control), different SM counts/L2 sizes/bandwidths and MIG slices. How Mirage, CUTLASS/CuTe, Inductor, TileLang and Hazy parametrize by target; analytical cost models and roofline-driven choices (tasks per op, split-K, tile shapes, barrier vs event); MegaBake's bodies/blackwell.py state. Recommend an architecture for target abstraction and compile-time autotuning that avoids model overfitting.
+    megabake_context: *ctx
+  - name: FlashMLA mega-attention fused kernel
+    category: DeepSeek V4.1 hand-fused stack (vLLM)
+    description: >-
+      /workspace/megabake/agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py and the FlashMLA ops it calls (fused_norm_rope_attn_rope_cast_decode / _fwd; find their CUDA/CuTe sources in agent_space/vllm csrc or third_party, or upstream FlashMLA on the web). One SM100 kernel does optional Q norm, Q RoPE, sparse paged attention over fp8/NVFP4 caches with attention sinks, the inverse RoPE of the output, and an MXFP8 cast with per-32 ue8m0 scales written in DeepGEMM's MN-major layout. Study what is fused and why it pays (algebraic absorption of inverse RoPE, cast-into-producer, padded-head vs live-head cost; the measured TP1-TP8 table in the file and its warning to measure under CUDA graphs). Which of these fusion kinds could a compiler like MegaBake discover or express generically (attention body with prologue/epilogue contracts) versus only hand-write? Is a body like this the "ideal output" for MegaBake, or only one ideal body inside the megakernel?
+    megabake_context: *ctx
+  - name: Load-time layout co-design and weight permutation
+    category: DeepSeek V4.1 hand-fused stack (vLLM)
+    description: >-
+      /workspace/megabake/agent_space/vllm/vllm/models/deepseek_v41/common/ops/fused_layout.py (q_fused_permutation, o_fused_permutation, permute_on_load) and how wq_b rows / wo_a columns and scales are permuted once at load so neighbouring GEMMs produce and consume the attention kernel's chunk-interleaved layouts with no per-step shuffle; also QKV/gate-up interleaving in Mirage MPK builders. Research compiler techniques for this generically - layout assignment/propagation across producer-consumer chains, folding permutations into constant weights at compile time, CuTe layout algebra, Mirage/Hexcute/Graphene/Tilus/Triton linear layouts, equality saturation over layouts. What MegaBake has (memory.py, lowering of views, weights as lifted parameters) and what a "layout assignment pass that rewrites weights" would take.
+    megabake_context: *ctx
+  - name: Quantized activation contracts and producer-consumer format negotiation
+    category: DeepSeek V4.1 hand-fused stack (vLLM)
+    description: >-
+      How the DeepSeek V4.1 stack negotiates work and formats between neighbouring layers - accepts_unnormed_unroped_query, _alloc_attn_out/_o_proj overrides, QuantizedActivation (data+scale, quant_key kMxfp8Dynamic, scale layout chosen for the consumer), packed_kv_cache_dtype (NVFP4 cache only this kernel reads), is_available_for capability/topology gating, query_quant.py, fused_compress_quant_cache.py, indexer_k_store.py under /workspace/megabake/agent_space/vllm/vllm/models/deepseek_v41. Translate this into a compiler design: typed edge formats (dtype, scale granularity, layout) chosen jointly by producer and consumer bodies, epilogue quantization, and absorbed-work flags in MegaBake's body interface (src/megabake/bodies/interface.py). Also cover fp8/nvfp4 support gaps in MegaBake (bf16-only today).
+    megabake_context: *ctx
+  - name: DeepSeek V4.1 sibling fused ops catalogue
+    category: DeepSeek V4.1 hand-fused stack (vLLM)
+    description: >-
+      Catalogue every hand-fused op in /workspace/megabake/agent_space/vllm/vllm/models/deepseek_v41/nvidia and /workspace/megabake/agent_space/vllm/vllm/models/deepseek_v41/common - ops/mega_mhc.py, mhc.py, fused_wo_a.py, o_proj.py, cute_dsl/all_reduce_mhc.py and primitives.py (CuTe DSL, same DSL MegaBake uses), engram_peer.py, flashinfer_sparse.py, flashmla.py, dspark.py, decoder_replay_cudagraph.py, model.py, model_state.py. For each: what ops it fuses, data formats, why, any measured numbers in comments, and whether that fusion is (a) generic and expressible by a compiler, (b) megakernel-exclusive, or (c) inherently model-specific. Pay special attention to the CuTe DSL code as directly reusable patterns for MegaBake bodies, and to decoder_replay_cudagraph.py / dspark.py for how they run decode and speculative decoding.
+    megabake_context: *ctx
+  - name: Mixed prefill-decode batches and workspace planning
+    category: DeepSeek V4.1 hand-fused stack (vLLM)
+    description: >-
+      Runtime ideas in the DeepSeek V4.1 stack - one output buffer per step with prefill and decode segments writing disjoint token ranges so one consumer GEMM covers both; prefill chunk plans; current_workspace_manager().get_simultaneous reservations and warmup reservation; sparse top-k index construction; paged NVFP4/fp8 caches. Map to MegaBake: static buckets vs device-side token counts, ragged batches inside a persistent kernel, workspace planner (memory.py), KV cache contract, chunked prefill inside a megakernel. Which ideas are needed for MegaBake to serve real traffic (batch>1, mixed prefill/decode) rather than single-request benchmarks?
+    megabake_context: *ctx
+  - name: Compiler synthesis of hand-fused kernels
+    category: Synthesis
+    description: >-
+      The user asks whether MegaBake's ideal output should look like /workspace/megabake/agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py. Research how close a compiler can get to such hand-fused kernels automatically and what the right target is - e.g. Mirage superoptimizer, ForgeMegakernel / AutoMegaKernel (agent-written kernels), Event Tensor, TVM/Ansor/MetaSchedule, Triton/Helion autotuned templates, ThunderKittens, cuTile, Hexcute, KernelBench-style LLM kernel generation, equality saturation fusion. Propose a concrete MegaBake architecture where hand-tuned "mega bodies" (attention+RoPE+cast, GEMM+epilogue) are a small library with declared prologue/epilogue/layout contracts, and the compiler does layout assignment, contract matching, weight pre-permutation and megakernel scheduling around them - and where the boundary between generic compiler work and hand-written kernels should sit to avoid model overfitting.
+    megabake_context: *ctx
+execution:
+  batch_size: 10
+  items_per_agent: 1
+  output_dir: ./results

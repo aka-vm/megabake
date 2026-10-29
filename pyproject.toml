@@ -50,6 +50,8 @@ line-length = 100
 extend-ignore = [
     # Nested guards separate CuTe compile-time conditions from device conditions.
     "SIM102",
+    # Allow 'l' as dimension variable in GEMM/tensor coordinates (M, N, K, L).
+    "E741",
 ]
 
 [tool.pytest.ini_options]

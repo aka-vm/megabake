@@ -1,8 +1,10 @@
 # MegaBake execution plan
 
+> **Historical document.** This is the 33-step build ladder used to build the compiler. The full-model path these steps describe is now built; test names such as `test_task24_*` refer to these numbers. It is kept for its evidence and history and is not maintained. The current design is [ARCHITECTURE.md](../../ARCHITECTURE.md) and the current plan is [ROADMAP.md](../../ROADMAP.md).
+
 Build the compiler in the numbered order below. Each step consumes an earlier result and produces a concrete implementation.
 
-[ARCHITECTURE.md](ARCHITECTURE.md) defines the design. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) defines acceptance checks. [north-star.md](north-star.md) fixes the scope.
+[ARCHITECTURE.md](../../ARCHITECTURE.md) defines the design. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) defines acceptance checks. [north-star.md](../../north-star.md) fixes the scope.
 
 ## Start from the current checkout
 
@@ -60,7 +62,7 @@ Use Mirage as the main implementation reference. The reuse table near the end ma
 
 - [x] Implement `make_backend(**options)` as a Dynamo backend factory. Its returned backend accepts the Dynamo graph and example inputs.
 - [x] Exercise that backend through `torch.compile(..., fullgraph=True)`.
-- [x] Extract the preparation logic from [verify_smollm_fx.py](src/eager/verify_smollm_fx.py) into `fx_handler/export.py`; keep Hugging Face model capture in `fx_handler/transformers.py`.
+- [x] Extract the preparation logic from [verify_smollm_fx.py](../../src/eager/verify_smollm_fx.py) into `fx_handler/export.py`; keep Hugging Face model capture in `fx_handler/transformers.py`.
 - [x] Implement a handoff callback that receives the live prepared graph and binds its optimized FX forward without Inductor compilation.
 - [x] Repair the cache-hit branch that currently labels an untransformed graph as post-grad. Keep capture-cache and compiled-plan reuse distinct.
 - [x] Retain PyTorch's argument, output, guard, alias, and mutation wrappers. Keep Dynamo's guards active in their owning layer.
@@ -212,7 +214,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `gemm.py`, with `gemm_candidates(region, target)` and a device range entry.
 
-- [x] Adapt [resident_range_probe.py](experiments/g0_2026_10_09/resident_range_probe.py) into a maintained provider.
+- [x] Adapt [resident_range_probe.py](../../experiments/g0_2026_10_09/resident_range_probe.py) into a maintained provider.
 - [x] Preserve the source license and revision. Replace experimental source rewriting with an explicit implementation before treating it as production code.
 - [x] Retain the pipeline across a range of tiles. Bind scratch, descriptors, and current tensor addresses through the common interface.
 - [x] Return coupled instruction, tile, layout, stage, and warp configurations. Check shape, stride, alignment, and tail restrictions.
@@ -276,7 +278,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Input:** the phase schedule, worker scratch, and launch requirements.
 
-**Implement in:** `runtime.py`, using [mixed_body_probe.py](experiments/g0_2026_10_09/mixed_body_probe.py).
+**Implement in:** `runtime.py`, using [mixed_body_probe.py](../../experiments/g0_2026_10_09/mixed_body_probe.py).
 
 - [x] Extract the cooperative worker loop and its release/acquire barrier into reusable device functions.
 - [x] Preserve CTA synchronization around arrival and release. Drain required asynchronous work before publishing completion or reusing scratch.
@@ -340,7 +342,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Check:** changing model weights must change outputs without stale bindings. A correct slow result remains a performance gap for steps 17–20.
 
-**Evidence:** [MegaBake complete-call report](artifacts/task16/mlp.json), [native/Inductor baseline](artifacts/task16/mlp_baseline.json), and [recurring-work traces](artifacts/task16/traces). The report records exact correctness, steady-state one-CUDA-kernel execution, complete-call and kernel-only timing, and the remaining phase/body performance gap for steps 17–20.
+**Evidence:** [MegaBake complete-call report](../../artifacts/task16/mlp.json), [native/Inductor baseline](../../artifacts/task16/mlp_baseline.json), and [recurring-work traces](../../artifacts/task16/traces). The report records exact correctness, steady-state one-CUDA-kernel execution, complete-call and kernel-only timing, and the remaining phase/body performance gap for steps 17–20.
 
 ## 17. Add legal local fusion and tuned region candidates
 
@@ -358,7 +360,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Check:** compare fused and unfused executions, including an extra intermediate output. Measure the full MLP after each accepted change.
 
-**Evidence:** [MegaBake complete-call report](artifacts/task17/mlp.json), [native/Inductor baseline](artifacts/task17/mlp_baseline.json), and [recurring-work traces](artifacts/task17/traces). The report records exact correctness and one-CUDA-kernel execution at batch sizes 4 and 256.
+**Evidence:** [MegaBake complete-call report](../../artifacts/task17/mlp.json), [native/Inductor baseline](../../artifacts/task17/mlp_baseline.json), and [recurring-work traces](../../artifacts/task17/traces). The report records exact correctness and one-CUDA-kernel execution at batch sizes 4 and 256.
 
 ## 18. Search a small coupled configuration space
 
@@ -377,7 +379,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Check:** rerun the selected candidate independently. A faster isolated GEMM must not displace a faster complete MLP plan.
 
-**Evidence:** [MegaBake complete-call report](artifacts/task18/mlp.json) and [Task 18 search summary](artifacts/task18/README.md). The report retains raw complete-call samples, verification reruns, resource attributes, selected worker counts, and explicit rejected-candidate reasons.
+**Evidence:** [MegaBake complete-call report](../../artifacts/task18/mlp.json) and [Task 18 search summary](../../artifacts/task18/README.md). The report retains raw complete-call samples, verification reruns, resource attributes, selected worker counts, and explicit rejected-candidate reasons.
 
 ## 19. Add tile events if phase waits limit the target
 
@@ -397,7 +399,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Check:** test forks, joins, residuals, uneven tails, delayed producers, and idle workers. Keep a phase schedule when event compression cannot represent the graph.
 
-**Evidence:** [Task 19 host and GPU event schedule evidence](artifacts/task19/README.md). The scheduler and runtime primitives cover exact reduction fan-in, shared prerequisite events, conservative state effects, delayed producers, and idle workers. A temporary backend wiring measurement showed a batch-4 complete-call regression, so compiler and public backend execution remain phase-only.
+**Evidence:** [Task 19 host and GPU event schedule evidence](../../artifacts/task19/README.md). The scheduler and runtime primitives cover exact reduction fan-in, shared prerequisite events, conservative state effects, delayed producers, and idle workers. A temporary backend wiring measurement showed a batch-4 complete-call regression, so compiler and public backend execution remain phase-only.
 
 ## 20. Close the first region performance gap
 
@@ -415,7 +417,7 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Check:** include the resource cost of the full body mixture. Complete G0 integration and G1 evidence before proceeding to wider coverage.
 
-**Evidence:** [Task 20 measured scheduler evidence](artifacts/task20/README.md). Automatic phase/event selection improves the measured complete MLP by 15.4% at batch 4 and 25.2% at batch 256, but G1 remains on hold because CUDA Graph replay is still 12.5x and 15.0x faster. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) gives the attribution, the ordered fixes, and the gates to pass before step 21. Judge the kernel by launch plus compute from `benchmarks/isolated.py`; complete-call time also contains per-call binding work.
+**Evidence:** [Task 20 measured scheduler evidence](../../artifacts/task20/README.md). Automatic phase/event selection improves the measured complete MLP by 15.4% at batch 4 and 25.2% at batch 256, but G1 remains on hold because CUDA Graph replay is still 12.5x and 15.0x faster. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) gives the attribution, the ordered fixes, and the gates to pass before step 21. Judge the kernel by launch plus compute from `benchmarks/isolated.py`; complete-call time also contains per-call binding work.
 
 ## 20A. Fuse the SiLU chain into one elementwise region
 
@@ -766,7 +768,7 @@ The entries below retain the completed work from the previous checklist. Their t
 - [x] Make one measurement harness report numerical errors, raw timings, launch count, and compiled resource use.
 - [x] Separate setup, compilation, first-call, warm GPU, and complete host-call timing. Include a weight-streaming case.
 
-**Deliverable:** complete. See [WORKLOAD.md](experiments/g0_2026_10_09/WORKLOAD.md), [g0_workload.json](experiments/g0_2026_10_09/g0_workload.json), the saved GEMM reports, and [mlp_baseline.json](experiments/g0_2026_10_09/mlp_baseline.json).
+**Deliverable:** complete. See [WORKLOAD.md](../../experiments/g0_2026_10_09/WORKLOAD.md), [g0_workload.json](../../experiments/g0_2026_10_09/g0_workload.json), the saved GEMM reports, and [mlp_baseline.json](../../experiments/g0_2026_10_09/mlp_baseline.json).
 
 ### Recorded task 02. Make a fast GEMM body process a range of tiles
 
@@ -779,7 +781,7 @@ The entries below retain the completed work from the previous checklist. Their t
 - [x] Bind current addresses and descriptors on each call. Check repeated entry with changed tensors, contents, and tile counts.
 - [x] Compare the original launch, the range entry, and the restarting adapter. Record latency and resources for each.
 
-**Deliverable:** complete. See [resident_range_probe.py](experiments/g0_2026_10_09/resident_range_probe.py) and [resident_range.json](experiments/g0_2026_10_09/resident_range.json) for the range contract, correctness, resource use, and comparison timings.
+**Deliverable:** complete. See [resident_range_probe.py](../../experiments/g0_2026_10_09/resident_range_probe.py) and [resident_range.json](../../experiments/g0_2026_10_09/resident_range.json) for the range contract, correctness, resource use, and comparison timings.
 
 ### Recorded task 03. Run different bodies inside one persistent kernel
 
@@ -795,4 +797,4 @@ The entries below retain the completed work from the previous checklist. Their t
 - [x] Test repeated calls, changed bindings, delayed producers, and the largest valid worker grid.
 - [x] Run the relevant memory/race checks. Save the launch trace and complete resource report.
 
-**Deliverable:** complete for correctness only. The probe's timing loop kept its deliberate producer delay, so the recorded 1,326 us GPU latency in `mixed_body.json` is not a composition cost and no clean one was measured. The cooperative M=4 kernel passes repeated changed bindings and delayed producers at the compiled 60-worker limit; repeated M=4→1 and M=4→256 rebinds also pass. A 61-worker request is rejected before the workload launch. The trace contains one kernel, and memcheck, racecheck, and synccheck are clean at 60 workers. CUDA Graph replay is outside this probe; tested calls supply their barrier epochs on the host. See [g0_status.json](experiments/g0_2026_10_09/g0_status.json), [mixed_body.json](experiments/g0_2026_10_09/mixed_body.json), [mixed_shape_m1.json](experiments/g0_2026_10_09/mixed_shape_m1.json), [mixed_shape_m256.json](experiments/g0_2026_10_09/mixed_shape_m256.json), and [mixed_kernel_trace.json](experiments/g0_2026_10_09/mixed_kernel_trace.json).
+**Deliverable:** complete for correctness only. The probe's timing loop kept its deliberate producer delay, so the recorded 1,326 us GPU latency in `mixed_body.json` is not a composition cost and no clean one was measured. The cooperative M=4 kernel passes repeated changed bindings and delayed producers at the compiled 60-worker limit; repeated M=4→1 and M=4→256 rebinds also pass. A 61-worker request is rejected before the workload launch. The trace contains one kernel, and memcheck, racecheck, and synccheck are clean at 60 workers. CUDA Graph replay is outside this probe; tested calls supply their barrier epochs on the host. See [g0_status.json](../../experiments/g0_2026_10_09/g0_status.json), [mixed_body.json](../../experiments/g0_2026_10_09/mixed_body.json), [mixed_shape_m1.json](../../experiments/g0_2026_10_09/mixed_shape_m1.json), [mixed_shape_m256.json](../../experiments/g0_2026_10_09/mixed_shape_m256.json), and [mixed_kernel_trace.json](../../experiments/g0_2026_10_09/mixed_kernel_trace.json).

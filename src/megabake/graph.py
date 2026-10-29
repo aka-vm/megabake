@@ -12,6 +12,20 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 _MISSING = object()
 
+# Bytes per element of each supported dtype, by its ``str(torch.dtype)``.
+DTYPE_BYTES = {
+    "torch.bool": 1,
+    "torch.uint8": 1,
+    "torch.int8": 1,
+    "torch.int16": 2,
+    "torch.int32": 4,
+    "torch.int64": 8,
+    "torch.float16": 2,
+    "torch.bfloat16": 2,
+    "torch.float32": 4,
+    "torch.float64": 8,
+}
+
 
 @dataclass(frozen=True)
 class StorageRelation:

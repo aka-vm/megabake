@@ -1,0 +1,272 @@
+{
+  "name": "Mixed prefill-decode batches and workspace planning",
+  "scope": "Read the DeepSeek V4.1 hand-fused vLLM stack (agent_space/vllm @83c9a547bf, 2026-10-18): the sparse-MLA attention layer (vllm/models/deepseek_v41/attention.py), the NVIDIA FlashMLA and FlashMLA mega-attention backends (nvidia/flashmla.py, nvidia/flash_mla_mega_attn.py), the per-step SWA metadata and prefill chunk planner (vllm/v1/attention/backends/mla/sparse_swa.py), the top-k/SWA index builders (common/ops/cache_utils.py), the AMD 'mono' persistent decode layer (amd/mono_decode.py, amd/mono/README.md), and the WorkspaceManager (vllm/v1/worker/workspace.py, gpu/model_runner.py lock site). Cross-checked against Mirage MPK's in-kernel batch preparation (agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh) and against MegaBake's buckets.py, memory.py, lowering.py (kv_attention contract), bodies/attention.py, bodies/gemm.py, fx_handler/hf_attention.py, ROADMAP.md, ARCHITECTURE.md and the 2026-10-18 full_model reports. Question answered: which of these runtime ideas MegaBake needs before it can serve real traffic (batch>1, ragged lengths, mixed prefill+decode steps, paged KV) instead of single-request, single-length benchmarks, and how to do them generically. Static analysis plus light web research; no GPU runs.",
+  "key_sources": [
+    "agent_space/vllm/vllm/v1/worker/workspace.py:181-207 (get_simultaneous: one byte buffer, 256-B aligned sub-views, offsets by prefix sum)",
+    "agent_space/vllm/vllm/v1/worker/workspace.py:209-280 (_ensure_workspace_size: grow-on-demand, empty_cache, AssertionError after lock)",
+    "agent_space/vllm/vllm/v1/worker/workspace.py:132-179 (get_persistent_resource / get_persistent keyed per (ubatch, lane))",
+    "agent_space/vllm/vllm/v1/worker/workspace.py:336-355 (lock_workspace contract: reserve during warmup, lock after)",
+    "agent_space/vllm/vllm/v1/worker/gpu/model_runner.py:1131-1134 (lock_workspace after CUDA-graph capture: a resize would free the static graph buffer)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flashmla.py:98-122 (warmup dummy run reserves worst-case prefill gather workspace: PREFILL_CHUNK_SIZE x (ceil(max_model_len/cr)+window+max_num_batched_tokens) x head_dim bf16)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flashmla.py:154-177 (decode-first batch; prefill writes output[num_decode_tokens:], decode writes output[:num_decode_tokens])",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flashmla.py:260-371 (_forward_prefill: per-chunk gather of compressed+SWA KV into bf16 workspace, combine_topk_swa_indices, flash_mla_sparse_fwd into the chunk's token range)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:1-16,105-136 (alloc_mega_attn_output: one fp8 data+MN-major scale pair per step; disjoint prefill/decode token ranges so one wo_a fp8_einsum covers the step)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:64-89 (measured mega vs split-KV table on GB300, TP1..TP8, s_q 1..512)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:212-238 (_o_proj: single fp8_einsum over all tokens, no repack)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:289-303,367-466 (_reserve_prefill_workspace and chunked _forward_prefill_mega)",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:206-209 (PREFILL_CHUNK_SIZE=4 requests per chunk bounds the gather workspace)",
+    "agent_space/vllm/vllm/models/deepseek_v41/attention.py:1531-1567 (short-context path: if max_seq_len/cr <= topk, fill top-k indices directly instead of scoring)",
+    "agent_space/vllm/vllm/v1/attention/backends/mla/sparse_swa.py:189-258 (DeepseekSparseSWAMetadata: num_decodes/num_prefills/num_decode_tokens, decode_swa_indices, per-layer-type FlashMLA tile-scheduler metadata planned once per step)",
+    "agent_space/vllm/vllm/v1/attention/backends/mla/sparse_swa.py:260-334 (get_prefill_chunk_plan: greedy grouping of prefill requests so chunk_size x (max_compressed+max_gather) <= max_workspace_area)",
+    "agent_space/vllm/vllm/v1/attention/backends/utils.py:804-840 (split_decodes_and_prefills: batch ordered decode -> short extend -> long extend -> prefill)",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/cache_utils.py:824-905 (compute_global_topk_indices_and_lens: block-table lookup local->global slot, valid count, padding tokens masked to len 0, one Triton program per token)",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/cache_utils.py:917-981 (combine_topk_swa_indices: fixed per-model width round_up(topk+window,128) so workspace stays valid every batch)",
+    "agent_space/vllm/vllm/models/deepseek_v41/common/ops/cache_utils.py:1226-1260 (build_flashinfer_mixed_sparse_indices: ONE index matrix for decode-first mixed batches -> one attention launch)",
+    "agent_space/vllm/vllm/models/deepseek_v41/amd/mono_decode.py:1-21,47-49,290-327 (persistent per-layer 'mono' kernels: decode-only, MAX_ROWS=48, fall back to the layer path on any prefill row; epoch tags instead of clearing)",
+    "agent_space/vllm/vllm/models/deepseek_v41/amd/mono/README.md (256-CTA task-table stages, epoch-tagged flags, fixed device pointers -> graph-safe)",
+    "agent_space/vllm/vllm/models/deepseek_v41/nvidia/decoder_replay_cudagraph.py:24-101 (static input buffers sliced to padded capture size)",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:278-525 (prepare_next_batch: in-kernel continuous batching, qo_indptr, chunked prefill via MPK_TOKEN_ROOM, paged-KV page queue)",
+    "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:59-73 (MPK_MAX_NUM_BATCHED_TOKENS / MAX_TOKENS_PER_REQUEST compile-time caps)",
+    "agent_space/mirage/include/mirage/persistent_kernel/tasks/ampere/linear.cuh:48,375-398 and norm_linear_new.cuh:348,392 (tasks compiled at max rows, masked by runtime num_active_tokens)",
+    "src/megabake/buckets.py:38 (DEFAULT_BUCKETS=(16,32,64,128,256,512)), :94-115 (pad-to-bucket, cut), :156-184 (padding-dependence check)",
+    "src/megabake/lowering.py:210-247 (megabake::kv_attention reference: one-token decode, one shared int32 valid_length)",
+    "src/megabake/lowering.py:1846-1870 (lowering rejects query_length!=1, non-contiguous caches, valid_length.shape!=(1,), non-bf16)",
+    "src/megabake/lowering.py:161-190 (KVCacheAccess: storage_class='bounded_contiguous', read [0,valid_length), write [valid_length, valid_length+query_length))",
+    "src/megabake/fx_handler/hf_attention.py:150-176 (DecodeStep.state_shapes: [batch, capacity, kv_heads, head_dim] caches + int32[1] length per layer)",
+    "src/megabake/bodies/attention.py:466-543 (stateful decode body reads valid_length on device; traps on overflow; scratch = one score row of kv_length per warp)",
+    "src/megabake/bodies/attention.py:422,738-751,782-787 (DECODE_MAX_CHUNKS=16, decode_chunks cost model with 0.15 penalty; split scratch = rows*kv_length scores + rows*chunks*(2+head_dim))",
+    "src/megabake/bodies/gemm.py:1893-1994 (SWAP_AB_MAX_ROWS=64, SWAP_AB_ROW_TILES=(16,32,64))",
+    "src/megabake/memory.py:513-561 (workspace lifetimes released at the barrier closing the last use), :574-622 (best-fit interval reuse, adapted from Mirage plan_stensor_memory), :684-735 (KV state assignments)",
+    "src/megabake/runtime.py:39 (DYNAMIC_ADDRESS_RING=64)",
+    "ROADMAP.md section 6 (measured state 2026-10-17; bucket table 5..300 tokens; 'a runtime token count inside the kernel (Mirage's approach) would remove that')",
+    "ARCHITECTURE.md:295-302 (workload facts include valid KV lengths; 'Add paged or ragged layouts through explicit access contracts')",
+    "artifacts/full_model_2026-10-18/*/report.json (decode kernel us: 135M 1502 vs Inductor 1382; 1.7B 2974 vs 2425; Qwen2-0.5B 1584 vs 1636; gemma-2b 3590 vs 3107)",
+    "https://arxiv.org/abs/2512.22219 (MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs, OSDI'26)",
+    "https://www.usenix.org/conference/osdi26/presentation/cheng (MPK OSDI'26 page)",
+    "https://arxiv.org/pdf/2605.11581 (Ada-MK; claims initial MPK supports only low-load decode, not large-batch prefill - secondary claim)",
+    "https://vllm.ai/blog/deepseek-v3-2 (vLLM DeepSeek V3.2 sparse attention: indexer forces separate prefill/decode handling)",
+    "https://docs.vllm.ai/en/latest/api/vllm/models/deepseek_v4/sparse_mla/ (V4 sparse MLA metadata builder, reorder threshold 1)"
+  ],
+  "core_ideas": [
+    {
+      "idea": "One output buffer per step; prefill and decode segments write disjoint token ranges so one consumer GEMM covers the whole step",
+      "how_it_works": "The batch is reordered decode-first (split_decodes_and_prefills). forward_mqa allocates one [num_tokens, groups, 512] fp8 data tensor plus an MN-major packed-ue8m0 scale tensor (scale stride 1 along tokens, padded to ceil4(num_tokens) for TMA). Decode attention writes rows [0, num_decode_tokens); each prefill chunk writes rows [num_decode_tokens+qs, num_decode_tokens+qe). The attention kernel itself applies inverse RoPE and the FP8 cast, emitting exactly the operand layout DeepGEMM's fp8_einsum wants, so wo_a runs once over all tokens with no repack and wo_b follows. Every GEMM in the layer is therefore shape-agnostic to the decode/prefill mix; only attention branches.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:1-16,105-136,212-287; nvidia/flashmla.py:154-177"
+    },
+    {
+      "idea": "Prefill chunk plan bounding attention workspace",
+      "how_it_works": "Sparse prefill gathers each request's compressed KV (ceil(seq/cr) rows) and SWA window (query_len + min(prefix, window-1)) into a dense bf16 workspace. get_prefill_chunk_plan greedily groups consecutive prefill requests while chunk_size x (max_compressed + max_gather) <= PREFILL_CHUNK_SIZE x (ceil(max_model_len/cr) + window + max_num_batched_tokens), using CPU copies of lengths; each chunk is (start, end, N=compressed width, M=total width). The loop per chunk: gather compressed KV at offset 0, gather SWA KV at offset N, build combined indices, run sparse attention into the chunk's output token range. Workspace is O(4 requests x worst width), not O(all requests).",
+      "where_in_source": "agent_space/vllm/vllm/v1/attention/backends/mla/sparse_swa.py:260-334; nvidia/flashmla.py:260-371; attention.py:206-209"
+    },
+    {
+      "idea": "get_simultaneous: several scratch tensors carved from one grow-only buffer",
+      "how_it_works": "Each request lists (shape, dtype); bytes are rounded to 256-B and laid out by prefix sum; the views alias the single per-(ubatch, lane) uint8 buffer. Different callers reuse the same bytes because ops execute sequentially on the stream (lifetime = one op). If too small and unlocked, the buffer is freed (empty_cache) and reallocated; after lock it asserts with the caller's file:line. Lanes/ubatches give separate buffers for concurrent streams (DBO, spec-decode draft).",
+      "where_in_source": "agent_space/vllm/vllm/v1/worker/workspace.py:49-280"
+    },
+    {
+      "idea": "Warmup reservation then lock",
+      "how_it_works": "In the profile/dummy run attn_metadata is None, so each attention layer calls get_simultaneous with the worst-case shapes it can ever request (max_model_len, window, max_num_batched_tokens, PREFILL_CHUNK_SIZE) and zero-fills its output. After CUDA-graph capture the runner calls lock_workspace(); a later growth would free memory a captured graph points to, so growth becomes a hard error. The KV-cache memory profiler sees the workspace as already allocated.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flashmla.py:98-122; flash_mla_mega_attn.py:289-303; vllm/v1/worker/gpu/model_runner.py:1131-1134"
+    },
+    {
+      "idea": "Device-side token counts with host-planned metadata (decode-first ragged batch)",
+      "how_it_works": "Per step the metadata builder computes num_decodes/num_prefills/num_*_tokens (host ints used for slicing) and device tensors query_start_loc, seq_lens, token_to_req_indices, is_valid_token, decode_swa_indices/lens. Kernels launched under CUDA graphs at a padded capture size read real lengths from device tensors; padded tokens get is_valid_token=0 and topk_len 0, so they do no attention work. FlashMLA's tile scheduler metadata is planned in-kernel once per layer type per step and shared by ~60 layers.",
+      "where_in_source": "agent_space/vllm/vllm/v1/attention/backends/mla/sparse_swa.py:189-258; vllm/v1/attention/backends/utils.py:804-840; nvidia/decoder_replay_cudagraph.py:24-101"
+    },
+    {
+      "idea": "Sparse top-k index construction: local top-k -> global paged slot ids, fused with length counting and padding masking",
+      "how_it_works": "The indexer emits per-token local positions in the compressed sequence. compute_global_topk_indices_and_lens (one Triton program per token, 1024-wide blocks) maps idx -> block_table[req, idx // block] * block + idx % block, writes -1 for invalid, counts valid entries, and forces len=0 for padding tokens. combine_topk_swa_indices concatenates top-k and SWA indices at a fixed per-model width round_up(topk+window,128) (FlashMLA B_TOPK alignment) so the preallocated workspace fits every batch. build_flashinfer_mixed_sparse_indices builds ONE matrix for decode and prefill rows (decode rows reuse precomputed indices, prefill rows derive window from position) so a single attention launch covers the mixed batch. Short contexts (max_seq_len/cr <= topk) skip scoring and fill indices directly.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/common/ops/cache_utils.py:824-981,1226-1260; attention.py:1531-1567"
+    },
+    {
+      "idea": "Paged quantized KV caches (fp8_ds_mla 528/584-B records, NVFP4 288-B compressed records) read directly by attention",
+      "how_it_works": "Caches are [num_blocks, page, 1, record_bytes] uint8 with in-record block scales (UE8M0 / E4M3). Decode attention takes slot-id indices (block*page+offset, -1 invalid) and reads the paged records directly, dequantizing in-kernel; prefill instead dequantize-gathers into a bf16 dense workspace (dequantize_and_gather_k_cache with fp8/mxfp8/nvfp4 variants). KV insertion is fused into the Q-norm/RoPE kernel via slot_mapping. Cache dtype is chosen per kernel capability (packed_kv_cache_dtype).",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py:198-205,326-365; common/ops/cache_utils.py:59-260,326-820"
+    },
+    {
+      "idea": "Persistent 'mono' decode layer with fallback for mixed steps",
+      "how_it_works": "On ROCm a whole decoder layer runs as two persistent launches (256 resident CTAs, task tables, epoch-tagged 8-B (value,tag) flags so nothing is cleared between steps; every argument a fixed device pointer, graph-safe). It only serves decode-only steps with <= MAX_ROWS=48 rows; any step with a prefill row, PIECEWISE graph mode, or more rows falls back to the layered vLLM path, which shares tensors at the layer boundary. This is the hand-written analogue of what MegaBake would face: persistent kernel for decode, separate path for mixed steps.",
+      "where_in_source": "agent_space/vllm/vllm/models/deepseek_v41/amd/mono_decode.py:1-21,47-49,290-327; amd/mono/README.md"
+    },
+    {
+      "idea": "In-kernel continuous batching with chunked prefill and paged KV (Mirage MPK)",
+      "how_it_works": "prepare_next_batch runs inside the persistent kernel between iterations: it finalizes the previous batch, advances decode requests, admits new prefill requests while num_tokens < MPK_MAX_NUM_BATCHED_TOKENS (a prompt is split by MPK_TOKEN_ROOM into chunks), allocates/recycles KV pages from a device page queue, and rewrites qo_indptr / paged_kv_indptr. Tasks are compiled for the max token count and mask rows >= num_active_tokens at run time.",
+      "where_in_source": "agent_space/mirage/include/mirage/persistent_kernel/persistent_kernel.cuh:59-73,278-525; tasks/ampere/linear.cuh:375-398"
+    }
+  ],
+  "megabake_status": [
+    {
+      "idea": "One output buffer per step, disjoint token ranges, one consumer GEMM",
+      "status": "missing",
+      "evidence": "src/megabake/lowering.py:1852 rejects query_length!=1 for kv_attention; prefill (megabake::attention) and decode (megabake::kv_attention via DecodeStep, fx_handler/hf_attention.py:150-185) are separate compiled kernels",
+      "notes": "Inside one compiled kernel MegaBake's GEMMs are already over all rows, so the mechanism is natural once a single attention op can take a ragged mix: decode rows and prefill rows write disjoint row ranges of the attention output value, and the existing o_proj GEMM covers both. What is missing is an attention op/body that accepts a mixed batch."
+    },
+    {
+      "idea": "Prefill chunk plan bounding attention workspace",
+      "status": "missing",
+      "evidence": "src/megabake/bodies/attention.py:481,664 (scratch holds a full score row of kv_length floats per warp); :782-787 split scratch = rows*kv_length + rows*chunks*(2+head_dim) floats; ROADMAP.md section 6 'prefill still uses the first-generation attention body'",
+      "notes": "MegaBake has no notion of chunking prefill requests. Its attention scratch grows linearly in capacity x rows (materialized scores, no online softmax), so it is the opposite of a bounded chunk plan. A compile-time analogue of get_prefill_chunk_plan is easy because MegaBake knows max tokens and capacity at plan time."
+    },
+    {
+      "idea": "get_simultaneous single-buffer scratch",
+      "status": "implemented",
+      "evidence": "src/megabake/memory.py:513-622 (interval lifetimes, best-fit reuse, one workspace buffer); compiler.py:1979 allocates plan.storage.workspace_bytes once",
+      "notes": "MegaBake's planner is stronger: offsets are computed at compile time from phase lifetimes (released at the closing barrier), so concurrent phases between barriers get distinct bytes while vLLM relies on stream order. Weakness: sizes are exact for one static shape, so each bucket has its own plan and buffer; there is no shared max-shape plan."
+    },
+    {
+      "idea": "Warmup reservation then lock",
+      "status": "partial",
+      "evidence": "compiler.py:1979 allocates workspace per compiled kernel; runtime.py:39 DYNAMIC_ADDRESS_RING; PERFORMANCE_REPORT/ROADMAP describe constant kernel arguments cached",
+      "notes": "Workspace size is known at compile time (no growth), which is equivalent to an always-locked manager. Missing: a single reservation across all buckets (each bucket kernel holds its own buffer) and an API that reports total bytes to a serving engine before KV-cache sizing."
+    },
+    {
+      "idea": "Device-side token counts / ragged batch metadata",
+      "status": "partial",
+      "evidence": "bodies/attention.py:538-543 reads valid_length from device and traps on overflow; lowering.py:1861 requires valid_length.shape==(1,); hf_attention.py:174-176 one int32[1] per layer for the whole batch; buckets.py:94-115 host-side padding",
+      "notes": "KV length is already a runtime device scalar (good precedent), but there is exactly one per layer shared by all sequences, so batch>1 requires every sequence to have the same length. Token count is static: buckets pad on the host and every padded row is computed. No query_start_loc / seq_lens / token_to_req tensors."
+    },
+    {
+      "idea": "Sparse top-k index construction",
+      "status": "not_applicable",
+      "evidence": "No sparse-attention model in the tested set; ROADMAP lists no indexer op",
+      "notes": "Relevant only if DeepSeek V3.2/V4-class models are targeted. The generic lesson that applies: index/metadata construction should be a small per-token phase whose output width is fixed per model so workspace is shape-stable."
+    },
+    {
+      "idea": "Paged quantized KV caches",
+      "status": "missing",
+      "evidence": "lowering.py:161-190 storage_class='bounded_contiguous'; lowering.py:1846-1870 bf16 contiguous only",
+      "notes": "Contiguous [batch, capacity, kv_heads, dim] bf16 cache. ARCHITECTURE.md:302 already plans 'paged or ragged layouts through explicit access contracts'. fp8 KV would also halve decode attention bytes."
+    },
+    {
+      "idea": "Persistent decode kernel with fallback for mixed steps",
+      "status": "partial",
+      "evidence": "Decode and prefill are separate compiled kernels (DecodeStep vs bucketed prefill); no runtime dispatcher",
+      "notes": "MegaBake already is the 'mono' design for decode. A serving wrapper choosing between a decode kernel and a prefill kernel per step is the minimum viable route, as vLLM's AMD path does."
+    },
+    {
+      "idea": "In-kernel continuous batching (Mirage)",
+      "status": "missing",
+      "evidence": "runtime.py executes one forward per launch; no step loop or page queue",
+      "notes": "Lowest priority; requires sampling and stop logic inside the kernel and conflicts with engine-owned scheduling (vLLM). Device-side counts get most of the benefit."
+    }
+  ],
+  "megakernel_exclusive_opportunities": [
+    {
+      "opportunity": "Token-range-granular readiness between attention segments and the shared consumer GEMM",
+      "why_multi_kernel_cannot": "vLLM runs _forward_prefill chunks and _forward_decode as separate launches, then one wo_a einsum that must wait for ALL of them (stream order). With event counters per token-range tile, a persistent kernel lets o_proj tiles covering decode rows start as soon as decode attention publishes, while prefill attention CTAs are still running, and lets decode-attention CTAs and prefill-attention CTAs share the SMs in the same phase.",
+      "nearest_multi_kernel_substitute": "Two streams (decode attention || prefill attention) joined by an event before o_proj, or PDL overlapping only the o_proj prologue; or FlashInfer's unified mixed index matrix (one attention launch). These remove the serialization of the two attention segments but still put a full kernel boundary before the GEMM."
+    },
+    {
+      "opportunity": "Runtime work repartition from a device-side token count without re-capture",
+      "why_multi_kernel_cannot": "A CUDA graph fixes every kernel's grid at capture size, so a 65-token step runs on the 128-size graph's grid; kernels can early-exit masked CTAs but cannot redistribute work. A persistent kernel's work iterator can compute the tile count of each phase from the device token count (tiles = ceil(n/tile_rows)) and spread exactly those tiles over all CTAs.",
+      "nearest_multi_kernel_substitute": "Many capture sizes (vLLM captures up to ~67 sizes) plus in-kernel masking; or persistent-style kernels inside the graph that read counts (FlashMLA tile scheduler). Achieves similar compute savings but at the cost of graph memory and capture time per size."
+    },
+    {
+      "opportunity": "Compile-time aliasing of attention scratch with other phases' intermediates",
+      "why_multi_kernel_cannot": "MegaBake's planner knows every phase's lifetime, so the prefill gather/score workspace can share bytes with MLP intermediates of the same layer that are dead at that point; vLLM's workspace is a separate global pool (shared sequentially among workspace users only) on top of PyTorch caching-allocator activations.",
+      "nearest_multi_kernel_substitute": "Inductor's memory planning plus the workspace manager; achieves comparable reuse within each mechanism but not across them. Gain is memory, not time [uncertain magnitude]."
+    },
+    {
+      "opportunity": "Weights read once per mixed step",
+      "why_multi_kernel_cannot": "Not exclusive: vLLM already does this with one forward over a mixed batch. It is listed because it is the main reason a megakernel MUST support mixed steps: if MegaBake runs prefill and decode as two separate kernels per step, it reads all weights twice (1.7B: ~1.5 ms floor each) and loses to any multi-kernel engine that batches them.",
+      "nearest_multi_kernel_substitute": "vLLM's mixed batch with piecewise CUDA graphs (full graphs for decode-only steps)."
+    },
+    {
+      "opportunity": "In-kernel step loop / batch preparation (Mirage prepare_next_batch)",
+      "why_multi_kernel_cannot": "The persistent kernel can finalize step t and admit requests for step t+1 without returning to the host, removing per-step host latency entirely.",
+      "nearest_multi_kernel_substitute": "CUDA graph conditional/while nodes (CUDA 12.4+) or async scheduling that overlaps host prep with GPU execution (vLLM async scheduling); these hide most host time in practice."
+    }
+  ],
+  "measured_or_reported_gains": "vLLM FlashMLA mega-attention vs split-KV (GB300, CUDA graphs on, 64-head DSV4.1, topk_swa=128, topk_extra=512, NVFP4 compressed cache), microseconds mega/split: TP1 s_q=1 29/29, 128 31/40, 256 53/72, 512 96/140 (up to 1.45x); TP2-TP8 within a few percent, ~2 us penalty at small s_q from padded heads (flash_mla_mega_attn.py:64-89, source-reported, not reproduced). No numeric gain is reported in-tree for the single-output-buffer trick, chunk plans or workspace manager; their purpose is avoiding one GEMM launch per segment, bounding memory and graph safety. MPK paper: up to 1.7x lower end-to-end latency than kernel-per-operator serving (arXiv 2512.22219); a secondary source (Ada-MK, arXiv 2605.11581) states initial MPK targeted low-load decode only [uncertain]. MegaBake own data (2026-10-18 reports, batch 1, context <100): decode kernel 135M 1502 us vs Inductor 1382; 1.7B 2974 vs 2425; Qwen2-0.5B 1584 vs 1636; gemma-2b 3590 vs 3107. Bucketed prefill (ROADMAP section 6): 135M 50 tok/64 bucket 3880 us, 100 tok/128 bucket 6785 us, 300 tok/512 bucket 54095 us vs Inductor+CUDA graphs 1862/2156/2579 us.",
+  "expected_impact_on_megabake": "Ranked by impact on serving throughput (tokens/s) on the 60-SM, ~2.2 TB/s MIG slice, derived from MegaBake's own breakdown (1.7B decode: 1.92 ms GEMMs near the ~1.5 ms weight floor, 24 attentions x ~10 us, 49 RMSNorms x ~2.8-5 us, ~0.7 us per barrier). (1) Batch>1 decode with per-sequence KV lengths: GEMMs are weight-bandwidth bound and swapAB keeps up to 16 rows in the same tile, so at batch 16 the 1.92 ms GEMM time is roughly unchanged while tokens per step go 1->16; attention grows ~linearly with batch x context (24 x 10 us at batch 1 -> roughly 24 x 30-80 us at batch 16 short context [uncertain]). Net: ~2.97 ms/token -> ~0.2-0.25 ms/token aggregate, ~12-15x throughput. Without per-sequence lengths batch>1 is only usable for lockstep sequences of equal length, i.e. not real traffic. Highest impact, small effort. (2) Mixed prefill+decode in one step: running prefill and decode as two kernels per step reads weights twice. For 1.7B with a 32-token prefill chunk and 16 decodes: separate kernels ~4.96 ms (32-token prefill) + ~3.0 ms decode = ~8 ms; one mixed 48-row kernel ~3.5-4.5 ms [uncertain], saving ~3.5-4.5 ms per mixed step (~45-55%). Requires a ragged attention body and per-row positions; GEMMs need nothing beyond the >16-row tile choice. (3) Chunked prefill at <=64-row chunks: keeps every GEMM on the tuned swapAB small-M path (ROADMAP: >64 rows is 3-21x slower than Inductor). A 300-token prompt as 5 chunks of 64 rows at ~4-7 ms each [uncertain] = ~20-35 ms vs 54 ms today on 135M; still slower than Inductor's 2.6 ms, so this is a stopgap until prefill bodies are fixed, but it bounds the damage and composes with (2). (4) Device-side token count instead of host buckets: decode padding is nearly free (bandwidth-bound GEMMs, 16-row tiles), so gain at decode <5%. Prefill bucket padding (65 -> 128) costs ~40% today (135M 64-bucket 3.88 ms vs 128-bucket 6.79 ms); masking tiles beyond n would recover most of it. Also collapses N bucket kernels into one compile (compile times 24 s - 41 min per bucket). (5) Online-softmax decode/prefill attention with bounded scratch: current split scratch is rows x capacity x 4 B; 1.7B (32 heads) at batch 32 x 32k capacity = 134 MB per phase, and score materialization doubles KV-side traffic at long context (135M 2,000-token decode 2.31 ms vs 1.43 at 16). Needed for long contexts and large batches; time gain 10-30% at >=1k context [uncertain]. (6) Paged KV: no speed gain by itself (slight indirection cost); required for memory-efficient batching and for integration with vLLM/SGLang KV managers. fp8 KV would roughly halve attention KV bytes. (7) Workspace max-shape reservation and lock: zero speed impact; prevents OOM and makes MegaBake embeddable in an engine. Caveat: the end-to-end advantage MegaBake reports (e.g. 1.7B 3.3 ms vs Inductor 9.2-10.3 ms complete call) comes from host/launch overhead; a serving engine with full CUDA graphs for decode removes that, so at batch>1 MegaBake competes on kernel GPU time, where it is currently 0-23% behind Inductor's kernels.",
+  "generality_and_overfitting_risk": "The vLLM ideas split into generic mechanisms and model-specific constants. Generic: decode-first ragged batches with device-side lengths, one output buffer with disjoint segments, grow-then-lock workspace, chunk planning bounded by a workspace area, paged KV via block tables/slot ids. Model/hardware-specific in the reference: PREFILL_CHUNK_SIZE=4 requests (attention.py:209), h_q padded to {64,128} (flashmla.py:72-78), combined-topk alignment 128 (cache_utils.py:913), record sizes 528/584/288 bytes, AMD MAX_ROWS=48 = 8 requests x 6 DSpark tokens and SWA_WIDTH=128 (mono_decode.py:47-49), and the mega-vs-split decision table measured on one GB300 (flash_mla_mega_attn.py:64-89, which itself warns to re-measure). vLLM avoids baking shapes in by deriving workspace sizes from config (max_model_len, max_num_batched_tokens, window) and capture sizes from config, not from tested models. MegaBake items in this area that look tuned to the tested models or to the 60-SM slice: (a) src/megabake/buckets.py:38 DEFAULT_BUCKETS=(16..512) - fixed powers of two, sized to the benchmark prompt range; should come from the engine's max_num_batched_tokens and a padding-cost model. (b) buckets.py:42 _RELATIVE_L2_LIMIT=0.05 - tolerance chosen from SmolLM/Qwen2 behavior. (c) bodies/gemm.py:1893-1896 SWAP_AB_MAX_ROWS=64 and SWAP_AB_ROW_TILES=(16,32,64) - crossover measured on the MIG slice; with more SMs or larger N the crossover moves (ARCHITECTURE.md:246 itself says no constant M threshold is universal). (d) bodies/attention.py:422 DECODE_MAX_CHUNKS=16 and :748 the 0.15 per-pass penalty in decode_chunks - hand-fit to 60 CTAs and batch-1 head counts; at batch 16 rows*chunks already exceeds 60 workers so the model picks 1 chunk, which may be wrong for skewed per-sequence lengths. (e) lowering.py:1846-1870 and hf_attention.py:174-176: bf16 contiguous cache and one shared valid_length - fits single-request benchmarks, not serving. (f) Benchmarks use KV capacity 128 and context <100 tokens (ROADMAP section 6), so attention and scratch sizing are untested at realistic contexts; the 2,000-token sweep is the only long-context evidence. (g) runtime.py:39 DYNAMIC_ADDRESS_RING=64 - arbitrary but harmless. Mitigations used by references: Mirage makes MAX_NUM_BATCHED_TOKENS / page size compile-time parameters from the engine; vLLM sizes everything from config and lets CUDA-graph capture sizes be user-set; Inductor autotunes per shape. MegaBake should derive bucket sets and chunk counts from target facts (SM count from the device query, bandwidth) and the engine's token budget, and record them in the plan key.",
+  "hardware_portability": "Device-side counts, ragged decode-first batches, disjoint-segment output buffers, workspace planning and chunk plans are pure runtime/planner logic and port to SM80, SM90 and SM100 unchanged. Masking rows beyond the runtime count works with TMA (OOB rows of a box are zero-filled on load and clipped on store when the tensor map extent is the runtime size, or masked in the epilogue when the extent is the max size), with cp.async predicates on SM80, and with tcgen05/TMA on SM100. Paged KV: on SM90 per-page TMA loads (page >= 64 tokens) or cp.async gathers; SM100 adds TMA gather4 for row gathers, which fits slot-id indexing like FlashMLA's. Dynamic per-phase tile counts in a persistent kernel are portable (software work iterator); SM100's Cluster Launch Control offers a hardware alternative for dynamic tile scheduling but is not needed. fp8 KV needs SM89+/SM90 for fp8 MMA (or dequantize to bf16 in registers on SM80); NVFP4 caches and the FlashMLA mega kernel are SM100-only (is_flashmla_mega_attn_supported requires capability family 100). Keep the KV access contract (contiguous | paged; dtype + scale layout) as a declared op attribute and let body providers per target accept or reject it, as bodies/blackwell.py is meant to.",
+  "recommended_actions": [
+    {
+      "action": "Per-sequence KV lengths for batch>1 decode: make valid_length int32[batch] (and positions per row) in megabake::kv_attention, DecodeStep.state_shapes and the lowering guard; decode bodies loop each row to its own length and trap per row on overflow; split-context chunks computed from max capacity, idle chunks of short rows exit early.",
+      "expected_gain": "Enables real batched decode; ~12-15x tokens/s at batch 16 on 1.7B (GEMM time ~flat) [uncertain]",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/lowering.py (kv_attention op 210-247, _kv_attention_program 1827-1930), src/megabake/fx_handler/hf_attention.py:150-185, src/megabake/bodies/attention.py (466-560, split body 754+), tests",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Paged KV access contract: add KVCacheAccess.storage_class='paged' with block_table [batch, max_blocks], slot_mapping [tokens], page size and optional fp8 dtype+scale; declare it on the op so vLLM's KV cache (or MegaBake's own page pool) can be bound directly.",
+      "expected_gain": "No latency gain; needed for memory-efficient batching and engine integration; fp8 variant halves KV bytes",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/lowering.py:161-190 and kv_attention, src/megabake/memory.py:684-780 (state assignments/verification), src/megabake/bodies/attention.py",
+      "prerequisite": "per-sequence lengths"
+    },
+    {
+      "action": "Ragged mixed-step attention op (decode-first, query_start_loc, seq_lens, positions per token): one megabake::ragged_attention covering decode rows and prefill rows that writes disjoint row ranges of one output value, so every GEMM in the graph runs once over all tokens of the step.",
+      "expected_gain": "Saves one full weight read per mixed step: ~3.5-4.5 ms per mixed step on 1.7B (~45-55%) vs separate prefill and decode kernels [uncertain]",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/lowering.py (new op + program), src/megabake/regions.py (matcher), src/megabake/bodies/attention.py (ragged body), src/megabake/fx_handler/hf_attention.py (serving wrapper), src/megabake/buckets.py",
+      "prerequisite": "per-sequence lengths; paged KV recommended; tiled prefill attention body"
+    },
+    {
+      "action": "Device-side token count: one runtime int32 n_tokens in the call table; work iterators compute per-phase tile counts from it and GEMM/norm/pointwise bodies mask rows >= n; compile once at max_num_batched_tokens (plus 1-2 small-M variants) instead of one kernel per bucket.",
+      "expected_gain": "Prefill bucket padding waste up to ~40% (65->128) recovered; decode <5%; bucket compile count N->1-3",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/codegen.py (table driver / work_iterator), src/megabake/runtime.py, src/megabake/bodies/gemm.py, bodies/*, src/megabake/buckets.py",
+      "prerequisite": "ideally event counters (ROADMAP step 10) so empty tiles do not still pay a barrier"
+    },
+    {
+      "action": "Online-softmax (flash-decoding) attention bodies so scratch is O(rows x chunks x head_dim) rather than O(rows x capacity); compile-time chunk plan for prefill attention bounded by a workspace area, analogous to get_prefill_chunk_plan.",
+      "expected_gain": "Bounded memory at long context/large batch (e.g. 134 MB -> <1 MB per phase for 1.7B batch 32 x 32k); 10-30% faster long-context decode [uncertain]",
+      "effort": "M",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/bodies/attention.py (481, 664, 754-950), src/megabake/schedule.py (phase scratch sizing), src/megabake/memory.py:841-885",
+      "prerequisite": "none"
+    },
+    {
+      "action": "Chunked prefill policy: cap prefill rows per step at the small-M GEMM limit (derived from target facts, not hard-coded 64) and run long prompts as several mixed steps, so the tuned swapAB path serves all steps until large-M bodies are fixed.",
+      "expected_gain": "300-token prompt on 135M ~54 ms -> ~20-35 ms [uncertain]; bounded latency for co-scheduled decodes",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "serving wrapper (new), src/megabake/buckets.py, src/megabake/bodies/gemm.py:1893-1994 (expose crossover as a target fact)",
+      "prerequisite": "ragged mixed-step attention (or prefix-aware prefill attention reading the cache)"
+    },
+    {
+      "action": "Workspace reservation API: plan storage at the max shape (max tokens, max requests, capacity), expose required workspace + scratch bytes before KV-cache sizing, share one buffer across kernel variants, and assert no growth after warmup (vLLM lock semantics).",
+      "expected_gain": "No speed change; prevents OOM and enables embedding in vLLM/SGLang",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/memory.py:100-160, src/megabake/compiler.py:1760-1985",
+      "prerequisite": "device-side token count (otherwise one buffer per bucket = max over buckets)"
+    },
+    {
+      "action": "Derive bucket sets, swapAB crossover and decode chunk limits from target facts (SM count, bandwidth) and the engine token budget instead of constants; add a padding-cost model.",
+      "expected_gain": "Avoids regressions on full H200 (132 SMs) and other GPUs; no gain on the MIG slice",
+      "effort": "S",
+      "generality": "generic",
+      "files_to_touch": "src/megabake/buckets.py:38, src/megabake/bodies/gemm.py:1893-1896, src/megabake/bodies/attention.py:422,738-751, src/megabake/bodies/interface.py (TargetFacts)",
+      "prerequisite": "none"
+    },
+    {
+      "action": "(Later) vLLM model-runner integration: a vLLM model class whose forward is one MegaBake call consuming vLLM's attention metadata (query_start_loc, seq_lens, block_table, slot_mapping) and captured inside vLLM's CUDA graphs; optional in-kernel step loop (Mirage prepare_next_batch) only after that.",
+      "expected_gain": "Real-traffic evaluation; host-overhead advantage disappears under full graphs, so this exposes true kernel competitiveness",
+      "effort": "L",
+      "generality": "generic",
+      "files_to_touch": "new src/megabake/serving/ module, src/megabake/runtime.py (graph capture already detected at runtime.py:304,358)",
+      "prerequisite": "paged KV, ragged attention, per-sequence lengths"
+    }
+  ],
+  "open_questions": [
+    "How does MegaBake's batched decode kernel scale from batch 1 to 64 (GEMM tile choice above 16 rows, attention with skewed lengths)? Experiment: after per-sequence lengths, run benchmarks/full_model.py decode at batch 1/4/16/64 with lengths drawn from a skewed distribution, compare to vLLM full-CUDA-graph decode on the same MIG slice.",
+    "What is the real cost of a mixed 48-row step versus prefill+decode kernels? Experiment: compile 1.7B at 48 rows (16 decode + 32 prefill) once the ragged op exists; measure with tools/phase_profile.py and compare to the two separate kernels back to back.",
+    "Does masking tiles from a device-side token count keep the tuned GEMM fast, or do TMA descriptors sized at max rows cost bandwidth? Experiment: GEMM microbenchmark with runtime n in {17, 33, 65} vs exact-shape compiles.",
+    "How should the prefill KV fill work today (does bucketed prefill write the cache that DecodeStep reads, or is the cache filled elsewhere)? [uncertain] Settle by reading benchmarks/full_model.py and tracing the cache tensors between prefill and decode calls.",
+    "Is fp8 KV accuracy acceptable for the tested model families with per-token/per-block scales? Experiment: teacher-forced logits comparison with fp8 cache vs bf16 at 2k context.",
+    "Do the vLLM GB300 mega-attention numbers translate to SM90? Not checkable here (SM100-only kernel); would need an SM100 machine.",
+    "Can a persistent kernel inside vLLM's CUDA graph co-exist with vLLM's other captured kernels (sampler, all-reduce) without cooperative-launch restrictions under capture? Experiment: capture a MegaBake table launch in torch.cuda.graph alongside other kernels and replay."
+  ],
+  "uncertain": [
+    "measured_or_reported_gains",
+    "expected_impact_on_megabake",
+    "open_questions"
+  ]
+}

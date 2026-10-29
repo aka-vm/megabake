@@ -53,9 +53,7 @@ class _BoundKVCache(torch.nn.Module):
         self.register_buffer("value_cache", cache.value_cache)
         self.register_buffer("valid_length", cache.valid_length)
 
-    def forward(
-        self, source: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-    ) -> Any:
+    def forward(self, source: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> Any:
         return self.model(source, key, value, self.key_cache, self.value_cache, self.valid_length)
 
 
@@ -76,9 +74,7 @@ class StatefulAttention(torch.nn.Module):
         value_cache: torch.Tensor,
         valid_length: torch.Tensor,
     ) -> torch.Tensor:
-        return kv_attention(
-            source, key, value, key_cache, value_cache, valid_length
-        )
+        return kv_attention(source, key, value, key_cache, value_cache, valid_length)
 
 
 def capture_transformer(
@@ -100,9 +96,11 @@ def capture_transformer(
         )
     else:
         loaded = model
-    target_device = torch.device(device) if device is not None else next(
-        loaded.parameters(), torch.empty(0)
-    ).device
+    target_device = (
+        torch.device(device)
+        if device is not None
+        else next(loaded.parameters(), torch.empty(0)).device
+    )
     loaded = loaded.to(target_device).eval()
     if attention_mask is None:
         attention_mask = torch.ones_like(input_ids)

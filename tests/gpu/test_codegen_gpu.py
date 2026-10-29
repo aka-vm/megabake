@@ -19,7 +19,7 @@ from megabake import (
     select_bodies,
 )
 from megabake.bodies import SelectionPolicy, TargetFacts
-from megabake.bodies.gemm import (
+from megabake.bodies.cuda.sm90.gemm import (
     compile_g0_range_gemm,
     cute_gemm_tensors,
     g0_range_body,
@@ -52,24 +52,14 @@ def _target() -> TargetFacts:
 
 
 def _plan(model, *inputs, allow_tuned=True):
-    prepared = prepare_fx_graph(
-        torch.export.export(model, inputs).graph_module, inputs
-    )
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
-    selection = select_bodies(
-        graph, _target(), SelectionPolicy(allow_tuned=allow_tuned)
-    )
-    return assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    prepared = prepare_fx_graph(torch.export.export(model, inputs).graph_module, inputs)
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=allow_tuned))
+    return assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
 
 
 def _load(generated):
-    spec = importlib.util.spec_from_file_location(
-        generated.module_name, generated.source_path
-    )
+    spec = importlib.util.spec_from_file_location(generated.module_name, generated.source_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[generated.module_name] = module
     spec.loader.exec_module(module)
@@ -114,9 +104,7 @@ def _run_generic(generated, source):
     slot_addresses = [tensor.data_ptr() for tensor in tensors]
     slot_addresses += [slot_addresses[slot] for slot in generated.launch.resolved_slots]
     addresses = torch.tensor(slot_addresses, dtype=torch.int64, device="cuda")
-    phase_table = torch.tensor(
-        generated.launch.phase_table, dtype=torch.int32, device="cuda"
-    )
+    phase_table = torch.tensor(generated.launch.phase_table, dtype=torch.int32, device="cuda")
     # Ring entry 0, stamped with call 0, holds this call's boundary addresses.
     dynamic_addresses = torch.tensor(
         [0, *(slot_addresses[slot] for slot in generated.launch.dynamic_slots)],
@@ -176,14 +164,10 @@ def test_generated_layout_conversion_compiles_and_matches_reference(tmp_path):
         if selected.program.family == "elementwise"
     )
     consumer = next(
-        selected
-        for selected in plan.selection.selections
-        if selected.program.family == "reduction"
+        selected for selected in plan.selection.selections if selected.program.family == "reduction"
     )
     value_id = producer.outputs[0]
-    source_layout = CuTeLayout.from_contract(
-        producer.body.layouts.outputs[value_id]
-    )
+    source_layout = CuTeLayout.from_contract(producer.body.layouts.outputs[value_id])
     target_layout = replace(source_layout, strides=(1, 3))
     load = consumer.program.loads[0]
     consumer_program = replace(
@@ -220,9 +204,7 @@ def test_generated_layout_conversion_compiles_and_matches_reference(tmp_path):
         conversions=(conversion,),
     )
     converted_plan = assign_storage(
-        make_phase_schedule(
-            converted_selection, derive_dependencies(converted_selection)
-        )
+        make_phase_schedule(converted_selection, derive_dependencies(converted_selection))
     )
 
     generated = emit_cute(converted_plan, tmp_path)
@@ -252,9 +234,7 @@ def test_generated_g0_kernel_matches_existing_g0_executable(tmp_path):
     output = torch.empty(4, 1536, device="cuda", dtype=torch.bfloat16)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
-    tensor_a, tensor_b, tensor_c = cute_gemm_tensors(
-        gpu_source, gpu_weight, output
-    )
+    tensor_a, tensor_b, tensor_c = cute_gemm_tensors(gpu_source, gpu_weight, output)
     ready = make_ready(generated.launch.grid_size, "cuda")
     tensor_views = (
         *(_view(tensor) for tensor in (gpu_source, gpu_weight, output, gpu_weight.t())),
@@ -270,9 +250,7 @@ def test_generated_g0_kernel_matches_existing_g0_executable(tmp_path):
         tensor_views,
         ((tensor_a, tensor_b, tensor_c),),
     ]
-    compiled = cute.compile(
-        module.launch, *views, max_clusters, stream
-    )
+    compiled = cute.compile(module.launch, *views, max_clusters, stream)
     compiled(*views, stream)
     torch.cuda.synchronize()
     generated_output = output.clone()
@@ -298,16 +276,17 @@ def _run_mixed(generated, source, weight, output_shape):
     workspace = torch.empty((4, 1536), device="cuda", dtype=torch.bfloat16)
     output = torch.empty(output_shape, device="cuda", dtype=torch.bfloat16)
     ready = make_ready(generated.launch.grid_size, "cuda")
-    work_iterator = torch.arange(
-        generated.launch.work_iterators[0].length,
-        device="cuda",
-        dtype=torch.int64,
-    ) * generated.launch.work_iterators[0].step
+    work_iterator = (
+        torch.arange(
+            generated.launch.work_iterators[0].length,
+            device="cuda",
+            dtype=torch.int64,
+        )
+        * generated.launch.work_iterators[0].step
+    )
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
-    tensor_a, tensor_b, tensor_c = cute_gemm_tensors(
-        gpu_source, gpu_weight, workspace
-    )
+    tensor_a, tensor_b, tensor_c = cute_gemm_tensors(gpu_source, gpu_weight, workspace)
     views = [
         _view(ready),
         cutlass.Int32(generated.launch.grid_size),

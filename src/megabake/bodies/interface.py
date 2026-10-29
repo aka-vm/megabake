@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
 
 from ..lowering import AxisAffine, DataIndex
 
@@ -38,7 +38,7 @@ class SelectionPolicy:
     # The token tile (WGMMA N) of swapAB launches: 16, 32, or 64 rows.
     table_gemm_swap_ab_rows: int = 16
     # Split the K range of swapAB table GEMMs that have fewer weight tiles
-    # than SMs (see bodies.gemm.split_k_count).
+    # than SMs (see bodies.cuda.sm90.gemm.split_k_count).
     table_gemm_split_k: bool = False
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
@@ -48,24 +48,6 @@ class SelectionPolicy:
 class WorkItem:
     output_tile: tuple[int, ...]
     reduction_range: tuple[int, int] | None = None
-
-
-@runtime_checkable
-class WorkIterator(Protocol):
-    def __next__(self) -> WorkItem:
-        ...
-
-
-@runtime_checkable
-class DeviceBody(Protocol):
-    def run(
-        self,
-        work_iterator: WorkIterator,
-        tensor_bindings: Mapping[str, Any],
-        scratch: Any,
-        epilogue: Any,
-    ) -> None:
-        ...
 
 
 @dataclass(frozen=True)
@@ -86,9 +68,7 @@ class SemanticContract:
     source_op_ids: tuple[str, ...]
     numerical_policy: str
     expression_hooks: tuple[str, ...]
-    expression_hook_restrictions: tuple[str, ...]
     access_effects: Mapping[str, Any]
-    access_restrictions: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -98,7 +78,6 @@ class TensorLayout:
     strides: tuple[int, ...]
     alignment_bytes: int
     shape: tuple[int, ...] | None = None
-    tail_policy: str = "predicated"
 
 
 @dataclass(frozen=True)
@@ -114,7 +93,6 @@ class TileContract:
     work_partition: str
     mma_family: str | None
     reduction_tile: tuple[int, ...]
-    tail_policy: str = "predicated"
 
 
 @dataclass(frozen=True)
@@ -130,7 +108,6 @@ class PipelineContract:
     stage_count: int
     barriers: tuple[str, ...]
     async_operations: tuple[str, ...]
-    shared_memory_layouts: Mapping[str, str]
     drain_rule: str
     descriptors: Mapping[str, str] = field(default_factory=dict)
 
@@ -140,18 +117,13 @@ class ScratchContract:
     owner: str
     size_bytes: int
     alignment_bytes: int
-    initial_state: str
-    reuse_rule: str
 
 
 @dataclass(frozen=True)
 class CompletionContract:
     outputs_ready: str
-    output_tiles_ready: str
-    async_work_complete: str
     scratch_reusable: str
     register_fragments: str
-    warp_roles_on_return: str
 
 
 @dataclass(frozen=True)
@@ -188,14 +160,6 @@ class ProviderRejection:
 class CandidateSet:
     configurations: tuple[BodyConfig, ...]
     rejections: tuple[ProviderRejection, ...]
-
-
-@runtime_checkable
-class BodyProvider(Protocol):
-    def get_candidates(
-        self, region: Any, target: TargetFacts, policy: SelectionPolicy
-    ) -> CandidateSet:
-        ...
 
 
 class InvalidBodyConfig(ValueError):

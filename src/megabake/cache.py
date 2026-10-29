@@ -14,7 +14,7 @@ import torch
 from .graph import ComputeGraph
 from .plan import BodySelectionPlan, KernelPlan
 from .platform import cutlass
-from .runtime import L2_PREFETCH_BYTES, PHASE_TIMER_SLOTS
+from .runtime import PHASE_TIMER_SLOTS, WEIGHT_STREAM_STAGES
 
 if TYPE_CHECKING:
     from .frontend import CaptureContext
@@ -72,7 +72,7 @@ def make_plan_key(
         "toolchain": dict(toolchain or {}) or _toolchain_versions(),
         # Timed kernels write stamps past the barrier state of an untimed buffer.
         "phase_timer_slots": PHASE_TIMER_SLOTS,
-        "l2_prefetch_bytes": L2_PREFETCH_BYTES,
+        "weight_stream_stages": WEIGHT_STREAM_STAGES,
     }
     encoded = json.dumps(
         _canonical(payload), sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -81,9 +81,7 @@ def make_plan_key(
 
 
 def _context_data(context: CaptureContext) -> dict[str, Any]:
-    requirements = {
-        key: value for key, value in context.requirements.items() if key != "execution"
-    }
+    requirements = {key: value for key, value in context.requirements.items() if key != "execution"}
     return {
         "mode": context.mode,
         "fallback": context.fallback,
@@ -157,10 +155,7 @@ def _canonical(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         return {
             "__dataclass__": type(value).__qualname__,
-            **{
-                field.name: _canonical(getattr(value, field.name))
-                for field in fields(value)
-            },
+            **{field.name: _canonical(getattr(value, field.name)) for field in fields(value)},
         }
     if isinstance(value, Mapping):
         items = [(_canonical(key), _canonical(item)) for key, item in value.items()]

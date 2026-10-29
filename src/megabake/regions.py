@@ -7,7 +7,7 @@ from math import prod
 from pathlib import Path
 from typing import Any
 
-from .graph import ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
+from .graph import DTYPE_BYTES, ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
 from .lowering import (
     Accumulator,
     AxisAffine,
@@ -28,19 +28,6 @@ from .lowering import (
     attention_access_axes,
     attention_tensor_program,
 )
-
-_DTYPE_BYTES = {
-    "torch.bool": 1,
-    "torch.uint8": 1,
-    "torch.int8": 1,
-    "torch.int16": 2,
-    "torch.int32": 4,
-    "torch.int64": 8,
-    "torch.float16": 2,
-    "torch.bfloat16": 2,
-    "torch.float32": 4,
-    "torch.float64": 8,
-}
 
 
 def form_regions(graph: ComputeGraph) -> ComputeGraph:
@@ -173,14 +160,17 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
             )
         ]
 
-    gated_candidate = _gated_mlp_candidate(graph)
-    if gated_candidate is not None:
-        tail_operation = gated_candidate.source_op_ids[-1]
-        candidates.setdefault(tail_operation, []).append(gated_candidate)
+    for candidate in _gemm_epilogue_candidates(graph):
+        tail_operation = candidate.source_op_ids[-1]
+        candidates.setdefault(tail_operation, []).append(candidate)
     for candidate in _rms_norm_candidates(graph):
         tail_operation = candidate.source_op_ids[-1]
         candidates.setdefault(tail_operation, []).append(candidate)
-    for candidate in _rope_candidates(graph):
+    rope_candidates = _rope_candidates(graph)
+    for candidate in rope_candidates:
+        tail_operation = candidate.source_op_ids[-1]
+        candidates.setdefault(tail_operation, []).append(candidate)
+    for candidate in _attention_prologue_candidates(graph, rope_candidates):
         tail_operation = candidate.source_op_ids[-1]
         candidates.setdefault(tail_operation, []).append(candidate)
     for candidate in _attention_candidates(graph):
@@ -329,6 +319,124 @@ def _stateful_attention_candidate(operation: Op, graph: ComputeGraph) -> RegionC
             * 2
         ),
     )
+
+
+def _attention_prologue_candidates(
+    graph: ComputeGraph, producers: tuple[RegionCandidate, ...]
+) -> tuple[RegionCandidate, ...]:
+    """Stateful decode attention that computes its query and new key from
+    their elementwise producers (RoPE) instead of reading them.
+
+    The attention then binds the producer's input in place of its result,
+    which never materializes, and the producer's other operands (cos, sin)
+    as extra loads. Its body evaluates each producer's program for the one
+    row it needs (``prologues`` in the semantic facts).
+    """
+    by_output = {
+        candidate.live_outputs[0]: candidate
+        for candidate in producers
+        if candidate.executable
+        and len(candidate.live_outputs) == 1
+        and candidate.tensor_program is not None
+        and candidate.tensor_program.family == "elementwise"
+    }
+    candidates = []
+    for operation in graph.ops.values():
+        attention = _stateful_attention_candidate(operation, graph)
+        if attention is None:
+            continue
+        program = attention.tensor_program
+        assert program is not None
+        loads = list(program.loads)
+        prologues: dict[str, dict[str, object]] = {}
+        operations: list[Op] = []
+        extra: dict[str, IndexedLoad] = {}
+        for load_id in ("attention:q", "attention:new_k"):
+            position = next(index for index, load in enumerate(loads) if load.id == load_id)
+            load = loads[position]
+            producer = by_output.get(load.value_id)
+            if (
+                producer is None
+                or load.value_id in graph.outputs
+                or graph.values[load.value_id].users != (operation.id,)
+            ):
+                continue
+            producer_program = producer.tensor_program
+            assert producer_program is not None
+            if (
+                producer_program.store.shape != load.source_shape
+                or producer_program.store.strides != load.strides
+            ):
+                continue
+            identity = tuple(domain.axis for domain in producer_program.iteration_domains)
+            # The producer input read at the output position takes the
+            # result's place in the attention's bindings.
+            source = next(
+                (
+                    candidate
+                    for candidate in producer_program.loads
+                    if candidate.axes == identity
+                    and candidate.strides == load.strides
+                    and candidate.dtype == load.dtype
+                ),
+                None,
+            )
+            if source is None:
+                continue
+            loads[position] = replace(load, value_id=source.value_id)
+            prologues[load_id] = {
+                "combine": producer_program.combine,
+                "loads": producer_program.loads,
+                "dtype": producer_program.store.dtype,
+            }
+            operations.extend(graph.ops[op_id] for op_id in producer.source_op_ids)
+            for candidate in producer_program.loads:
+                extra.setdefault(candidate.value_id, candidate)
+        if not prologues:
+            continue
+        bound = {load.value_id for load in loads}
+        for value_id, candidate in extra.items():
+            if value_id not in bound:
+                # Point accesses keep the attention's access maps valid; the
+                # body reads these through the prologue's own loads.
+                loads.append(
+                    replace(
+                        candidate,
+                        id=f"prologue:{len(loads)}",
+                        axes=(0,) * len(candidate.strides),
+                    )
+                )
+                bound.add(value_id)
+        fused = replace(program, loads=tuple(loads))
+        fused_loads = {load.id: load for load in fused.loads}
+        operation_ids = {item.id for item in operations}
+        if len(operation_ids) != len(operations):
+            continue
+        candidates.append(
+            RegionCandidate(
+                id=f"region:{operation.id.removeprefix('op:')}:attention_prologue",
+                source_op_ids=tuple(
+                    item.id
+                    for item in graph.ops.values()
+                    if item.id in operation_ids or item.id == operation.id
+                ),
+                external_inputs=tuple(dict.fromkeys(load.value_id for load in fused.loads)),
+                live_outputs=attention.live_outputs,
+                tensor_program=fused,
+                semantic_facts={
+                    **attention.semantic_facts,
+                    "q_access": fused_loads["attention:q"],
+                    "prologues": prologues,
+                },
+                cost_bytes=attention.cost_bytes
+                + sum(
+                    2 * _value_bytes(load.value_id, graph)
+                    for load in program.loads
+                    if load.id in prologues
+                ),
+            )
+        )
+    return tuple(candidates)
 
 
 def _scalar_fusion_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate | None:
@@ -1312,9 +1420,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
         return None
     q_head_axis, k_head_axis, v_head_axis = axes
     query_heads = q.shape[q_head_axis]
-    _query_length = q.shape[3 - q_head_axis]
     kv_heads = k.shape[k_head_axis]
-    _kv_length = k.shape[3 - k_head_axis]
     head_dim = q.shape[-1]
     if (
         query_heads % kv_heads
@@ -1744,20 +1850,6 @@ def _producer_path(value_id: str, stop: Op, graph: ComputeGraph) -> tuple[Op, ..
     return None
 
 
-def _value_root(value_id: str, graph: ComputeGraph) -> str:
-    while True:
-        operation = _producer(value_id, graph)
-        program = operation.tensor_program if operation is not None else None
-        if (
-            operation is None
-            or not isinstance(program, TensorProgram)
-            or program.family not in {"view", "copy"}
-            or len(operation.operands) != 1
-        ):
-            return value_id
-        value_id = operation.operands[0]
-
-
 def _value_root_path(value_id: str, graph: ComputeGraph) -> tuple[str, tuple[Op, ...]]:
     operations: list[Op] = []
     current = value_id
@@ -2003,19 +2095,6 @@ def _binary_operator(operation: Op | None, operator: str) -> bool:
     )
 
 
-def _transitive_operations(operation: Op, graph: ComputeGraph) -> tuple[Op, ...]:
-    operation_ids = {operation.id}
-    frontier = list(operation.operands)
-    while frontier:
-        value_id = frontier.pop()
-        producer = _producer(value_id, graph)
-        if producer is None or producer.id in operation_ids:
-            continue
-        operation_ids.add(producer.id)
-        frontier.extend(producer.operands)
-    return tuple(candidate for candidate in graph.ops.values() if candidate.id in operation_ids)
-
-
 def _rope_operations(
     concat: Op, root_ids: tuple[str, str, str], graph: ComputeGraph
 ) -> tuple[Op, ...]:
@@ -2031,7 +2110,14 @@ def _rope_operations(
             continue
         operation_ids.add(producer.id)
         frontier.extend(producer.operands)
-    return tuple(candidate for candidate in graph.ops.values() if candidate.id in operation_ids)
+    # Aliasing views cost nothing and need no region; leaving them out lets
+    # several RoPE regions read one shared view (of merged cosines, say).
+    return tuple(
+        candidate
+        for candidate in graph.ops.values()
+        if candidate.id in operation_ids
+        and (candidate is concat or _producing_view(candidate.results[0], graph) is None)
+    )
 
 
 def _last_axis_slice(value_id: str, graph: ComputeGraph) -> tuple[str, int] | None:
@@ -2087,178 +2173,367 @@ def _view_root(value_id: str, graph: ComputeGraph) -> str | None:
         value_id = producer.operands[0]
 
 
-def _gated_mlp_candidate(graph: ComputeGraph) -> RegionCandidate | None:
-    for multiply in graph.ops.values():
-        program = multiply.tensor_program
-        if not isinstance(program, TensorProgram) or program.family != "elementwise":
-            continue
-        if not isinstance(program.combine, Binary) or program.combine.operator != "mul":
-            continue
-        value_by_load = {load.id: load.value_id for load in program.loads}
-        operands = [
-            value_by_load.get(_load_id(program.combine.lhs)),
-            value_by_load.get(_load_id(program.combine.rhs)),
-        ]
-        if any(operand is None for operand in operands):
-            continue
-        activation_id = None
-        up_id = None
-        activation_operations: tuple[Op, ...] = ()
-        for operand_id in operands:
-            producer_id = graph.values[operand_id].producer
-            if producer_id is None:
-                continue
-            producer_program = graph.ops[producer_id].tensor_program
-            decomposed_silu = _decomposed_silu_operations(graph.ops[producer_id], graph)
-            if decomposed_silu is not None:
-                activation_id = operand_id
-                activation_operations = decomposed_silu
-            elif (
-                isinstance(producer_program, TensorProgram)
-                and isinstance(producer_program.combine, Unary)
-                and producer_program.combine.operator == "silu"
-            ):
-                activation_id = operand_id
-                activation_operations = (graph.ops[producer_id],)
-            else:
-                up_id = operand_id
-        if activation_id is None or up_id is None:
-            continue
-        up_producer_id = graph.values[up_id].producer
-        if up_producer_id is None:
-            continue
-        activation = activation_operations[-1]
-        up = graph.ops[up_producer_id]
-        gate_id = activation_operations[0].operands[0] if activation_operations else None
-        if gate_id is None:
-            continue
-        gate_producer_id = graph.values[gate_id].producer
-        if gate_producer_id is None:
-            continue
-        gate = graph.ops[gate_producer_id]
-        if not activation_operations or not _is_contraction(gate) or not _is_contraction(up):
-            continue
-        gate_program = gate.tensor_program
-        up_program = up.tensor_program
-        assert isinstance(gate_program, TensorProgram)
-        assert isinstance(up_program, TensorProgram)
-        if (
-            gate_program.iteration_domains != up_program.iteration_domains
-            or gate_program.reduction_axes != up_program.reduction_axes
-            or gate_program.loads[0].value_id != up_program.loads[0].value_id
-        ):
-            continue
+def _gemm_epilogue_candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
+    """GEMMs fused with the elementwise chain that consumes their results.
 
-        source_op_ids = (
-            gate.id,
-            up.id,
-            *(operation.id for operation in activation_operations),
-            multiply.id,
-        )
-        operations = tuple(graph.ops[operation_id] for operation_id in source_op_ids)
-        external_outputs = _external_outputs(operations, graph)
-        rejections = []
-        if any(_has_illegal_effects(operation) for operation in operations):
-            rejections.append("source effects do not fit a paired GEMM epilogue")
-        if not (
-            _same_tensor_layout(gate.results[0], up.results[0], graph)
-            and _same_tensor_layout(activation.results[0], multiply.results[0], graph)
-        ):
-            rejections.append("numerical or ownership contract fails")
-        if external_outputs:
-            rejections.append("secondary outputs require multi-store epilogue support")
-        rejections.append("paired GEMM provider is not implemented")
-
-        output_value = graph.values[multiply.results[0]]
-        output_elements = prod(output_value.shape or ())
-        element_bytes = _DTYPE_BYTES.get(output_value.dtype or "", 0)
-        separate_output_bytes = 2 * output_elements * element_bytes
-        paired_output_bytes = 0 if not external_outputs else separate_output_bytes
-        packing_cost_bytes = output_elements * element_bytes
-        conversion_cost_bytes = (
-            0 if _same_strides(gate.results[0], up.results[0], graph) else separate_output_bytes
-        )
-        scalar_saved_bytes = sum(
-            _value_bytes(operation.results[0], graph) * 2
-            for operation in activation_operations
-            if operation.results[0] not in external_outputs
-        )
-        return RegionCandidate(
-            id=f"region:{multiply.id.removeprefix('op:')}:gated_mlp",
-            source_op_ids=source_op_ids,
-            external_inputs=_external_inputs(operations, graph),
-            live_outputs=tuple(dict.fromkeys((multiply.results[0], *external_outputs))),
-            tensor_program=None,
-            semantic_facts={
-                "family": "gated_mlp",
-                "fusion": "paired_gemm_epilogue",
-                "gate_contraction": gate.id,
-                "up_contraction": up.id,
-                "activation": activation.id,
-                "combine": multiply.id,
-                "secondary_outputs": external_outputs,
-                "effects": tuple((operation.id, operation.effects) for operation in operations),
-                "separate_work_bytes": separate_output_bytes + scalar_saved_bytes,
-                "paired_work_bytes": paired_output_bytes
-                + packing_cost_bytes
-                + conversion_cost_bytes,
-                "packing_cost_bytes": packing_cost_bytes,
-                "conversion_cost_bytes": conversion_cost_bytes,
-                "scalar_fusion_saved_bytes": scalar_saved_bytes,
-                "source_casts": "preserved",
-            },
-            cost_bytes=paired_output_bytes + packing_cost_bytes + conversion_cost_bytes,
-            rejections=tuple(rejections),
-        )
-    return None
+    The chain becomes the contraction's ``post`` expression: every read of
+    the GEMM result at the output position is replaced by the GEMM's own
+    result expression (the accumulator rounded to the result dtype), and the
+    chain's other operands become loads indexed by the GEMM's output axes. A
+    chain over two GEMMs of the same left operand and shape (gate and up
+    projections) forms a paired contraction: accumulator 1 multiplies
+    ``loads[2]`` as accumulator 0 multiplies ``loads[1]``.
+    """
+    candidates = []
+    for tail in graph.ops.values():
+        if not _is_scalar_operation(tail) or _absorbed_by_consumer_chain(tail, graph):
+            continue
+        candidate = _gemm_epilogue_candidate(tail, graph)
+        if candidate is not None:
+            candidates.append(candidate)
+    return tuple(candidates)
 
 
-def _load_id(expression: ScalarExpression) -> str | None:
-    return expression.load_id if isinstance(expression, Load) else None
-
-
-def _decomposed_silu_operations(tail: Op, graph: ComputeGraph) -> tuple[Op, ...] | None:
-    expected = (
-        ("convert_element_type", "elementwise"),
-        ("neg", "elementwise"),
-        ("exp", "elementwise"),
-        ("add", "elementwise"),
-        ("div", "elementwise"),
-        ("convert_element_type", "elementwise"),
+def _absorbed_by_consumer_chain(operation: Op, graph: ComputeGraph) -> bool:
+    """Whether ``operation``'s only consumer also reads a GEMM result, so the
+    epilogue (a paired one) forms at that consumer instead. Fusing here
+    alone would make the other GEMM wait for this one."""
+    result = operation.results[0]
+    users = graph.values[result].users
+    if result in graph.outputs or len(users) != 1:
+        return False
+    consumer = graph.ops[users[0]]
+    return _is_scalar_operation(consumer) and any(
+        _viewed_contraction(operand_id, graph) is not None
+        for operand_id in consumer.operands
+        if operand_id != result
     )
-    chain = [tail]
-    current = tail
-    if not _matches_operation(current, *expected[-1]):
+
+
+def _gemm_epilogue_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate | None:
+    chain = _epilogue_chain(tail, graph)
+    chain_ids = {operation.id for operation in chain}
+    if any(_has_illegal_effects(operation) for operation in chain):
         return None
-    for operation_name, family in reversed(expected[:-1]):
-        if not current.operands:
-            return None
-        operand_index = 1 if current.id.removeprefix("op:").startswith("div") else 0
-        producer_id = graph.values[current.operands[operand_index]].producer
-        if producer_id is None:
-            return None
-        current = graph.ops[producer_id]
-        if not _matches_operation(current, operation_name, family):
-            return None
-        chain.insert(0, current)
-    cast_to_float, negation, exponential, increment, division, cast_to_source = chain
-    if (
-        division.operands != (cast_to_float.results[0], increment.results[0])
-        or negation.operands != (cast_to_float.results[0],)
-        or exponential.operands != (negation.results[0],)
-        or increment.operands != (exponential.results[0],)
-        or cast_to_source.operands != (division.results[0],)
+    if any(
+        operation.results[0] in graph.outputs
+        or any(user not in chain_ids for user in graph.values[operation.results[0]].users)
+        for operation in chain[:-1]
     ):
         return None
-    return tuple(chain)
+    if not all(
+        _same_chain_layout(operation.results[0], tail.results[0], graph) for operation in chain
+    ):
+        return None
+    composed = _compose_scalar_chain(chain, graph)
+    if composed is None or _has_axis_index(composed.combine):
+        return None
 
+    leaves = {
+        load.id: found
+        for load in composed.loads
+        if (found := _viewed_contraction(load.value_id, graph)) is not None
+    }
+    contraction_ids = list(dict.fromkeys(contraction.id for contraction, _ in leaves.values()))
+    if not 1 <= len(contraction_ids) <= 2:
+        return None
+    order = list(graph.ops)
+    contractions = [graph.ops[op_id] for op_id in sorted(contraction_ids, key=order.index)]
+    first = contractions[0].tensor_program
+    assert isinstance(first, TensorProgram)
+    rows, columns = first.store.shape if len(first.store.shape) == 2 else (0, 0)
+    store = composed.store
+    if not _is_row_major_gemm(first) or prod(store.shape) != rows * columns:
+        return None
+    if not store.owns_storage or _significant_strides(
+        store.strides, store.shape
+    ) != _significant_strides(_contiguous_strides(store.shape), store.shape):
+        return None
+    for contraction in contractions:
+        views = [
+            view for found, path in leaves.values() if found.id == contraction.id for view in path
+        ]
+        allowed = chain_ids | {view.id for view in views}
+        path_values = (contraction.results[0], *(view.results[0] for view in views))
+        if any(
+            value_id in graph.outputs
+            or any(user not in allowed for user in graph.values[value_id].users)
+            for value_id in path_values
+        ):
+            return None
 
-def _matches_operation(operation: Op, name_prefix: str, family: str) -> bool:
-    return (
-        operation.id.removeprefix("op:").startswith(name_prefix)
-        and isinstance(operation.tensor_program, TensorProgram)
-        and operation.tensor_program.family == family
+    base_loads = first.loads
+    posts = {contractions[0].id: first.post}
+    if len(contractions) == 2:
+        second = contractions[1].tensor_program
+        assert isinstance(second, TensorProgram)
+        if not _pairs_with(first, second, graph):
+            return None
+        base_loads = (*first.loads, replace(second.loads[1], id=f"load:{len(first.loads)}"))
+        posts[contractions[1].id] = _with_accumulator(second.post, 1)
+
+    chain_axes = tuple(domain.axis for domain in composed.iteration_domains)
+    coordinates = _gemm_coordinates(store.shape, rows, columns)
+    if coordinates is None:
+        return None
+    axis_map = dict(zip(chain_axes, coordinates, strict=True))
+    extra_loads: list[IndexedLoad] = []
+    replacements: dict[str, ScalarExpression] = {}
+    for load in composed.loads:
+        if load.id in leaves:
+            contraction, _ = leaves[load.id]
+            result = graph.values[load.value_id]
+            source = graph.values[contraction.results[0]]
+            if (
+                len(load.axes) != len(chain_axes)
+                or any(
+                    axis != chain_axis and not (size == 1 and axis == 0)
+                    for axis, chain_axis, size in zip(load.axes, chain_axes, store.shape)
+                )
+                or load.dtype != first.store.dtype
+                or result.storage_offset != source.storage_offset
+                or _significant_strides(load.strides, store.shape)
+                != _significant_strides(_contiguous_strides(store.shape), store.shape)
+            ):
+                # Only reads at the output position come from the accumulators.
+                return None
+            replacements[load.id] = posts[contraction.id]
+            continue
+        axes = _gemm_load_axes(load.axes, axis_map)
+        if axes is None:
+            return None
+        load_id = f"load:{len(base_loads) + len(extra_loads)}"
+        extra_loads.append(replace(load, id=load_id, axes=axes))
+        replacements[load.id] = Load(load_id, load.dtype)
+    post = _substitute_loads(composed.combine, replacements)
+    if post.dtype != store.dtype:
+        post = Cast(post, store.dtype, _cast_rounding_for(store.dtype))
+
+    program = replace(
+        first,
+        decomposition="indexed multiply-accumulate with a fused elementwise epilogue",
+        loads=(*base_loads, *extra_loads),
+        post=post,
+        store=TensorStore(store.value_id, (rows, columns), store.dtype, (columns, 1), True),
     )
+    operations = (*contractions, *chain)
+    return RegionCandidate(
+        id=f"region:{tail.id.removeprefix('op:')}:gemm_epilogue",
+        source_op_ids=tuple(operation.id for operation in operations),
+        external_inputs=tuple(dict.fromkeys(load.value_id for load in program.loads)),
+        live_outputs=(tail.results[0],),
+        tensor_program=program,
+        semantic_facts={
+            "family": "gemm_epilogue",
+            "fusion": "gemm_epilogue",
+            "contractions": tuple(contraction.id for contraction in contractions),
+            "paired": len(contractions) == 2,
+            "source_casts": "preserved",
+        },
+        cost_bytes=sum(
+            2 * _value_bytes(contraction.results[0], graph) for contraction in contractions
+        )
+        + sum(2 * _value_bytes(operation.results[0], graph) for operation in chain[:-1]),
+    )
+
+
+def _epilogue_chain(tail: Op, graph: ComputeGraph) -> tuple[Op, ...]:
+    """The scalar producers of ``tail`` whose results stay inside the chain.
+
+    A producer whose result is also read elsewhere (the previous residual
+    sum, say) stays materialized and becomes a load of the epilogue.
+    """
+    operations = {operation.id: operation for operation in _scalar_fusion_operations(tail, graph)}
+    while True:
+        escaping = {
+            operation_id
+            for operation_id, operation in operations.items()
+            if operation_id != tail.id
+            and (
+                operation.results[0] in graph.outputs
+                or any(user not in operations for user in graph.values[operation.results[0]].users)
+            )
+        }
+        if not escaping:
+            break
+        reachable: set[str] = set()
+        pending = [tail.id]
+        while pending:
+            current = pending.pop()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            for operand_id in graph.ops[current].operands:
+                producer_id = graph.values[operand_id].producer
+                if producer_id in operations and producer_id not in escaping:
+                    pending.append(producer_id)
+        operations = {
+            operation_id: operation
+            for operation_id, operation in operations.items()
+            if operation_id in reachable
+        }
+    return tuple(
+        operation
+        for operation in _scalar_fusion_operations(tail, graph)
+        if operation.id in operations
+    )
+
+
+def _viewed_contraction(value_id: str, graph: ComputeGraph) -> tuple[Op, tuple[Op, ...]] | None:
+    """The contraction whose result ``value_id`` is, through aliasing views,
+    and those views."""
+    views: list[Op] = []
+    while (view := _producing_view(value_id, graph)) is not None:
+        views.append(view)
+        view_program = view.tensor_program
+        assert isinstance(view_program, TensorProgram)
+        value_id = view_program.loads[0].value_id
+    producer = _producer(value_id, graph)
+    if producer is None or not _is_contraction(producer):
+        return None
+    return producer, tuple(views)
+
+
+def _is_row_major_gemm(program: TensorProgram) -> bool:
+    if len(program.store.shape) != 2 or len(program.reduction_axes) != 1:
+        return False
+    _, columns = program.store.shape
+    return program.store.strides == (columns, 1) and program.store.owns_storage
+
+
+def _pairs_with(first: TensorProgram, second: TensorProgram, graph: ComputeGraph) -> bool:
+    """Whether two unbiased GEMMs share their left operand and shape, so one
+    pass over the left operand can feed both."""
+    if len(first.loads) != 2 or len(second.loads) != 2 or not _is_row_major_gemm(second):
+        return False
+    first_left, second_left = first.loads[0], second.loads[0]
+    first_right, second_right = first.loads[1], second.loads[1]
+    # Each GEMM may read the operand through its own reshape of one tensor.
+    left_values = graph.values[first_left.value_id], graph.values[second_left.value_id]
+    return (
+        first.iteration_domains == second.iteration_domains
+        and (first_left.axes, first_left.strides, first_left.dtype, first_left.source_shape)
+        == (second_left.axes, second_left.strides, second_left.dtype, second_left.source_shape)
+        and left_values[0].storage_relation.storage_id is not None
+        and left_values[0].storage_relation.storage_id == left_values[1].storage_relation.storage_id
+        and left_values[0].storage_offset == left_values[1].storage_offset
+        and first.combine == second.combine
+        and first.post == second.post
+        and first.store.shape == second.store.shape
+        and first.store.dtype == second.store.dtype
+        and (first_right.axes, first_right.strides, first_right.dtype)
+        == (second_right.axes, second_right.strides, second_right.dtype)
+    )
+
+
+def _with_accumulator(expression: ScalarExpression, index: int) -> ScalarExpression:
+    if isinstance(expression, Accumulator):
+        return replace(expression, index=index)
+    if isinstance(expression, (Unary, Cast)):
+        return replace(expression, operand=_with_accumulator(expression.operand, index))
+    if isinstance(expression, Binary):
+        return replace(
+            expression,
+            lhs=_with_accumulator(expression.lhs, index),
+            rhs=_with_accumulator(expression.rhs, index),
+        )
+    if isinstance(expression, Where):
+        return replace(
+            expression,
+            condition=_with_accumulator(expression.condition, index),
+            true_value=_with_accumulator(expression.true_value, index),
+            false_value=_with_accumulator(expression.false_value, index),
+        )
+    return expression
+
+
+def _has_axis_index(expression: ScalarExpression) -> bool:
+    if isinstance(expression, AxisIndex):
+        return True
+    if isinstance(expression, (Unary, Cast)):
+        return _has_axis_index(expression.operand)
+    if isinstance(expression, Binary):
+        return _has_axis_index(expression.lhs) or _has_axis_index(expression.rhs)
+    if isinstance(expression, Where):
+        return any(
+            _has_axis_index(part)
+            for part in (expression.condition, expression.true_value, expression.false_value)
+        )
+    return False
+
+
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    strides = []
+    stride = 1
+    for size in reversed(shape):
+        strides.append(stride)
+        stride *= size
+    return tuple(reversed(strides))
+
+
+def _significant_strides(strides: tuple[int, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
+    # A size-1 axis never moves, so its stride does not matter.
+    return tuple(stride for stride, size in zip(strides, shape, strict=True) if size != 1)
+
+
+def _gemm_coordinates(
+    shape: tuple[int, ...], rows: int, columns: int
+) -> list[int | str | AxisAffine] | None:
+    """Each axis of a contiguous ``shape`` as a function of the GEMM output
+    coordinates ``o0`` (rows) and ``o1`` (columns), when the trailing axes
+    hold the columns and the leading axes the rows."""
+    split = len(shape)
+    inner = 1
+    while split > 0 and inner < columns:
+        split -= 1
+        inner *= shape[split]
+    if inner != columns or prod(shape[:split]) != rows:
+        return None
+    coordinates: list[int | str | AxisAffine] = []
+    for index, size in enumerate(shape):
+        axis, end, extent = ("o1", len(shape), columns) if index >= split else ("o0", split, rows)
+        below = prod(shape[index + 1 : end])
+        if size == 1:
+            coordinates.append(0)
+        elif below == 1 and size == extent:
+            coordinates.append(axis)
+        else:
+            modulus = 0 if size * below == extent else size
+            coordinates.append(AxisAffine((AxisTerm(axis, 1, below, modulus),)))
+    return coordinates
+
+
+def _gemm_load_axes(
+    axes: tuple[Any, ...], axis_map: Mapping[str, int | str | AxisAffine]
+) -> tuple[Any, ...] | None:
+    """A chain load's axes rewritten over the GEMM output axes, or None when
+    an index does not compose."""
+    result: list[Any] = []
+    for axis in axes:
+        if isinstance(axis, int):
+            result.append(axis)
+        elif isinstance(axis, str):
+            if axis not in axis_map:
+                return None
+            result.append(axis_map[axis])
+        elif isinstance(axis, AxisAffine):
+            terms: list[AxisTerm] = []
+            for term in axis.terms:
+                mapped = axis_map.get(term.axis)
+                if mapped is None:
+                    return None
+                if isinstance(mapped, int):
+                    continue
+                if isinstance(mapped, str):
+                    terms.append(replace(term, axis=mapped))
+                elif term.divisor == 1 and term.modulus == 0 and len(mapped.terms) == 1:
+                    terms.append(replace(mapped.terms[0], scale=term.scale))
+                else:
+                    return None
+            result.append(AxisAffine(tuple(terms), axis.offset))
+        else:
+            return None
+    return tuple(result)
 
 
 def _has_illegal_effects(operation: Op) -> bool:
@@ -2272,41 +2547,15 @@ def _is_contraction(operation: Op) -> bool:
     )
 
 
-def _external_outputs(operations: tuple[Op, ...], graph: ComputeGraph) -> tuple[str, ...]:
-    operation_ids = {operation.id for operation in operations}
-    produced = {result_id for operation in operations for result_id in operation.results}
-    outputs: list[str] = []
-    for result_id in graph.outputs:
-        if result_id in produced and result_id not in outputs:
-            outputs.append(result_id)
-    for operation in operations:
-        for result_id in operation.results:
-            if result_id in outputs:
-                continue
-            if any(user not in operation_ids for user in graph.values[result_id].users):
-                outputs.append(result_id)
-    return tuple(outputs)
-
-
-def _same_tensor_layout(left_id: str, right_id: str, graph: ComputeGraph) -> bool:
-    left = graph.values[left_id]
-    right = graph.values[right_id]
-    return left.shape == right.shape and left.dtype == right.dtype and left.strides == right.strides
-
-
 def _same_chain_layout(left_id: str, right_id: str, graph: ComputeGraph) -> bool:
     left = graph.values[left_id]
     right = graph.values[right_id]
     return left.shape == right.shape and left.strides == right.strides
 
 
-def _same_strides(left_id: str, right_id: str, graph: ComputeGraph) -> bool:
-    return graph.values[left_id].strides == graph.values[right_id].strides
-
-
 def _value_bytes(value_id: str, graph: ComputeGraph) -> int:
     value = graph.values[value_id]
-    return prod(value.shape or ()) * _DTYPE_BYTES.get(value.dtype or "", 0)
+    return prod(value.shape or ()) * DTYPE_BYTES.get(value.dtype or "", 0)
 
 
 def _semantic_facts(operation: Op, graph: ComputeGraph) -> dict[str, object]:

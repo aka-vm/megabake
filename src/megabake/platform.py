@@ -52,10 +52,12 @@ try:
     import cutlass
     import cutlass.utils.hopper_helpers as sm90_utils
     from cutlass import cute, pipeline, utils
+    from cutlass._mlir import ir
     from cutlass._mlir.dialects import llvm
     from cutlass.cute.runtime import from_dlpack
     from cutlass.cutlass_dsl import dsl_user_op
     from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+    from cutlass.pipeline.helpers import MbarrierArray
     from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 
     HAS_CUTLASS = True
@@ -72,6 +74,8 @@ except ImportError:
     TensorMapManager = _UnavailableBackendProxy("TensorMapManager")
     TensorMapUpdateMode = _UnavailableBackendProxy("TensorMapUpdateMode")
     llvm = _UnavailableBackendProxy("llvm")
+    ir = _UnavailableBackendProxy("ir")
+    MbarrierArray = _UnavailableBackendProxy("MbarrierArray")
 
 
 def require_cuda_and_cutlass(feature: str = "This operation") -> None:
@@ -86,6 +90,7 @@ def require_cuda_and_cutlass(feature: str = "This operation") -> None:
 __all__ = [
     "HAS_CUDA",
     "HAS_CUTLASS",
+    "MbarrierArray",
     "TensorMapManager",
     "TensorMapUpdateMode",
     "cuda",
@@ -93,6 +98,7 @@ __all__ = [
     "cutlass",
     "dsl_user_op",
     "from_dlpack",
+    "ir",
     "llvm",
     "pipeline",
     "pipeline_init_arrive",

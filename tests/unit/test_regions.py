@@ -11,6 +11,7 @@ from megabake import (
     prepare_fx_graph,
 )
 from megabake.graph import import_fx
+from megabake.lowering import Accumulator, Binary, Cast, Load, TensorStore
 
 
 def _context(graph: torch.fx.GraphModule, *values: torch.Tensor) -> SimpleNamespace:
@@ -129,13 +130,21 @@ def test_form_regions_rejects_vector_chain_when_intermediate_is_external():
     assert len(graph.regions) == len(graph.ops)
 
 
-def test_form_regions_matches_gated_mlp_and_counts_candidate_costs():
+def _epilogue_candidates(graph):
+    return [
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts["family"] == "gemm_epilogue"
+    ]
+
+
+def test_form_regions_pairs_gate_and_up_gemms_with_their_activation():
     class Model(torch.nn.Module):
         def forward(self, source, gate_weight, up_weight):
             gate = torch.nn.functional.linear(source, gate_weight)
             up = torch.nn.functional.linear(source, up_weight)
-            activated = torch.nn.functional.silu(gate)
-            return activated * up, gate, activated
+            return torch.nn.functional.silu(gate) * up
 
     torch.manual_seed(67)
     source = torch.randn(4, 8, dtype=torch.bfloat16)
@@ -145,11 +154,9 @@ def test_form_regions_matches_gated_mlp_and_counts_candidate_costs():
 
     candidate = next(
         candidate
-        for region in graph.regions
-        for candidate in region.fusion_candidates
-        if candidate.semantic_facts["family"] == "gated_mlp"
+        for candidate in _epilogue_candidates(graph)
+        if candidate.semantic_facts["paired"]
     )
-    facts = candidate.semantic_facts
     assert candidate.source_op_ids == (
         "op:mm",
         "op:mm_1",
@@ -161,21 +168,65 @@ def test_form_regions_matches_gated_mlp_and_counts_candidate_costs():
         "op:convert_element_type_5",
         "op:mul",
     )
-    assert facts["gate_contraction"] == "op:mm"
-    assert facts["up_contraction"] == "op:mm_1"
-    assert facts["activation"] == "op:convert_element_type_5"
-    assert set(facts["secondary_outputs"]) == {
-        "value:mul",
-        "value:mm",
-        "value:convert_element_type_5",
-    }
-    assert facts["separate_work_bytes"] == 1056
-    assert facts["paired_work_bytes"] == 144
-    assert facts["packing_cost_bytes"] == 4 * 6 * 2
-    assert facts["conversion_cost_bytes"] == 0
-    assert facts["scalar_fusion_saved_bytes"] == 960
-    assert not candidate.executable
-    assert "paired GEMM provider is not implemented" in candidate.rejections
+    assert candidate.executable
+    assert candidate.live_outputs == ("value:mul",)
+    program = candidate.tensor_program
+    assert program.family == "contraction"
+    assert [load.value_id for load in program.loads] == [
+        "value:arg0_1",
+        "value:permute",
+        "value:permute_1",
+    ]
+    assert program.store == TensorStore("value:mul", (4, 6), "torch.bfloat16", (6, 1), True)
+    # Each product is rounded to BF16 before the activation, as in eager.
+    assert program.post.rhs == Cast(
+        Accumulator("torch.float32", 1), "torch.bfloat16", "round_nearest_even"
+    )
+
+
+def test_form_regions_does_not_pair_gemms_whose_results_escape():
+    class Model(torch.nn.Module):
+        def forward(self, source, gate_weight, up_weight):
+            gate = torch.nn.functional.linear(source, gate_weight)
+            up = torch.nn.functional.linear(source, up_weight)
+            return torch.nn.functional.silu(gate) * up, gate
+
+    torch.manual_seed(67)
+    source = torch.randn(4, 8, dtype=torch.bfloat16)
+    gate_weight = torch.randn(6, 8, dtype=torch.bfloat16)
+    up_weight = torch.randn(6, 8, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, gate_weight, up_weight))
+
+    assert not any(
+        candidate.semantic_facts["paired"] for candidate in _epilogue_candidates(graph)
+    )
+
+
+def test_form_regions_fuses_residual_add_into_gemm_epilogue():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight, residual):
+            return residual + torch.nn.functional.linear(source, weight).view(1, 4, 16)
+
+    torch.manual_seed(71)
+    source = torch.randn(4, 8, dtype=torch.bfloat16)
+    weight = torch.randn(16, 8, dtype=torch.bfloat16)
+    residual = torch.randn(1, 4, 16, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, weight, residual))
+
+    (candidate,) = _epilogue_candidates(graph)
+    assert candidate.source_op_ids == ("op:mm", "op:add")
+    program = candidate.tensor_program
+    residual_load = program.loads[2]
+    # The [1, 4, 16] residual is read at GEMM output (row, column).
+    assert residual_load.value_id == "value:arg2_1"
+    assert residual_load.axes == (0, "o0", "o1")
+    assert program.store == TensorStore("value:add", (4, 16), "torch.bfloat16", (16, 1), True)
+    assert program.post == Binary(
+        "add",
+        Load("load:2", "torch.bfloat16"),
+        Cast(Accumulator("torch.float32"), "torch.bfloat16", "round_nearest_even"),
+        "torch.bfloat16",
+    )
 
 
 def test_form_regions_matches_view_plus_gemm_and_preserves_alias_index_map():

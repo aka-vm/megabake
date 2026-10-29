@@ -6,7 +6,7 @@ from cuda.bindings import driver as cuda
 from cutlass import cute
 
 from megabake.bodies import SelectionPolicy
-from megabake.bodies.blackwell import BlackwellGemmProvider, emit_blackwell_gemm
+from megabake.bodies.cuda.sm100.gemm import BlackwellGemmProvider, emit_blackwell_gemm
 from megabake.compiler import _target_facts
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
@@ -25,17 +25,24 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("shape", [(1, 32, 64), (5, 33, 70), (32, 64, 128)])
 def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input):
     m, n, k = shape
+
     class Gemm(torch.nn.Module):
         def forward(self, a, b):
             return a @ b if strided_input else a @ b.T
+
     torch.manual_seed(42)
-    a = (torch.randn(k, m, device="cuda", dtype=dtype).T if strided_input
-         else torch.randn(m, k, device="cuda", dtype=dtype))
+    a = (
+        torch.randn(k, m, device="cuda", dtype=dtype).T
+        if strided_input
+        else torch.randn(m, k, device="cuda", dtype=dtype)
+    )
     b = torch.randn((k, n) if strided_input else (n, k), device="cuda", dtype=dtype)
     prepared = prepare_fx_graph(torch.export.export(Gemm(), (a, b)).graph_module, (a, b))
     graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     region = next(r for r in graph.regions if r.tensor_programs[0].family == "contraction")
-    candidates = BlackwellGemmProvider().get_candidates(region, _target_facts(a.device), SelectionPolicy())
+    candidates = BlackwellGemmProvider().get_candidates(
+        region, _target_facts(a.device), SelectionPolicy()
+    )
     assert candidates.configurations, candidates.rejections
     body = emit_blackwell_gemm(region.tensor_programs[0], candidates.configurations[0])
     path = tmp_path / "blackwell_body.py"
@@ -51,7 +58,9 @@ def test_blackwell_mma_tails_and_rebinding(tmp_path, dtype, shape, strided_input
         compiled(*args)
         torch.cuda.synchronize()
         expected = Gemm()(a, b)
-        torch.testing.assert_close(c, expected, atol=0.04 if dtype == torch.bfloat16 else 0.004, rtol=0.01)
+        torch.testing.assert_close(
+            c, expected, atol=0.04 if dtype == torch.bfloat16 else 0.004, rtol=0.01
+        )
         a.add_(0.125)
 
 
@@ -63,28 +72,37 @@ def test_blackwell_complete_mlp_one_kernel_and_private_isolated_state(tmp_path, 
     from megabake import make_backend
 
     torch.manual_seed(123)
-    args = (torch.randn(5, 17, device="cuda", dtype=torch.bfloat16) / 4,
-            torch.randn(33, 17, device="cuda", dtype=torch.bfloat16) / 4,
-            torch.randn(33, 17, device="cuda", dtype=torch.bfloat16) / 4,
-            torch.randn(17, 33, device="cuda", dtype=torch.bfloat16) / 6)
+    args = (
+        torch.randn(5, 17, device="cuda", dtype=torch.bfloat16) / 4,
+        torch.randn(33, 17, device="cuda", dtype=torch.bfloat16) / 4,
+        torch.randn(33, 17, device="cuda", dtype=torch.bfloat16) / 4,
+        torch.randn(17, 33, device="cuda", dtype=torch.bfloat16) / 6,
+    )
     backend = make_backend(compile_kernel=True, scheduler=scheduler, dump_dir=tmp_path)
     bound = torch.compile(mlp, backend=backend, fullgraph=True)
     with torch.no_grad():
         result = bound(*args)
         reference = mlp(*args)
-        assert ((result.float() - reference.float()).norm() / reference.float().norm()).item() < 0.01
+        assert (
+            (result.float() - reference.float()).norm() / reference.float().norm()
+        ).item() < 0.01
         compiled = backend.megabake_last_compiled
         assert any(s.body.provider == "blackwell_mma" for s in compiled.plan.selection.selections)
         # Search may legitimately mix a scalar tail GEMM with MMA at tiny shapes.
-        assert any(c.description.count("blackwell_mma/") == 3 and c.measurement is not None
-                   for c in compiled.search.candidates)
+        assert any(
+            c.description.count("blackwell_mma/") == 3 and c.measurement is not None
+            for c in compiled.search.candidates
+        )
         trace = kernel_trace(lambda: bound(*args), tmp_path / "trace.json")
         assert trace["launch_count"] == 1
         # Bind entirely new tensors, not just new contents at existing addresses.
         changed = tuple(t + 0.125 for t in args)
         changed_result = bound(*changed)
         changed_reference = mlp(*changed)
-        assert ((changed_result.float() - changed_reference.float()).norm() / changed_reference.float().norm()).item() < 0.01
+        assert (
+            (changed_result.float() - changed_reference.float()).norm()
+            / changed_reference.float().norm()
+        ).item() < 0.01
         isolated = _MegaBakeKernel(compiled, args, _graph_ordered_inputs(compiled, args))
         isolated.launch_call(isolated.arguments())
         torch.cuda.synchronize()

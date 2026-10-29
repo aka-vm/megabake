@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -48,12 +47,18 @@ def ready_slots(workers: int) -> int:
     return workers + 3 + PHASE_TIMER_SLOTS
 
 
-# Bytes of upcoming GEMM weights a table launch prefetches into L2 per GEMM
-# barrier interval (see codegen._weight_prefetch_schedule); 0 disables it.
-# Off by default: on a 60-SM H200 slice it slowed decode by 16-24% issued by
-# every CTA (artifacts/chunk3_2026-10-20) and by 8-10% issued only by CTAs
-# idle in the issuing phase (artifacts/chunk4_2026-10-20).
-L2_PREFETCH_BYTES = int(os.environ.get("MEGABAKE_L2_PREFETCH_BYTES", "0"))
+# Weight streaming into shared memory (see codegen._weight_stream_schedule):
+# at the grid barrier before a GEMM interval, each CTA loads the weight
+# operand of the first K tiles of its first tile in that interval into the
+# GEMM's pipeline stages, so the loads overlap the barrier wait and the norms
+# folded into the interval. At most this many stages per CTA (the GEMM's
+# stage count bounds it); 0 disables streaming.
+# Off by default: against the same kernel with the streaming code compiled in
+# but never preloading, the preloads changed decode by -0.7% to +1.5% on a
+# 60-SM H200 slice (artifacts/step3_2026-10-21). Issuing them blocks warp 0
+# once the SM's TMA queue is full, so they overlap little beyond the barrier
+# wait.
+WEIGHT_STREAM_STAGES = int(os.environ.get("MEGABAKE_WEIGHT_STREAM_STAGES", 0))
 
 
 # Host-mapped buffers holding table launches' per-call boundary addresses;
@@ -131,9 +136,21 @@ def grid_barrier(ready: cute.Tensor, workers: cutlass.Int32, epoch: cutlass.Int3
 
 
 @cute.jit
-def counting_grid_barrier(
-    ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32
-):
+def trap_if(condition):
+    """Trap the kernel when ``condition`` holds on any lane of this warp.
+
+    The warp votes before it branches, so the trap sits behind a warp-uniform
+    branch. Behind a per-lane branch, lanes may leave a warp early as far as
+    ptxas can tell, and it then serializes every wgmma of the megakernel
+    (C7519, "WG.AR in divergent path"). Every lane of the warp must reach the
+    call.
+    """
+    if cute.arch.vote_any_sync(condition):
+        llvm.intr_trap()
+
+
+@cute.jit
+def counting_grid_barrier(ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32):
     """Grid barrier on an arrival counter that only grows.
 
     Barrier ``ordinal`` (counted densely from the last ready reset) completes
@@ -144,37 +161,33 @@ def counting_grid_barrier(
     caller keeps ``(ordinal + 1) * workers`` within int32 and resets the
     ready buffer before it would wrap.
     """
+    counting_grid_arrive(ready, workers)
+    counting_grid_wait(ready, workers, ordinal)
+
+
+@cute.jit
+def counting_grid_arrive(ready: cute.Tensor, workers: cutlass.Int32):
+    """The arrival half of ``counting_grid_barrier``: once every thread of
+    the CTA is done, thread 0 arrives. The CTA may issue work that does not
+    depend on other CTAs (weight loads) before ``counting_grid_wait``."""
     thread, _, _ = cute.arch.thread_idx()
     cute.arch.sync_threads()
     if thread == 0:
         counter = ready.iterator + workers + 1
-        cute.arch.red(
-            counter, cutlass.Int32(1), op="add", dtype="s32", sem="release", scope="gpu"
-        )
+        cute.arch.red(counter, cutlass.Int32(1), op="add", dtype="s32", sem="release", scope="gpu")
+
+
+@cute.jit
+def counting_grid_wait(ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32):
+    """The waiting half of ``counting_grid_barrier``."""
+    thread, _, _ = cute.arch.thread_idx()
+    if thread == 0:
+        counter = ready.iterator + workers + 1
         target = (ordinal + cutlass.Int32(1)) * workers
         seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
         while seen < target:
             seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
     cute.arch.sync_threads()
-
-
-@dsl_user_op
-def prefetch_l2(address, size, *, loc=None, ip=None):
-    """Fetch ``size`` bytes (a multiple of 16) at the 16-byte-aligned global
-    ``address`` into L2 without waiting (``cp.async.bulk.prefetch.L2``)."""
-    llvm.inline_asm(
-        res=None,
-        operands_=[
-            cutlass.Int64(address).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(size).ir_value(loc=loc, ip=ip),
-        ],
-        asm_string="cp.async.bulk.prefetch.L2.global [$0], $1;",
-        constraints="l,r",
-        has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op
@@ -190,37 +203,6 @@ def prefetch_l1(pointer, *, loc=None, ip=None):
         loc=loc,
         ip=ip,
     )
-
-
-# Table launches' GEMM rows hold (variant, A, B, C, bias), then for L2
-# prefetch: the weight operand's address slot, its row count, the bytes
-# between its rows, and how many leading bytes of each row to prefetch.
-@cute.jit
-def prefetch_gemm_weights(
-    addresses: cute.Tensor,
-    gemm_table: cute.Tensor,
-    first: cutlass.Int32,
-    count: cutlass.Int32,
-    thread: cutlass.Int32,
-    threads: cutlass.Int32,
-):
-    """Spread L2 prefetches of GEMMs ``first..first+count`` over ``threads``.
-
-    Each request covers the leading bytes of one weight row, so a partial
-    prefetch holds the first K tiles of every output tile, which is the
-    order the GEMM mainloop reads them in.
-    """
-    offset = cutlass.Int32(0)
-    for gemm in cutlass.range(first, first + count, unroll=1):
-        rows = gemm_table[gemm, 6]
-        stride = cutlass.Int64(gemm_table[gemm, 7])
-        size = gemm_table[gemm, 8]
-        base = addresses[gemm_table[gemm, 5]]
-        # Rotate the first row per GEMM so small weights spread over threads.
-        start = (thread + threads - offset % threads) % threads
-        for row in cutlass.range(start, rows, threads, unroll=1):
-            prefetch_l2(base + cutlass.Int64(row) * stride, size)
-        offset = offset + rows
 
 
 @cute.jit
@@ -276,7 +258,6 @@ class RuntimeAdmission:
 
 @dataclass(frozen=True)
 class RuntimeInvocation:
-    invocation_id: uuid.UUID
     epoch: int
     barrier_count: int
 
@@ -290,7 +271,6 @@ class EventRuntimeAdmission:
 
 @dataclass(frozen=True)
 class EventRuntimeInvocation:
-    invocation_id: uuid.UUID
     epoch: int
     event_count: int
 
@@ -352,17 +332,13 @@ def admit_runtime(plan: KernelPlan) -> RuntimeAdmission:
             f"plan architecture {plan.launch.architecture} does not match the current device"
         )
     if properties.multi_processor_count != target.multiprocessor_count:
-        raise InvalidRuntime(
-            "plan multiprocessor count does not match the current device"
-        )
+        raise InvalidRuntime("plan multiprocessor count does not match the current device")
     if not _cooperative_launch_supported():
         raise InvalidRuntime("the current device does not support cooperative launch")
 
     if plan.launch.max_active_blocks_per_sm is None:
         raise InvalidRuntime("plan has no compiled active-block capacity")
-    max_workers = (
-        plan.launch.max_active_blocks_per_sm * properties.multi_processor_count
-    )
+    max_workers = plan.launch.max_active_blocks_per_sm * properties.multi_processor_count
     if plan.launch.grid_size > max_workers:
         raise InvalidRuntime(
             f"cooperative grid {plan.launch.grid_size} exceeds capacity {max_workers}"
@@ -383,29 +359,29 @@ def execute_phase_plan(
     ready: torch.Tensor | None = None,
     epoch: int | None = None,
     synchronize: bool = True,
+    capturable: bool = False,
 ) -> RuntimeInvocation:
     """Launch ``kernel`` on ``stream``. With ``synchronize=False`` the call
-    returns once the launch is enqueued; its results are stream-ordered."""
+    returns once the launch is enqueued; its results are stream-ordered.
+    ``capturable`` declares that ``kernel`` takes its epochs from the device,
+    so a CUDA graph may capture it."""
     active_stream = stream or torch.cuda.current_stream()
     device = active_stream.device
-    with torch.cuda.device(device):
-        selected_admission = admission or admit_runtime(plan)
-    invocation_id = uuid.uuid4()
+    selected_admission = admission
+    if selected_admission is None:
+        with torch.cuda.device(device):
+            selected_admission = admit_runtime(plan)
 
-    if _stream_is_capturing(active_stream):
+    if not capturable and _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for phase plans")
     with torch.cuda.stream(active_stream):
-        selected_ready = (
-            ready if ready is not None else make_ready(plan.launch.grid_size, device)
-        )
+        selected_ready = ready if ready is not None else make_ready(plan.launch.grid_size, device)
         selected_epoch = 0 if epoch is None else epoch
         kernel(selected_ready, selected_epoch, active_stream)
         if synchronize:
             active_stream.synchronize()
 
-    return RuntimeInvocation(
-        invocation_id, selected_epoch, selected_admission.barrier_count
-    )
+    return RuntimeInvocation(selected_epoch, selected_admission.barrier_count)
 
 
 def admit_event_runtime(schedule: EventSchedule) -> EventRuntimeAdmission:
@@ -439,9 +415,10 @@ def execute_event_plan(
 ) -> EventRuntimeInvocation:
     active_stream = stream or torch.cuda.current_stream()
     device = active_stream.device
-    with torch.cuda.device(device):
-        selected_admission = admission or admit_event_runtime(schedule)
-    invocation_id = uuid.uuid4()
+    selected_admission = admission
+    if selected_admission is None:
+        with torch.cuda.device(device):
+            selected_admission = admit_event_runtime(schedule)
 
     if _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for event plans")
@@ -458,24 +435,17 @@ def execute_event_plan(
         if tuple(selected_events.shape) != (selected_admission.event_count,):
             raise InvalidRuntime("event tensor shape does not match the event plan")
         if selected_events.dtype != torch.int32 or selected_events.device != device:
-            raise InvalidRuntime(
-                "event tensor must be an int32 tensor on the stream device"
-            )
+            raise InvalidRuntime("event tensor must be an int32 tensor on the stream device")
         if epoch is not None and not 0 <= epoch < selected_admission.max_invocations:
             raise InvalidRuntime("event epoch would overflow int32 counters")
         selected_epoch = 0 if epoch is None else epoch
         if events is not None and validate_counters:
             if selected_epoch == 0:
                 if selected_events.count_nonzero():
-                    raise InvalidRuntime(
-                        "the first event invocation requires zeroed counters"
-                    )
+                    raise InvalidRuntime("the first event invocation requires zeroed counters")
             else:
                 for event in schedule.events:
-                    if (
-                        selected_events[event.id].item()
-                        != selected_epoch * event.trigger_count
-                    ):
+                    if selected_events[event.id].item() != selected_epoch * event.trigger_count:
                         raise InvalidRuntime(
                             f"event {event.id} counters do not match epoch {selected_epoch}"
                         )
@@ -484,7 +454,6 @@ def execute_event_plan(
             active_stream.synchronize()
 
     return EventRuntimeInvocation(
-        invocation_id,
         selected_epoch,
         selected_admission.event_count,
     )
