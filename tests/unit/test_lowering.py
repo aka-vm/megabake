@@ -11,20 +11,22 @@ from torch.utils._pytree import tree_unflatten
 from megabake import prepare_fx_graph
 from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.graph import import_fx
-from megabake.lowering import (
+from megabake.ir import (
     Accumulator,
     AxisAffine,
-    DataIndex,
     AxisIndex,
     Binary,
     CanonicalProgram,
     Cast,
     Constant,
+    DataIndex,
     Load,
     ScalarExpression,
     TensorProgram,
     Unary,
     Where,
+)
+from megabake.lowering import (
     axis_coordinate,
     canonicalize_semantics,
     dump_lowering_graph,

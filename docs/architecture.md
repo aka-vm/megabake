@@ -28,11 +28,12 @@ flowchart TD
 | Stage | Module | What it does |
 | --- | --- | --- |
 | Capture | `frontend.py`, `fx_handler/` | `make_backend()`; pinned AOT, pre-grad and post-grad passes; capture cache; options `mode`, `fallback` |
-| Declared ops | `fx_handler/hf_attention.py` | `megabake::attention` and `megabake::kv_attention` through transformers' `AttentionInterface`; `DecodeStep` for one-token decode over explicit KV state |
+| Declared ops | `fx_handler/hf_attention.py` | `megabake::attention` and `megabake::kv_attention` (defined in `ops/attention.py`) through transformers' `AttentionInterface`; `DecodeStep` for one-token decode over explicit KV state |
 | Import | `graph.py` | `import_fx` into `ComputeGraph` (`Value`, `Op`, `Region`) |
-| Lowering | `lowering.py` | Tensor programs per primitive family; `UnsupportedLowering` names the gap |
-| Regions | `regions.py` | Semantic matchers (RMSNorm, RoPE, attention, gated MLP) and region formation |
-| Bodies | `bodies/` | Arch-neutral `interface.py` contracts and `catalog.py` provider registry. `cuda/generic.py`: map, reduction and contraction for any SM. `cuda/sm90/` (Hopper): `gemm.py` drives the TMA/WGMMA kernel in `cutlass_gemm.py`, a fork of the pinned CUTLASS file in `cutlass_upstream/` (`tools/vendor_cutlass.py` shows the diff); `attention.py`. `cuda/sm100/` (Blackwell, SM10x/SM12x): `gemm.py` warp-MMA correctness baseline |
+| Lowering | `ir.py`, `lowering.py` | The tensor-program IR; tensor programs per primitive family; `UnsupportedLowering` names the gap |
+| Semantic families | `ops/` | One module per family (`attention.py`, `norm.py`, `rope.py`, `gemm.py`, `elementwise.py`): the typed descriptor bodies read, its recognizer, and for declared ops the PyTorch op, eager reference and program |
+| Regions | `regions.py` | Region formation: one region per op, with the `ops` candidates that end at it |
+| Bodies | `bodies/` | Arch-neutral `interface.py` contracts (`BodyProvider`: candidates, `emit`, `widen`; `Generation`). `catalog.py` offers a target the generic providers plus its generation's (`cuda/sm90/__init__.py`, `cuda/sm100/__init__.py`); codegen emits every phase body through it. `cuda/generic.py`: map, reduction and contraction for any SM. `cuda/sm90/` (Hopper): `gemm.py` drives the TMA/WGMMA kernel in `cutlass_gemm.py`, a fork of the pinned CUTLASS file in `cutlass_upstream/` (`tools/vendor_cutlass.py` shows the diff); `attention.py`. `cuda/sm100/` (Blackwell, SM10x/SM12x): `gemm.py` warp-MMA correctness baseline |
 | Planning | `planner.py`, `plan.py` | Body selection, tile maps, bounded plan search |
 | Scheduling | `schedule.py` | Dependencies, phase schedule, event schedule, simulation |
 | Storage | `memory.py` | Lifetimes, workspace reuse, per-worker scratch, plan verification |
@@ -67,7 +68,7 @@ Not yet lowered: scans (`cumsum`), triangular solve, reductions over several axe
 
 ## 4. Device bodies
 
-A provider receives a region's tensor program, its semantic parameters and `TargetFacts`, and returns legal `BodyConfig`s or a `ProviderRejection` with a reason. Each body declares its participants, scratch, barriers, completion points and resource use (`bodies/interface.py`).
+A provider receives a region's tensor program, its `ops` descriptor (`region.semantics`), `TargetFacts` and the `SelectionPolicy` (whose `target_options` carry its generation's launch-wide choices, such as Hopper's swapAB and split-K), and returns legal `BodyConfig`s or a `ProviderRejection` with a reason. The selected config's provider also emits its device body. Each body declares its participants, scratch, barriers, completion points and resource use (`bodies/interface.py`).
 
 | Family | Built today |
 | --- | --- |

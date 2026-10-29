@@ -3,6 +3,7 @@ import torch
 
 from megabake import canonicalize_semantics, form_regions, import_fx, make_backend
 from megabake.fx_handler import register_transformers_attention
+from megabake.ops import Attention
 
 transformers = pytest.importorskip("transformers")
 
@@ -55,12 +56,12 @@ def test_declared_attention_forms_one_region_per_layer(name, model_class, config
         candidate
         for region in graph.regions
         for candidate in region.fusion_candidates
-        if candidate.semantic_facts.get("family") == "attention"
+        if isinstance(candidate.semantics, Attention)
     ]
     assert len(declared) == config.num_hidden_layers
-    grouping = declared[0].semantic_facts["head_grouping"]
-    assert grouping["query_heads"] == config.num_attention_heads
-    assert grouping["kv_heads"] == config.num_key_value_heads
+    grouping = declared[0].semantics.grouping
+    assert grouping.query_heads == config.num_attention_heads
+    assert grouping.kv_heads == config.num_key_value_heads
     assert all(candidate.source_op_ids[0].startswith("op:attention") for candidate in declared)
 
 

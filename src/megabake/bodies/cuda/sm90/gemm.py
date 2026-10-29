@@ -7,7 +7,9 @@ module only drives it.
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from math import prod
+import os
 import re
 
 import cuda.bindings.driver as cuda
@@ -17,7 +19,9 @@ from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 
 from .cutlass_gemm import HopperWgmmaGemmPersistentKernel
 
-from ....graph import Region
+from ....graph import ComputeGraph, Region
+from ....ir import TensorProgram
+from ....ops import ViewPlusGemm
 from ...interface import (
     BodyConfig,
     CandidateSet,
@@ -34,6 +38,7 @@ from ...interface import (
     TargetFacts,
     TensorLayout,
     TileContract,
+    access_effects,
     validate_body_config,
 )
 
@@ -168,7 +173,7 @@ def table_gemm_shared_bytes(tiles: Sequence[tuple[int, int]], capacity: int) -> 
 
 def plain_contraction(program) -> bool:
     """Whether ``program``'s result is its accumulator rounded once."""
-    from ....lowering import Accumulator, Cast
+    from ....ir import Accumulator, Cast
 
     return (
         len(program.loads) == 2
@@ -180,7 +185,7 @@ def plain_contraction(program) -> bool:
 def paired_contraction(program) -> bool:
     """Whether ``program`` multiplies one left operand by two right operands
     (loads 1 and 2), its post reading accumulator 1 for the second."""
-    from ....lowering import Accumulator
+    from ....ir import Accumulator
 
     def reads_second(expression) -> bool:
         if isinstance(expression, Accumulator):
@@ -224,10 +229,10 @@ def epilogue_source(program, symbol: str) -> str:
 
 def _epilogue_rejection(program, policy: SelectionPolicy) -> str | None:
     """Why ``program``'s fused epilogue does not fit the GEMM, or None."""
-    from ....lowering import AxisAffine
+    from ....ir import AxisAffine
     from ..generic import UnsupportedMapBody
 
-    if not (policy.table_launch and policy.table_gemm_swap_ab):
+    if not (policy.table_launch and launch_options_of(policy).swap_ab):
         return "fused epilogues run in swapAB table GEMMs, which store from registers"
     if paired_contraction(program):
         first, second = program.loads[1:3]
@@ -261,6 +266,23 @@ def _epilogue_rejection(program, policy: SelectionPolicy) -> str | None:
 class G0RangeBodyProvider:
     provider_name = "g0_range"
 
+    def emit(
+        self,
+        program: TensorProgram,
+        config: BodyConfig,
+        *,
+        defer_length_publish: bool = False,
+        workers: int | None = None,
+    ):
+        # The persistent TMA/WGMMA kernel is instantiated once per tile shape
+        # in the kernel module, with its tensor maps and shared storage; codegen
+        # emits that, not a nested per-phase body.
+        raise NotImplementedError("g0_range GEMMs are emitted with the kernel module")
+
+    def widen(self, program: TensorProgram, config: BodyConfig, threads: int) -> BodyConfig:
+        # The GEMM runs its own warp-specialized CTA, whatever the launch's.
+        return config
+
     def get_candidates(
         self, region: Region, target: TargetFacts, policy: SelectionPolicy
     ) -> CandidateSet:
@@ -269,7 +291,8 @@ class G0RangeBodyProvider:
 
         if not policy.allow_tuned:
             return reject("tuned providers disabled")
-        if not policy.allow_tma_gemm:
+        options = launch_options_of(policy)
+        if not options.tma_gemm:
             return reject("TMA GEMM bodies are disabled by policy")
         if not region.tensor_programs or len(region.tensor_programs) != 1:
             return reject("region has no single tensor program")
@@ -329,15 +352,15 @@ class G0RangeBodyProvider:
         if policy.table_launch:
             # Every table-launched GEMM shares one staged shared-memory budget,
             # sized to leave room for the other bodies' scratch.
-            if policy.table_gemm_swap_ab:
-                token_tile = policy.table_gemm_swap_ab_rows
+            if options.swap_ab:
+                token_tile = options.swap_ab_rows
                 if rows > token_tile:
                     return reject(f"swapAB GEMMs of this launch take at most {token_tile} rows")
                 splits = (
                     split_k_count(
                         -(-columns // 64), reduction_size // 64, target.multiprocessor_count
                     )
-                    if policy.table_gemm_split_k and not fused
+                    if options.split_k and not fused
                     else 1
                 )
                 return CandidateSet(
@@ -419,7 +442,7 @@ def _bias_epilogue_rejection(program) -> str | None:
     The epilogue adds a contiguous BF16 bias over the output columns to the
     FP32 accumulators and rounds once, exactly ``post`` with alpha = beta = 1.
     """
-    from ....lowering import Accumulator, Binary, Cast, Load
+    from ....ir import Accumulator, Binary, Cast, Load
 
     bias = program.loads[2]
     columns = program.store.shape[1]
@@ -481,6 +504,45 @@ def swap_ab_rows(shapes: Sequence[tuple[int, int]]) -> int:
 def wants_swap_ab(shapes: Sequence[tuple[int, int]]) -> bool:
     """Whether every ``(rows, columns)`` GEMM of a launch is small-M."""
     return bool(shapes) and all(rows <= SWAP_AB_MAX_ROWS for rows, _ in shapes)
+
+
+@dataclass(frozen=True)
+class HopperLaunchOptions:
+    """Launch-wide GEMM choices (``SelectionPolicy.target_options`` on sm90a)."""
+
+    tma_gemm: bool = True
+    # Table-launched GEMMs with at most ``swap_ab_rows`` rows put the weight
+    # on WGMMA's M side (Mirage's swapAB). One orientation serves the whole
+    # launch because its GEMMs share one shared-memory layout.
+    swap_ab: bool = False
+    # The token tile (WGMMA N) of swapAB launches: 16, 32, or 64 rows.
+    swap_ab_rows: int = 16
+    # Split the K range of swapAB GEMMs that have fewer weight tiles than
+    # SMs (see split_k_count).
+    split_k: bool = False
+
+
+def launch_options(graph: ComputeGraph, table_launch: bool) -> HopperLaunchOptions:
+    """SwapAB when every GEMM of a table launch is small-M; split-K on
+    request (``MEGABAKE_SPLIT_K=1``)."""
+    shapes = tuple(
+        tuple(operation.tensor_program.store.shape)
+        for operation in graph.ops.values()
+        if isinstance(operation.tensor_program, TensorProgram)
+        and operation.tensor_program.family == "contraction"
+        and len(operation.tensor_program.store.shape) == 2
+    )
+    swap_ab = table_launch and wants_swap_ab(shapes)
+    return HopperLaunchOptions(
+        swap_ab=swap_ab,
+        swap_ab_rows=swap_ab_rows(shapes) if swap_ab else 16,
+        split_k=swap_ab and os.environ.get("MEGABAKE_SPLIT_K") == "1",
+    )
+
+
+def launch_options_of(policy: SelectionPolicy) -> HopperLaunchOptions:
+    options = policy.target_options
+    return options if isinstance(options, HopperLaunchOptions) else HopperLaunchOptions()
 
 
 def gemm_candidates(
@@ -621,12 +683,12 @@ def _g0_config(
         ),
         semantic=SemanticContract(
             operation_family="view_plus_gemm"
-            if region.semantic_facts.get("family") == "view_plus_gemm"
+            if isinstance(region.semantics, ViewPlusGemm)
             else "contraction",
             source_op_ids=region.source_op_ids,
             numerical_policy="source_semantics",
             expression_hooks=(),
-            access_effects=_access_effects(program),
+            access_effects=access_effects(program),
         ),
         layouts=_layouts(program, alignment_bytes=16),
         tiles=TileContract(
@@ -745,11 +807,3 @@ def _layouts(program, alignment_bytes: int) -> LayoutContract:
         )
     }
     return LayoutContract(inputs, outputs)
-
-
-def _access_effects(program):
-    return {
-        "reads": tuple(load.value_id for load in program.loads),
-        "writes": (program.store.value_id,),
-        "owns_storage": program.store.owns_storage,
-    }

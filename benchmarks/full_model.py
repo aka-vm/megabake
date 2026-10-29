@@ -40,7 +40,7 @@ from megabake.fx_handler.hf_attention import (  # noqa: E402
     register_transformers_attention,
 )
 from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  # noqa: E402
-from megabake.lowering import kv_attention  # noqa: E402
+from megabake.ops.attention import kv_attention  # noqa: E402
 
 PROMPT = [1, 504, 3458, 314]
 VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake", "megabake_graphed")

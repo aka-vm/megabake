@@ -9,8 +9,8 @@ from __future__ import annotations
 from dataclasses import replace
 
 from ....graph import Region
-from ....lowering import Accumulator, Binary, Cast, Constant, Load, TensorProgram
-from ..generic import GeneratedContractionBody
+from ....ir import Accumulator, Binary, Cast, Constant, Load, TensorProgram
+from ..generic import GeneratedContractionBody, generic_config
 from ...interface import (
     BodyConfig, CandidateSet, ParticipantContract, ProviderRejection, ResourceEvidence,
     SelectionPolicy, TargetFacts, TileContract, validate_body_config,
@@ -21,6 +21,21 @@ BLACKWELL_ARCHITECTURES = frozenset({"sm100", "sm103", "sm120", "sm121"})
 
 class BlackwellGemmProvider:
     provider_name = "blackwell_mma"
+
+    def emit(
+        self,
+        program: TensorProgram,
+        config: BodyConfig,
+        *,
+        defer_length_publish: bool = False,
+        workers: int | None = None,
+    ) -> GeneratedContractionBody:
+        return emit_blackwell_gemm(program, config)
+
+    def widen(self, program: TensorProgram, config: BodyConfig, threads: int) -> BodyConfig:
+        if threads != config.participants.participating_threads:
+            raise ValueError("the warp-MMA GEMM body runs four warps per CTA")
+        return config
 
     def get_candidates(
         self, region: Region, target: TargetFacts, policy: SelectionPolicy
@@ -60,8 +75,7 @@ class BlackwellGemmProvider:
                 or program.combine != Binary("add", acc, product, "torch.float32")
                 or program.post != Cast(acc, dtype, "round_nearest_even")):
             return reject("provider requires an unscaled FP32 accumulation and result cast")
-        from ...catalog import _generic_config
-        base = _generic_config(region, program)
+        base = generic_config(region, program)
         return CandidateSet((replace(
             base,
             provider=self.provider_name,
@@ -147,7 +161,7 @@ def run(
 '''
     return GeneratedContractionBody(
         source=source, threads_per_cta=128, output_tile_elements=512,
-        reduction_chunk=16, tile_count=((rows + 15) // 16) * ntiles,
+        reduction_chunk=16, tile_count=((rows + 15) // 16) * ntiles, work_step=1,
         work_iterator_encoding="one row-major 16x32 output tile ordinal per CTA",
         phases=("output_tile", "warp_mma", "epilogue"),
     )

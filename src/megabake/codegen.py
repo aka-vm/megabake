@@ -22,20 +22,15 @@ from .bodies.cuda.sm90.gemm import (
     split_k,
     table_gemm_shared_bytes,
 )
+from .bodies.catalog import provider
 from .bodies.cuda.sm90.cutlass_gemm import STREAM_TAG_SLOT
-from .bodies.cuda.sm90.attention import emit_attention_body
-from .bodies.cuda.sm100.gemm import emit_blackwell_gemm
-from .bodies.cuda.generic import (
-    emit_contraction_body,
-    emit_map_body,
-    emit_reduction_body,
-)
+from .bodies.cuda.generic import emit_map_body
 from .bodies.interface import (
     BodyConfig,
     LayoutContract,
     TensorLayout,
 )
-from .lowering import (
+from .ir import (
     AxisPredicate,
     IndexedLoad,
     IterationDomain,
@@ -251,7 +246,7 @@ def _emit_generic_module(
     has_g0 = any(phase.body.provider == "g0_range" for phase in plan.phases)
     normalized = (
         {
-            region_id: _normalize_generic_selection(
+            region_id: _widened_selection(
                 selection, plan.launch.threads_per_block
             )
             for region_id, selection in selected.items()
@@ -398,12 +393,7 @@ def _emit_generic_module(
 
         iterator_index = len(work_iterators)
         iterator_name = f"work_iterator_{phase.index}"
-        step = (
-            1
-            if selection.program.family in {"reduction", "attention"}
-            or selection.body.provider == "blackwell_mma"
-            else getattr(generated, "tile_elements", generated.threads_per_cta)
-        )
+        step = generated.work_step
         work_iterators.append(
             WorkIteratorBinding(
                 iterator_name,
@@ -752,7 +742,7 @@ def _emit_table_module(
     has_gemm = any(phase.body.provider == "g0_range" for phase in plan.phases)
     selected = {
         selection.region_id: (
-            _normalize_generic_selection(selection, plan.launch.threads_per_block)
+            _widened_selection(selection, plan.launch.threads_per_block)
             if has_gemm
             else selection
         )
@@ -1025,12 +1015,7 @@ def _emit_table_module(
             phase_scratch[phase.index] = (scratch_floats, scratch_counters)
         if generated.__dataclass_fields__.get("scratch_elements") is not None:
             scratch_elements[phase.index] = generated.scratch_elements
-        step = (
-            1
-            if selection.program.family in {"reduction", "attention"}
-            or selection.body.provider == "blackwell_mma"
-            else getattr(generated, "tile_elements", generated.threads_per_cta)
-        )
+        step = generated.work_step
         body_symbol, body_variant_id = body_variant(
             generated, (phase.body.provider, phase.body.name, generated.source), step
         )
@@ -2102,76 +2087,15 @@ def _event_worker_loop(
 '''
 
 
-def _normalize_generic_selection(
+def _widened_selection(
     selection: SelectedBody, threads: int
 ) -> SelectedBody:
+    """``selection`` with its body run by CTAs of the launch's ``threads``."""
     body = selection.body
-    old_threads = body.participants.participating_threads
-    if body.provider == "g0_range" or old_threads == threads:
+    if body.participants.participating_threads == threads:
         return selection
-    if threads % old_threads:
-        raise UnsupportedCodegen(
-            f"generic body uses {old_threads} threads; cannot share {threads}"
-        )
-
-    factor = threads // old_threads
-    participants = replace(
-        body.participants,
-        participating_threads=threads,
-        warp_roles=body.participants.warp_roles * factor,
-    )
-    family = selection.program.family
-    if family in {"elementwise", "copy", "gather", "concat", "contraction"}:
-        output_domains = tuple(
-            domain
-            for domain in selection.program.iteration_domains
-            if domain.axis not in selection.program.reduction_axes
-        )
-        tiles = replace(
-            body.tiles,
-            cta_shape=(threads,) + (1,) * max(len(output_domains) - 1, 0),
-        )
-    elif family == "reduction":
-        output_domains = tuple(
-            domain
-            for domain in selection.program.iteration_domains
-            if domain.axis not in selection.program.reduction_axes
-        )
-        accumulator_size = DTYPE_BYTES[selection.program.accumulator_dtype or ""]
-        tiles = replace(
-            body.tiles,
-            cta_shape=(threads,) + (1,) * max(len(output_domains) - 1, 0),
-            reduction_tile=(threads,),
-        )
-        scratch = replace(
-            body.scratch,
-            size_bytes=max(
-                body.scratch.size_bytes,
-                (threads // 32) * accumulator_size,
-            ),
-        )
-        return replace(
-            selection,
-            body=replace(body, participants=participants, tiles=tiles, scratch=scratch),
-        )
-    elif family == "attention":
-        # Decode attention keeps a statistic and a head-dim row of value
-        # partials per warp in its shared scratch.
-        head_dim = body.tiles.cta_shape[-1]
-        scratch = replace(
-            body.scratch,
-            size_bytes=body.scratch.size_bytes
-            + (threads - old_threads) // 32 * (1 + head_dim) * 4,
-        )
-        return replace(
-            selection, body=replace(body, participants=participants, scratch=scratch)
-        )
-    else:
-        raise UnsupportedCodegen(f"cannot normalize generic body family {family}")
-
     return replace(
-        selection,
-        body=replace(body, participants=participants, tiles=tiles),
+        selection, body=provider(body.provider).widen(selection.program, body, threads)
     )
 
 
@@ -2183,23 +2107,12 @@ def _generate_device_body(
 ):
     """``workers`` is given for table launches, whose bodies may split work
     across CTAs through phase scratch."""
-    program = selection.program
-    if selection.body.provider == "blackwell_mma":
-        return emit_blackwell_gemm(program, selection.body)
-    if program.family in {"elementwise", "copy", "gather", "concat"}:
-        return emit_map_body(program, selection.body)
-    if program.family == "reduction":
-        return emit_reduction_body(program, selection.body)
-    if program.family == "contraction":
-        return emit_contraction_body(program, selection.body)
-    if program.family == "attention":
-        return emit_attention_body(
-            program,
-            selection.body,
-            defer_length_publish=defer_length_publish,
-            workers=workers,
-        )
-    raise UnsupportedCodegen(f"unsupported device body family {program.family}")
+    return provider(selection.body.provider).emit(
+        selection.program,
+        selection.body,
+        defer_length_publish=defer_length_publish,
+        workers=workers,
+    )
 
 
 def _generate_conversion_body(

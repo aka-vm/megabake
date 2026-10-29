@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 import operator
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 from torch.fx.operator_schemas import normalize_function
 from torch.utils._pytree import tree_flatten, tree_unflatten
+
+if TYPE_CHECKING:
+    from .ops import Semantics
 
 
 _MISSING = object()
@@ -72,7 +75,7 @@ class Region:
     source_op_ids: tuple[str, ...]
     external_inputs: tuple[str, ...]
     live_outputs: tuple[str, ...]
-    semantic_facts: dict[str, Any] = field(default_factory=dict)
+    semantics: Semantics | None = None
     tensor_programs: tuple[Any, ...] = ()
     fusion_candidates: tuple[Any, ...] = ()
 
@@ -84,7 +87,7 @@ class RegionCandidate:
     external_inputs: tuple[str, ...]
     live_outputs: tuple[str, ...]
     tensor_program: Any | None
-    semantic_facts: dict[str, Any] = field(default_factory=dict)
+    semantics: Semantics | None = None
     cost_bytes: int = 0
     rejections: tuple[str, ...] = ()
 
